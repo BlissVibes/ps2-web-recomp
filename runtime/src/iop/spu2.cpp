@@ -32,11 +32,11 @@ struct Envelope {
     void step(int rate, bool decrease, bool exponential) {
         const int shift = rate >> 2;
         int cycles = 1 << std::max(0, shift - 11);
-        int delta = (decrease ? -8 + (rate & 3) : 7 - (rate & 3)) << std::max(0, 11 - shift);
         if (exponential && !decrease && level > 0x6000) cycles *= 4;
-        if (exponential && decrease) delta = delta * level / 0x8000;
         if (++counter < cycles) return;
         counter = 0;
+        int delta = (decrease ? -8 + (rate & 3) : 7 - (rate & 3)) << std::max(0, 11 - shift);
+        if (exponential && decrease) delta = delta * level / 0x8000;
         level = std::clamp(level + delta, 0, 0x7FFF);
     }
 };

@@ -85,6 +85,40 @@ void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data) {
     std::uint32_t cycle = 0;
     std::uint8_t *mem = vu_data(unit);
     const std::uint32_t wrap = vu_qwords(unit);
+    if (!masked && u.mode == 0 && !(wl > cl) && !(vn == 3 && vl == 3)) {
+        const auto *bytes = reinterpret_cast<const std::uint8_t *>(data);
+        for (std::uint32_t n = 0; n < num; ++n) {
+            std::uint32_t value[4];
+            const std::size_t first = static_cast<std::size_t>(n) * components;
+            for (std::uint32_t j = 0; j < components; ++j) {
+                if (bits == 32) {
+                    std::memcpy(&value[j], bytes + (first + j) * 4, 4);
+                } else if (bits == 16) {
+                    std::uint16_t h;
+                    std::memcpy(&h, bytes + (first + j) * 2, 2);
+                    value[j] = usn ? h : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(h)));
+                } else {
+                    const std::uint8_t b = bytes[first + j];
+                    value[j] = usn ? b : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int8_t>(b)));
+                }
+            }
+            if (components == 1) value[1] = value[2] = value[3] = value[0];
+            else if (components == 2) {
+                value[2] = value[0];
+                value[3] = value[1];
+            } else if (components == 3) {
+                value[3] = 0;
+            }
+            std::memcpy(mem + (addr % wrap) * 16, value, 16);
+            ++addr;
+            if (++cycle >= wl) {
+                addr += cl - wl;
+                cycle = 0;
+            }
+        }
+        u.num = 0;
+        return;
+    }
     for (std::uint32_t n = 0; n < num; ++n) {
         const bool fill = wl > cl && cycle >= cl;
         std::uint32_t value[4] = {0, 0, 0, 0};
