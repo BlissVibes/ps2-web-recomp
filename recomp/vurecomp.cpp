@@ -137,6 +137,41 @@ Upper upper(std::uint32_t hi, bool flags_live) {
         default: return "r.i";
         }
     };
+    const std::string dst = target == kAcc ? "r.acc" : std::format("r.vf[{}]", target);
+    const bool vector = kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub || kind == Max || kind == Min || kind == Abs;
+    if (vector) {
+        std::string vb;
+        switch (src) {
+        case Vec: vb = std::format("vload(r.vf[{}])", ft); break;
+        case Bc: vb = std::format("vsplat(r.vf[{}].w[{}])", ft, bc); break;
+        case Q: vb = "vsplat(r.q)"; break;
+        default: vb = "vsplat(r.i)"; break;
+        }
+        const std::string vs = std::format("vload(r.vf[{}])", fs);
+        std::string e;
+        switch (kind) {
+        case Add: e = std::format("vadd({}, {})", vs, vb); break;
+        case Sub: e = std::format("vsub({}, {})", vs, vb); break;
+        case Mul: e = std::format("vmul({}, {})", vs, vb); break;
+        case Madd: e = std::format("vmadd(vload(r.acc), {}, {})", vs, vb); break;
+        case Msub: e = std::format("vmsub(vload(r.acc), {}, {})", vs, vb); break;
+        case Max: e = std::format("vmax({}, {})", vs, vb); break;
+        case Min: e = std::format("vmin({}, {})", vs, vb); break;
+        default: e = std::format("vabs({})", vs); break;
+        }
+        u.pre += std::format("const v4u uv = {}; ", e);
+        if (d == 0xF) {
+            u.post += std::format("vstore({}, uv); ", dst);
+        } else {
+            std::string mask = "v4u{";
+            for (int i = 0; i < 4; ++i) mask += std::string(i ? ", " : "") + (lane(d, i) ? "0xFFFFFFFFu" : "0u");
+            mask += "}";
+            u.post += std::format("vstore({0}, vsel(vload({0}), uv, {1})); ", dst, mask);
+        }
+        u.sets_flags = flags;
+        if (flags && flags_live) u.post += std::format("flags(r, {}, {}u); fl.set_mac(r.mac, r.status); ", dst, d);
+        return u;
+    }
     for (int i = 0; i < 4; ++i) {
         if (!lane(d, i)) continue;
         std::string e;
@@ -165,7 +200,6 @@ Upper upper(std::uint32_t hi, bool flags_live) {
         }
         u.pre += std::format("const std::uint32_t u{} = {}; ", kLane[i], e);
     }
-    const std::string dst = target == kAcc ? "r.acc" : std::format("r.vf[{}]", target);
     for (int i = 0; i < 4; ++i)
         if (lane(d, i)) u.post += std::format("{}.w[{}] = u{}; ", dst, i, kLane[i]);
     u.sets_flags = flags;

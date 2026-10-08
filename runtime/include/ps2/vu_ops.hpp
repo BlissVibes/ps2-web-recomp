@@ -122,6 +122,48 @@ PS2_VU_INLINE std::uint32_t msub(std::uint32_t acc, std::uint32_t a, std::uint32
 PS2_VU_INLINE std::uint32_t max(std::uint32_t a, std::uint32_t b) { return fp::max(a, b); }
 PS2_VU_INLINE std::uint32_t min(std::uint32_t a, std::uint32_t b) { return fp::min(a, b); }
 
+typedef std::uint32_t v4u __attribute__((vector_size(16)));
+typedef std::int32_t v4i __attribute__((vector_size(16)));
+typedef float v4f __attribute__((vector_size(16)));
+
+PS2_VU_INLINE v4u vload(const Reg128 &r) {
+    v4u v;
+    std::memcpy(&v, &r, 16);
+    return v;
+}
+PS2_VU_INLINE void vstore(Reg128 &r, v4u v) { std::memcpy(&r, &v, 16); }
+PS2_VU_INLINE v4u vsplat(std::uint32_t x) { return v4u{x, x, x, x}; }
+PS2_VU_INLINE v4u vsel(v4u old, v4u now, v4u mask) { return (now & mask) | (old & ~mask); }
+PS2_VU_INLINE v4u vfix(v4u x) {
+    const v4u e = x & 0x7F800000u, s = x & 0x80000000u;
+    const v4u zero = (v4u)(e == 0u), big = (v4u)(e == 0x7F800000u);
+    return (x & ~(zero | big)) | (s & zero) | ((s | 0x7F7FFFFFu) & big);
+}
+PS2_VU_INLINE v4f vin(v4u x) { return (v4f)vfix(x); }
+PS2_VU_INLINE v4u vout(v4f f) { return vfix((v4u)f); }
+PS2_VU_INLINE v4f vnorm(v4f f) { return (v4f)vfix((v4u)f); }
+PS2_VU_INLINE v4u vadd(v4u a, v4u b) { return vout(vin(a) + vin(b)); }
+PS2_VU_INLINE v4u vsub(v4u a, v4u b) { return vout(vin(a) - vin(b)); }
+PS2_VU_INLINE v4u vmul(v4u a, v4u b) { return vout(vin(a) * vin(b)); }
+PS2_VU_INLINE v4u vmadd(v4u acc, v4u a, v4u b) { return vout(vin(acc) + vnorm(vin(a) * vin(b))); }
+PS2_VU_INLINE v4u vmsub(v4u acc, v4u a, v4u b) { return vout(vin(acc) - vnorm(vin(a) * vin(b))); }
+PS2_VU_INLINE v4i vkey(v4u x) {
+    const v4u zero = (v4u)((x & 0x7F800000u) == 0u);
+    const v4u f = (x & ~zero) | (x & 0x80000000u & zero);
+    const v4i m = (v4i)(f & 0x7FFFFFFFu);
+    const v4i negative = (v4i)((f & 0x80000000u) != 0u);
+    return (m & ~negative) | (-m & negative);
+}
+PS2_VU_INLINE v4u vmax(v4u a, v4u b) {
+    const v4u ge = (v4u)(vkey(a) >= vkey(b));
+    return (a & ge) | (b & ~ge);
+}
+PS2_VU_INLINE v4u vmin(v4u a, v4u b) {
+    const v4u le = (v4u)(vkey(a) <= vkey(b));
+    return (a & le) | (b & ~le);
+}
+PS2_VU_INLINE v4u vabs(v4u a) { return a & 0x7FFFFFFFu; }
+
 PS2_VU_INLINE void flags(Vu0Regs &r, const Reg128 &v, unsigned dest) {
     std::uint32_t mac = 0;
     for (int i = 0; i < 4; ++i) {
