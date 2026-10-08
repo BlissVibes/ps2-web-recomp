@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <deque>
 #include <map>
+#include <set>
 #include <vector>
 
 namespace ps2::iop::kernel {
@@ -110,6 +111,7 @@ std::map<int, Sema> g_semas;
 std::map<int, EventFlag> g_events;
 std::map<int, Mbx> g_mbxs;
 std::map<int, Fpl> g_fpls;
+std::map<std::uint32_t, std::set<std::uint32_t>> g_heaps;
 std::vector<VblankHandler> g_vblank_handlers;
 std::vector<int> g_vblank_start_waiters, g_vblank_end_waiters;
 std::map<std::uint64_t, Alarm> g_alarms;
@@ -262,7 +264,11 @@ void install_thbase() {
         const std::uint32_t p = arg(c, 0);
         c.r[2] = static_cast<std::uint32_t>(create_thread(read32(p + 8), read32(p + 12), static_cast<int>(read32(p + 16)), c.r[28], read32(p), read32(p + 4)));
     });
-    def("thbase", 5, "DeleteThread", [](Cpu &c) { c.r[2] = 0; });
+    def("thbase", 5, "DeleteThread", [](Cpu &c) {
+        Thread *t = thread(static_cast<int>(arg(c, 0)));
+        if (!t) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownThread); return; }
+        c.r[2] = delete_thread(t->id) ? 0u : static_cast<std::uint32_t>(-414);
+    });
     def("thbase", 6, "StartThread", [](Cpu &c) {
         Thread *t = thread(static_cast<int>(arg(c, 0)));
         if (!t) { c.r[2] = static_cast<std::uint32_t>(kErrorUnknownThread); return; }
@@ -286,7 +292,12 @@ void install_thbase() {
         reschedule();
     };
     def("thbase", 8, "ExitThread", exit_thread);
-    def("thbase", 9, "ExitDeleteThread", exit_thread);
+    def("thbase", 9, "ExitDeleteThread", [exit_thread](Cpu &c) {
+        Thread *t = current();
+        const int id = t ? t->id : 0;
+        exit_thread(c);
+        if (id) schedule(now() + 1, [id]() { delete_thread(id); });
+    });
     auto terminate = [](Cpu &c) {
         Thread *t = thread(static_cast<int>(arg(c, 0)));
         if (t && t != current()) {
@@ -914,10 +925,27 @@ void install_dmacman() {
 
 void install_heaplib() {
     register_hle_library("heaplib", 0x0101);
-    def("heaplib", 4, "CreateHeap", [](Cpu &c) { c.r[2] = kernel_alloc(16); });
-    def("heaplib", 5, "DeleteHeap", [](Cpu &c) { c.r[2] = 0; });
-    def("heaplib", 6, "AllocHeapMemory", [](Cpu &c) { c.r[2] = alloc(arg(c, 1)); });
-    def("heaplib", 7, "FreeHeapMemory", [](Cpu &c) { free(arg(c, 1)); c.r[2] = 0; });
+    def("heaplib", 4, "CreateHeap", [](Cpu &c) {
+        c.r[2] = kernel_alloc(16);
+        g_heaps[c.r[2]];
+    });
+    def("heaplib", 5, "DeleteHeap", [](Cpu &c) {
+        auto it = g_heaps.find(arg(c, 0));
+        if (it != g_heaps.end()) {
+            for (std::uint32_t block : it->second) free(block);
+            g_heaps.erase(it);
+        }
+        c.r[2] = 0;
+    });
+    def("heaplib", 6, "AllocHeapMemory", [](Cpu &c) {
+        c.r[2] = alloc(arg(c, 1));
+        if (c.r[2]) g_heaps[arg(c, 0)].insert(c.r[2]);
+    });
+    def("heaplib", 7, "FreeHeapMemory", [](Cpu &c) {
+        free(arg(c, 1));
+        g_heaps[arg(c, 0)].erase(arg(c, 1));
+        c.r[2] = 0;
+    });
 }
 
 void install_misc() {
@@ -942,6 +970,7 @@ void install_libraries() {
     g_events.clear();
     g_mbxs.clear();
     g_fpls.clear();
+    g_heaps.clear();
     g_vblank_handlers.clear();
     g_vblank_start_waiters.clear();
     g_vblank_end_waiters.clear();

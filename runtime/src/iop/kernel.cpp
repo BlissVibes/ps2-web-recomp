@@ -269,6 +269,14 @@ int create_thread(std::uint32_t entry, std::uint32_t stack_size, int priority, s
     return t.id;
 }
 
+bool delete_thread(int id) {
+    auto it = g_threads.find(id);
+    if (it == g_threads.end() || it->second.status != kDormant || id == g_current) return false;
+    if (it->second.stack) free(it->second.stack);
+    g_threads.erase(it);
+    return true;
+}
+
 void start_thread(int id, std::uint32_t a0, std::uint32_t a1) {
     Thread *t = thread(id);
     if (!t) return;
