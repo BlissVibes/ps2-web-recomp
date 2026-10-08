@@ -256,6 +256,7 @@ int run() {
         if (std::FILE *f = std::fopen(path, "wb")) {
             std::fwrite(g_ram, 1, kRamSize, f);
             std::fwrite(iop::ram_ptr(0), 1, iop::kRamSize, f);
+            std::fwrite(iop::spu2::ram(), 2, 1u << 20, f);
             std::fclose(f);
         }
     }

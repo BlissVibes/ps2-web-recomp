@@ -83,7 +83,7 @@ void check_irq(std::uint32_t address, std::uint32_t words) {
         if (((k.irqa - address) & kRamMask) >= words) continue;
         k.irq = true;
         static const bool trace = std::getenv("PS2_TRACE_SPU2") != nullptr;
-        if (trace) std::fprintf(stderr, "[spu2] irq at 0x%05X\n", k.irqa);
+        if (trace) std::fprintf(stderr, "[spu2] irq at 0x%05X time %llu\n", k.irqa, static_cast<unsigned long long>(kernel::now()));
         hw::raise_interrupt(kSpuLine);
     }
 }
