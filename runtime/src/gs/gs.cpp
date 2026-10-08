@@ -726,6 +726,9 @@ void dump_region(const char *spec) {
 
 void stats() {
     if (const char *spec = std::getenv("PS2_DUMP_VRAM")) dump_region(spec);
+#ifdef PS2_GPU
+    gpu::stats();
+#endif
     std::fprintf(stderr, "[gs] %llu primitives drawn, register writes:", static_cast<unsigned long long>(g_primitives));
     for (int r = 0; r < 128; ++r)
         if (g_writes[r]) std::fprintf(stderr, " %02X:%llu", r, static_cast<unsigned long long>(g_writes[r]));

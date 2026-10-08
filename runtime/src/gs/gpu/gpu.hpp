@@ -24,5 +24,6 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut);
 void flush();
 void download(std::uint8_t *memory);
 bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba);
+void stats();
 
 }

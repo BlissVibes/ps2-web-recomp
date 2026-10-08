@@ -149,16 +149,29 @@ fn bits_at(offset: u32, bit: u32, count: u32) -> u32 {
 @compute @workgroup_size(64)
 fn upload(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x + gid.y * 64u * 1024u;
-    if (i >= prm(7u)) {
+    if (i >= prm(2u)) {
         return;
     }
-    let rrw = prm(5u);
-    let p = prm(6u) + i;
-    let x = (prm(3u) + p % rrw) & 0x7FFu;
-    let y = (prm(4u) + p / rrw) & 0x7FFu;
-    let bpp = prm(10u);
-    let v = bits_at(prm(8u), prm(9u) + i * bpp, bpp);
-    write_pixel(prm(2u), prm(0u), prm(1u), x, y, v);
+    let records = prm(0u);
+    var lo = 0u;
+    var hi = prm(1u);
+    while (hi - lo > 1u) {
+        let mid = (lo + hi) / 2u;
+        if (data[records + mid * 12u + 11u] <= i) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let r = records + lo * 12u;
+    let k = i - data[r + 11u];
+    let rrw = data[r + 5u];
+    let p = data[r + 6u] + k;
+    let x = (data[r + 3u] + p % rrw) & 0x7FFu;
+    let y = (data[r + 4u] + p / rrw) & 0x7FFu;
+    let bpp = data[r + 10u];
+    let v = bits_at(data[r + 8u], data[r + 9u] + k * bpp, bpp);
+    write_pixel(data[r + 2u], data[r], data[r + 1u], x, y, v);
 }
 
 @compute @workgroup_size(64)
@@ -197,44 +210,41 @@ fn copy_write(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(256)
 fn load_clut(@builtin(local_invocation_index) k: u32) {
-    let src = prm(0u) * CLUT_ENTRIES;
-    let dst = prm(1u) * CLUT_ENTRIES;
-    clut[dst + k] = clut[src + k];
-    clut[dst + k + 256u] = clut[src + k + 256u];
-    storageBarrier();
-    let cbp = prm(2u);
-    let cpsm = prm(3u);
-    let csm = prm(4u);
-    let csa = prm(5u);
-    let eight = prm(6u) != 0u;
-    let cbw = prm(7u);
-    let cou = prm(8u);
-    let cov = prm(9u);
-    var entries = 16u;
-    if (eight) {
-        entries = 256u;
+    let count = prm(1u);
+    for (var n = 0u; n < count; n = n + 1u) {
+        let r = prm(0u) + n * 12u;
+        let src = data[r] * CLUT_ENTRIES;
+        let dst = data[r + 1u] * CLUT_ENTRIES;
+        clut[dst + k] = clut[src + k];
+        clut[dst + k + 256u] = clut[src + k + 256u];
+        storageBarrier();
+        let cbp = data[r + 2u];
+        let cpsm = data[r + 3u];
+        let csm = data[r + 4u];
+        let csa = data[r + 5u];
+        let eight = data[r + 6u] != 0u;
+        var entries = 16u;
+        if (eight) {
+            entries = 256u;
+        }
+        if (k < entries) {
+            if (csm != 0u) {
+                clut[dst + ((csa * 16u + k) & 511u)] = read_pixel(cpsm, cbp, data[r + 7u], data[r + 8u] * 16u + k, data[r + 9u]);
+            } else {
+                var x = k & 7u;
+                var y = k >> 3u;
+                var slot = ((csa & 15u) * 16u + k) & 255u;
+                if (eight) {
+                    let j = (k & ~0x18u) | ((k & 0x08u) << 1u) | ((k & 0x10u) >> 1u);
+                    x = j & 15u;
+                    y = j >> 4u;
+                    slot = k;
+                }
+                clut[dst + slot] = read_pixel(cpsm, cbp, 1u, x, y);
+            }
+        }
+        storageBarrier();
     }
-    if (k >= entries) {
-        return;
-    }
-    if (csm != 0u) {
-        clut[dst + ((csa * 16u + k) & 511u)] = read_pixel(cpsm, cbp, cbw, cou * 16u + k, cov);
-        return;
-    }
-    var x = 0u;
-    var y = 0u;
-    var slot = 0u;
-    if (eight) {
-        let j = (k & ~0x18u) | ((k & 0x08u) << 1u) | ((k & 0x10u) >> 1u);
-        x = j & 15u;
-        y = j >> 4u;
-        slot = k;
-    } else {
-        x = k & 7u;
-        y = k >> 3u;
-        slot = ((csa & 15u) * 16u + k) & 255u;
-    }
-    clut[dst + slot] = read_pixel(cpsm, cbp, 1u, x, y);
 }
 
 @compute @workgroup_size(8, 8)

@@ -37,6 +37,7 @@ constexpr int kTileShift = 4;
 constexpr int kTilesPerRow = 2048 >> kTileShift;
 
 Mode g_mode = Mode::off;
+std::uint64_t g_dispatches[kPipelines] = {}, g_submits = 0;
 
 WGPUInstance g_instance = nullptr;
 WGPUDevice g_device = nullptr;
@@ -105,6 +106,23 @@ struct Batch {
     std::uint32_t fbp = 0, fbw = 0, fpsm = 0, zbp = 0, zpsm = 0;
     bool zte = false;
 } g_batch;
+
+struct PreOp {
+    bool clut = false;
+    std::uint32_t rec[12] = {};
+    Range range;
+    std::uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+};
+
+bool uploads_overlap(const PreOp &a, const PreOp &b) {
+    if (!a.range.overlaps(b.range.lo, b.range.hi)) return false;
+    if (a.rec[0] != b.rec[0] || a.rec[1] != b.rec[1] || a.rec[2] != b.rec[2]) return true;
+    return a.x0 <= b.x1 && b.x0 <= a.x1 && a.y0 <= b.y1 && b.y0 <= a.y1;
+}
+
+// Uploads and CLUT loads run before the pending primitive batch unless they touch memory it reads or writes.
+std::vector<PreOp> g_pre;
+std::vector<Range> g_batch_reads;
 
 std::vector<std::uint32_t> g_tile_count(kTilesPerRow * kTilesPerRow), g_tile_fill(kTilesPerRow * kTilesPerRow);
 std::vector<std::uint32_t> g_touched;
@@ -230,9 +248,65 @@ void flush_batch() {
     b.prims.clear();
     b.setups.clear();
     b.boxes.clear();
+    g_batch_reads.clear();
     b.key = ~0ull;
     b.minx = b.miny = 1 << 30;
     b.maxx = b.maxy = -1;
+}
+
+bool batch_conflict(const Range &r, bool clut) {
+    const Batch &b = g_batch;
+    if (b.prims.empty()) return false;
+    const Range fb = region(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy);
+    if (fb.overlaps(r.lo, r.hi)) return true;
+    if (b.zte) {
+        const Range z = region(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy);
+        if (z.overlaps(r.lo, r.hi)) return true;
+    }
+    if (!clut)
+        for (const Range &t : g_batch_reads)
+            if (t.overlaps(r.lo, r.hi)) return true;
+    return false;
+}
+
+void emit_pre() {
+    std::size_t i = 0;
+    while (i < g_pre.size()) {
+        const bool clut = g_pre[i].clut;
+        std::size_t j = i + 1;
+        while (j < g_pre.size() && g_pre[j].clut == clut) {
+            bool overlap = false;
+            if (!clut)
+                for (std::size_t k = i; k < j && !overlap; ++k) overlap = uploads_overlap(g_pre[k], g_pre[j]);
+            if (overlap) break;
+            ++j;
+        }
+        const std::uint32_t count = static_cast<std::uint32_t>(j - i);
+        std::uint32_t *records = g_arena.grow(count * 12u);
+        const std::uint32_t offset = static_cast<std::uint32_t>(records - g_arena.data());
+        std::uint32_t total = 0;
+        for (std::size_t k = i; k < j; ++k) {
+            std::memcpy(records + (k - i) * 12, g_pre[k].rec, sizeof g_pre[k].rec);
+            if (!clut) {
+                records[(k - i) * 12 + 11] = total;
+                total += g_pre[k].rec[7];
+            }
+        }
+        if (clut) g_commands.push_back({kLoadClut, 1, 1, push_params({offset, count})});
+        else dispatch_linear(kUpload, total, push_params({offset, count, total}));
+        i = j;
+    }
+    g_pre.clear();
+}
+
+void emit_all() {
+    emit_pre();
+    flush_batch();
+}
+
+void queue_pre(const PreOp &op) {
+    if (batch_conflict(op.range, op.clut)) emit_all();
+    g_pre.push_back(op);
 }
 
 void flush_image() {
@@ -243,9 +317,18 @@ void flush_image() {
     std::uint32_t pixels = static_cast<std::uint32_t>((bits - im.lead_bits) / im.bpp);
     pixels = std::min(pixels, im.total - im.done);
     if (!pixels) return;
+    PreOp op;
     const std::uint32_t offset = arena_append(im.pending.data(), im.pending.size());
-    const std::uint32_t param = push_params({im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.done, pixels, offset, im.lead_bits, im.bpp});
-    dispatch_linear(kUpload, pixels, param);
+    const std::uint32_t rec[11] = {im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.done, pixels, offset, im.lead_bits, im.bpp};
+    std::memcpy(op.rec, rec, sizeof rec);
+    const std::uint32_t first = im.done / im.rrw, last = (im.done + pixels - 1) / im.rrw;
+    op.range = region(im.dbp, im.dbw, im.dpsm, static_cast<int>(im.dsax), static_cast<int>(im.dsay + first), static_cast<int>(im.dsax + im.rrw - 1),
+                      static_cast<int>(im.dsay + last));
+    op.x0 = im.dsax;
+    op.x1 = im.dsax + im.rrw - 1;
+    op.y0 = im.dsay + (im.done % im.rrw ? first : first);
+    op.y1 = im.dsay + last;
+    queue_pre(op);
     const std::uint64_t used = im.lead_bits + static_cast<std::uint64_t>(pixels) * im.bpp;
     im.pending.erase(im.pending.begin(), im.pending.begin() + static_cast<std::ptrdiff_t>(used / 8));
     im.lead_bits = static_cast<std::uint32_t>(used % 8);
@@ -257,8 +340,8 @@ void flush_image() {
 }
 
 void flush_all() {
-    flush_batch();
     flush_image();
+    emit_all();
 }
 
 void on_error(WGPUDevice const *, WGPUErrorType type, WGPUStringView message, void *, void *) {
@@ -326,7 +409,9 @@ void submit() {
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
     WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, nullptr);
     Pipeline current = kPipelines;
+    ++g_submits;
     for (const Command &c : g_commands) {
+        ++g_dispatches[c.pipeline];
         if (c.pipeline != current) {
             wgpuComputePassEncoderSetPipeline(pass, g_pipelines[c.pipeline]);
             current = c.pipeline;
@@ -626,18 +711,21 @@ void draw(const State &st, const Vertex *v, int count) {
     const bool zte = flags & 512u;
     const std::uint64_t key = static_cast<std::uint64_t>(setup[1]) | (static_cast<std::uint64_t>(setup[2]) << 14) | (static_cast<std::uint64_t>(setup[3]) << 20) |
                               (static_cast<std::uint64_t>(setup[5]) << 26) | (static_cast<std::uint64_t>(setup[6]) << 40);
-    if (b.key != ~0ull && b.key != key) flush_batch();
-    if ((flags & 2u) && !b.prims.empty()) {
+    if (b.key != ~0ull && b.key != key) emit_all();
+    Range tex;
+    if (flags & 2u) {
         const std::uint32_t tw = setup[15] & 0xFFu, th = setup[15] >> 8;
         const int w = std::max(1 << tw, static_cast<int>(setup[18] >> 16) + 1), h = std::max(1 << th, static_cast<int>(setup[19] >> 16) + 1);
-        const Range tex = region(setup[12], setup[13], setup[14], 0, 0, w - 1, h - 1);
-        const Range fb = region(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy);
-        bool hazard = tex.overlaps(fb.lo, fb.hi);
-        if (!hazard && b.zte) {
-            const Range z = region(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy);
-            hazard = tex.overlaps(z.lo, z.hi);
+        tex = region(setup[12], setup[13], setup[14], 0, 0, w - 1, h - 1);
+        if (!b.prims.empty()) {
+            const Range fb = region(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy);
+            bool hazard = tex.overlaps(fb.lo, fb.hi);
+            if (!hazard && b.zte) {
+                const Range z = region(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy);
+                hazard = tex.overlaps(z.lo, z.hi);
+            }
+            if (hazard) emit_all();
         }
-        if (hazard) flush_batch();
     }
     if (b.prims.empty()) {
         b.key = key;
@@ -657,6 +745,13 @@ void draw(const State &st, const Vertex *v, int count) {
         setup_index = static_cast<std::uint32_t>(setups);
         b.setups.insert(b.setups.end(), setup, setup + kSetupWords);
     }
+    if (flags & 2u) {
+        if (g_batch_reads.empty() || g_batch_reads.back().lo != tex.lo || g_batch_reads.back().hi != tex.hi) {
+            bool known = false;
+            for (const Range &t : g_batch_reads) known = known || (t.lo <= tex.lo && tex.hi <= t.hi);
+            if (!known) g_batch_reads.push_back(tex);
+        }
+    }
     rec[0] = setup_index;
     rec[2] = static_cast<std::uint32_t>(minx) | (static_cast<std::uint32_t>(miny) << 16);
     rec[3] = static_cast<std::uint32_t>(maxx) | (static_cast<std::uint32_t>(maxy) << 16);
@@ -667,11 +762,11 @@ void draw(const State &st, const Vertex *v, int count) {
     b.miny = std::min(b.miny, miny);
     b.maxx = std::max(b.maxx, maxx);
     b.maxy = std::max(b.maxy, maxy);
-    if (b.prims.size() >= kPrimWords * 65536) flush_batch();
+    if (b.prims.size() >= kPrimWords * 65536) emit_all();
 }
 
 void image_begin(const State &s) {
-    flush_all();
+    flush_image();
     Image &im = g_image;
     const std::uint64_t buf = s.bitbltbuf, pos = s.trxpos, reg = s.trxreg;
     im = Image{};
@@ -689,7 +784,6 @@ void image_begin(const State &s) {
 void image_data(const std::uint8_t *data, std::size_t bytes) {
     Image &im = g_image;
     if (!im.active) return;
-    flush_batch();
     im.pending.insert(im.pending.end(), data, data + bytes);
 }
 
@@ -708,23 +802,31 @@ void local_copy(const State &s) {
 }
 
 void load_clut(std::uint64_t tex0, std::uint64_t texclut) {
-    flush_all();
-    if (g_clut_loads + 2 >= kClutSlots) submit();
+    flush_image();
+    if (g_clut_loads + 2 >= kClutSlots) {
+        emit_all();
+        submit();
+    }
     const std::uint32_t psm = static_cast<std::uint32_t>(tex0 >> 20) & 0x3Fu;
-    const std::uint32_t cpsm = static_cast<std::uint32_t>(tex0 >> 51) & 0xFu;
+    const std::uint32_t cpsm = (static_cast<std::uint32_t>(tex0 >> 51) & 0xFu) == 0 ? PSMCT32 : static_cast<std::uint32_t>(tex0 >> 51) & 0xFu;
     const std::uint32_t next = (g_clut_slot + 1) % kClutSlots;
     const std::uint32_t tc = static_cast<std::uint32_t>(texclut);
-    const std::uint32_t param = push_params({g_clut_slot, next, static_cast<std::uint32_t>(tex0 >> 37) & 0x3FFFu, cpsm == 0 ? PSMCT32 : cpsm,
-                                             static_cast<std::uint32_t>(tex0 >> 55) & 1u, static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu,
-                                             (psm == PSMT8 || psm == PSMT8H) ? 1u : 0u, tc & 0x3Fu, (tc >> 6) & 0x3Fu, (tc >> 12) & 0x3FFu});
-    g_commands.push_back({kLoadClut, 1, 1, param});
+    const std::uint32_t cbp = static_cast<std::uint32_t>(tex0 >> 37) & 0x3FFFu, csm = static_cast<std::uint32_t>(tex0 >> 55) & 1u;
+    const std::uint32_t cbw = tc & 0x3Fu, cou = (tc >> 6) & 0x3Fu, cov = (tc >> 12) & 0x3FFu;
+    PreOp op;
+    op.clut = true;
+    const std::uint32_t rec[10] = {g_clut_slot, next, cbp, cpsm, csm, static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu, (psm == PSMT8 || psm == PSMT8H) ? 1u : 0u, cbw, cou, cov};
+    std::memcpy(op.rec, rec, sizeof rec);
+    op.range = csm ? region(cbp, cbw, cpsm, static_cast<int>(cou * 16), static_cast<int>(cov), static_cast<int>(cou * 16 + 255), static_cast<int>(cov))
+                   : region(cbp, 1, cpsm, 0, 0, 15, 15);
+    queue_pre(op);
     g_clut_slot = next;
     ++g_clut_loads;
 }
 
 void flush() {
     if (g_mode == Mode::off) return;
-    flush_batch();
+    flush_all();
     submit();
 }
 
@@ -732,6 +834,13 @@ void download(std::uint8_t *memory) {
     flush_all();
     submit();
     read_back(g_vram, kMemorySize, memory);
+}
+
+void stats() {
+    if (g_mode == Mode::off) return;
+    std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
+    for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
+    std::fprintf(stderr, "\n");
 }
 
 bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba) {
