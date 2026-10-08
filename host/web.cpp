@@ -107,8 +107,9 @@ std::vector<std::uint32_t> g_frame;
 void on_vblank() {
     if (!g_window_tried) {
         g_window_tried = true;
+        const bool no_surface = EM_ASM_INT({ return Module.noSurface ? 1 : 0; });
         g_copy = EM_ASM_INT({ return Module.presentCopy ? 1 : 0; });
-        if (!g_copy && !EM_ASM_INT({ return Module.noSurface ? 1 : 0; })) {
+        if (!g_copy && !no_surface) {
             ps2::WindowTarget target;
             target.kind = ps2::WindowTarget::Canvas;
             target.selector = "#canvas";
@@ -116,6 +117,7 @@ void on_vblank() {
             target.height = static_cast<std::uint32_t>(EM_ASM_INT({ return Module.canvas.height; }));
             g_window = ps2::attach_window(target);
         }
+        g_copy = g_copy || (!g_window && !no_surface);
         std::fprintf(stderr, "[web] %s\n", g_window ? "presenting through WebGPU" : g_copy ? "presenting through a 2D canvas copy" : "not presenting");
     }
     if (g_window) ps2::present_frame();

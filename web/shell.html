@@ -108,6 +108,53 @@ function pollInput() {
   }
 }
 
+// Some browsers cannot show a canvas drawn by another GPU (hybrid laptops on Linux), so each adapter draws a few test frames first.
+async function canPresent(power) {
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: power });
+  if (!adapter) return null;
+  const device = await adapter.requestDevice();
+  let failed = false;
+  device.lost.then(() => { failed = true; });
+  device.onuncapturederror = () => { failed = true; };
+  const probe = document.createElement('canvas');
+  probe.width = probe.height = 64;
+  probe.style.cssText = 'position:fixed;left:0;top:0;width:2px;height:2px;opacity:0.01;pointer-events:none';
+  document.body.appendChild(probe);
+  try {
+    const context = probe.getContext('webgpu');
+    context.configure({ device, format: navigator.gpu.getPreferredCanvasFormat(), alphaMode: 'opaque' });
+    for (let i = 0; i < 3 && !failed; ++i) {
+      const encoder = device.createCommandEncoder();
+      encoder.beginRenderPass({ colorAttachments: [{ view: context.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }] }).end();
+      device.queue.submit([encoder.finish()]);
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      await device.queue.onSubmittedWorkDone();
+    }
+  } catch (e) {
+    failed = true;
+  }
+  probe.remove();
+  const name = [adapter.info.vendor, adapter.info.architecture].filter(Boolean).join(' ') || power;
+  device.destroy();
+  return failed ? null : name;
+}
+
+async function chooseGpu() {
+  if (!navigator.gpu) return 'WebGPU unavailable, software renderer';
+  const forced = params.get('gpu');
+  if (forced !== 'low') {
+    const name = await canPresent('high-performance');
+    if (name) return 'GPU ' + name;
+  }
+  const name = await canPresent('low-power');
+  if (name) {
+    Module.ENV.PS2_GPU_LOW_POWER = '1';
+    return 'GPU ' + name;
+  }
+  Module.presentCopy = true;
+  return 'GPU cannot draw to the page, copying frames';
+}
+
 let frames = 0, last = performance.now(), lastGpu = 0;
 var Module = {
   canvas,
@@ -126,9 +173,10 @@ var Module = {
   preRun: [() => {
     for (const [key, value] of params) if (key.startsWith('PS2_')) Module.ENV[key] = value;
     Module.addRunDependency('disc');
-    fetch(Module.discUrl, { method: 'HEAD' }).then((r) => {
+    Promise.all([fetch(Module.discUrl, { method: 'HEAD' }), chooseGpu().catch((e) => 'GPU check failed: ' + e)]).then(([r, gpu]) => {
       Module.discSize = Number(r.headers.get('content-length')) || 0;
-      statusEl.textContent = Module.discSize ? 'Disc ' + (Module.discSize / 1073741824).toFixed(2) + ' GB' : 'No disc image at ' + Module.discUrl;
+      Module.gpuInfo = gpu;
+      statusEl.textContent = (Module.discSize ? 'Disc ' + (Module.discSize / 1073741824).toFixed(2) + ' GB' : 'No disc image at ' + Module.discUrl) + ', ' + gpu;
       Module.removeRunDependency('disc');
     });
   }],
@@ -162,7 +210,7 @@ document.getElementById('start').addEventListener('click', async () => {
   canvas.focus();
   fitCanvas();
   await startAudio();
-  statusEl.textContent = 'Running ' + Module.arguments[2];
+  statusEl.textContent = 'Running ' + Module.arguments[2] + ', ' + Module.gpuInfo;
   Module.callMain(Module.arguments);
 });
 </script>
