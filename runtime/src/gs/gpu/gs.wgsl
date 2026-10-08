@@ -263,7 +263,7 @@ fn display(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (psm == PSMCT16 || psm == PSMCT16S) {
         c = ((c & 0x1Fu) << 3u) | ((c & 0x3E0u) << 6u) | ((c & 0x7C00u) << 9u);
     }
-    scratch[gid.y * w + gid.x] = c | 0xFF000000u;
+    scratch[prm(8u) + gid.y * w + gid.x] = c | 0xFF000000u;
 }
 
 struct Setup {

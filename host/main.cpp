@@ -50,7 +50,7 @@ bool parse_press(const std::string &spec, ps2::Press &press) {
 int usage() {
     std::fprintf(stderr,
                  "usage: ps2run <elf> [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
-                 "              [--disc image.iso] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
+                 "              [--disc image.iso] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
                  "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n]\n"
                  "              [--press frame:button[+button][:frames]]... [--window]\n");
     return 2;
@@ -66,7 +66,10 @@ int main(int argc, char **argv) {
         const std::string a = argv[i];
         if (a == "--arg" && i + 1 < argc) args.push_back(argv[++i]);
         else if (a == "--frames" && i + 1 < argc) ps2::g_options.max_frames = std::strtoull(argv[++i], nullptr, 10);
-        else if (a == "--ntsc") ps2::g_options.pal = false;
+        else if (a == "--ntsc" || a == "--pal") {
+            ps2::g_options.pal = a == "--pal";
+            ps2::g_options.rate_forced = true;
+        }
         else if (a == "--misses" && i + 1 < argc) ps2::g_options.misses_path = argv[++i];
         else if (a == "--trace-syscalls") ps2::g_options.trace_syscalls = true;
         else if (a == "--trace-io") ps2::g_options.trace_io = true;

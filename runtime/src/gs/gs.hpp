@@ -59,6 +59,7 @@ bool display(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32
 bool attach_window(int kind, void *display, std::uint64_t window, void *surface, const char *selector, std::uint32_t width, std::uint32_t height);
 void resize_window(std::uint32_t width, std::uint32_t height);
 bool present();
+double gpu_busy_ms();
 std::uint64_t primitives_drawn();
 void stats();
 

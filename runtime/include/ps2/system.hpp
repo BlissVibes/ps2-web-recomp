@@ -26,6 +26,7 @@ struct Options {
     bool trace_io = false;
     bool trace_threads = false;
     bool pal = true;
+    bool rate_forced = false;
     std::uint64_t max_frames = 0;
     std::string misses_path;
     std::string disc_path;
@@ -83,6 +84,8 @@ struct WindowTarget {
 bool attach_window(const WindowTarget &target);
 void resize_window(std::uint32_t width, std::uint32_t height);
 bool present_frame();
+// GPU time spent on emulation so far, estimated from timestamp queries (0 when unsupported).
+double gpu_busy_ms();
 void set_pad_buttons(std::uint16_t pressed);
 void set_pad_axis(int axis, std::uint8_t value);
 void set_audio_sink(std::function<void(const std::int16_t *samples, std::size_t frames)> sink);

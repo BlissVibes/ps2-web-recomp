@@ -49,6 +49,15 @@ std::uint32_t g_surface_width = 0, g_surface_height = 0;
 WGPURenderPipeline g_blit = nullptr;
 WGPUBindGroup g_blit_group = nullptr;
 WGPUBuffer g_blit_params = nullptr;
+std::uint32_t g_field = 0, g_last_width = 0, g_last_height = 0;
+bool g_have_previous = false;
+constexpr std::uint32_t kFieldWords = 2u << 20;
+
+bool g_timestamps = false;
+WGPUQuerySet g_queries = nullptr;
+WGPUBuffer g_query_resolve = nullptr, g_query_read = nullptr;
+bool g_query_pending = false, g_query_ready = false;
+std::uint64_t g_measured_ns = 0, g_measured = 0, g_total_passes = 0;
 WGPUDevice g_device = nullptr;
 WGPUQueue g_queue = nullptr;
 WGPUBuffer g_vram = nullptr, g_tables = nullptr, g_params = nullptr, g_data = nullptr, g_clut = nullptr, g_scratch = nullptr, g_readback = nullptr;
@@ -429,10 +438,31 @@ void submit(WGPUTextureView present_view = nullptr) {
     ensure_capacity();
     if (!g_arena.empty()) wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
     wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
+    if (g_query_ready) {
+        const void *mapped = wgpuBufferGetConstMappedRange(g_query_read, 0, 16);
+        if (mapped) {
+            std::uint64_t t[2];
+            std::memcpy(t, mapped, sizeof t);
+            if (t[1] > t[0]) {
+                g_measured_ns += t[1] - t[0];
+                ++g_measured;
+            }
+        }
+        wgpuBufferUnmap(g_query_read);
+        g_query_ready = g_query_pending = false;
+    }
+    const bool measure = g_timestamps && !g_query_pending;
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
-    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, nullptr);
+    WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
+    writes.querySet = g_queries;
+    writes.beginningOfPassWriteIndex = 0;
+    writes.endOfPassWriteIndex = 1;
+    WGPUComputePassDescriptor cd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+    if (measure) cd.timestampWrites = &writes;
+    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, &cd);
     Pipeline current = kPipelines;
     ++g_submits;
+    ++g_total_passes;
     for (const Command &c : g_commands) {
         ++g_dispatches[c.pipeline];
         if (c.pipeline != current) {
@@ -445,6 +475,10 @@ void submit(WGPUTextureView present_view = nullptr) {
     }
     wgpuComputePassEncoderEnd(pass);
     wgpuComputePassEncoderRelease(pass);
+    if (measure) {
+        wgpuCommandEncoderResolveQuerySet(enc, g_queries, 0, 2, g_query_resolve, 0);
+        wgpuCommandEncoderCopyBufferToBuffer(enc, g_query_resolve, 0, g_query_read, 0, 16);
+    }
     if (present_view) {
         WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
         color.view = present_view;
@@ -468,6 +502,21 @@ void submit(WGPUTextureView present_view = nullptr) {
     wgpuQueueSubmit(g_queue, 1, &cmd);
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
+    if (measure) {
+        g_query_pending = true;
+        WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+        cb.mode = WGPUCallbackMode_AllowProcessEvents;
+        cb.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void *, void *) {
+            if (status == WGPUMapAsyncStatus_Success) g_query_ready = true;
+            else g_query_pending = false;
+        };
+        wgpuBufferMapAsync(g_query_read, WGPUMapMode_Read, 0, 16, cb);
+    }
+#ifdef __EMSCRIPTEN__
+    wgpuInstanceProcessEvents(g_instance);
+#else
+    wgpuDevicePoll(g_device, false, nullptr);
+#endif
     g_commands.clear();
     g_param_records.clear();
     g_arena.clear();
@@ -601,6 +650,12 @@ bool init(Mode m) {
     limits.maxBufferSize = supported.maxBufferSize;
     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
     dd.requiredLimits = &limits;
+    const WGPUFeatureName timestamp_feature = WGPUFeatureName_TimestampQuery;
+    g_timestamps = wgpuAdapterHasFeature(adapter, WGPUFeatureName_TimestampQuery);
+    if (g_timestamps) {
+        dd.requiredFeatureCount = 1;
+        dd.requiredFeatures = &timestamp_feature;
+    }
     dd.uncapturedErrorCallbackInfo.callback = on_error;
     bool device_done = false;
     WGPURequestDeviceCallbackInfo dcb = WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
@@ -626,6 +681,14 @@ bool init(Mode m) {
     g_clut = make_buffer(static_cast<std::uint64_t>(kClutSlots) * kClutEntries * 4, WGPUBufferUsage_Storage);
     g_scratch = make_buffer(kScratchBytes, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
     g_readback = make_buffer(kScratchBytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
+    if (g_timestamps) {
+        WGPUQuerySetDescriptor qd = WGPU_QUERY_SET_DESCRIPTOR_INIT;
+        qd.type = WGPUQueryType_Timestamp;
+        qd.count = 2;
+        g_queries = wgpuDeviceCreateQuerySet(g_device, &qd);
+        g_query_resolve = make_buffer(16, WGPUBufferUsage_QueryResolve | WGPUBufferUsage_CopySrc);
+        g_query_read = make_buffer(16, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
+    }
 
     WGPUBindGroupLayoutEntry le[6] = {};
     const WGPUBufferBindingType types[6] = {WGPUBufferBindingType_Storage, WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Uniform,
@@ -953,8 +1016,9 @@ bool attach_surface(const SurfaceTarget &target) {
             break;
         }
     g_present_mode = WGPUPresentMode_Fifo;
-    for (std::size_t i = 0; i < caps.presentModeCount; ++i)
-        if (caps.presentModes[i] == WGPUPresentMode_Mailbox) g_present_mode = WGPUPresentMode_Mailbox;
+    for (const WGPUPresentMode wanted : {WGPUPresentMode_Immediate, WGPUPresentMode_Mailbox})
+        for (std::size_t i = 0; i < caps.presentModeCount; ++i)
+            if (caps.presentModes[i] == wanted) g_present_mode = wanted;
     wgpuSurfaceCapabilitiesFreeMembers(caps);
     g_surface_width = target.width;
     g_surface_height = target.height;
@@ -995,14 +1059,14 @@ bool attach_surface(const SurfaceTarget &target) {
     g_blit = wgpuDeviceCreateRenderPipeline(g_device, &rd);
     wgpuShaderModuleRelease(module);
     wgpuPipelineLayoutRelease(pipeline_layout);
-    g_blit_params = make_buffer(16, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
+    g_blit_params = make_buffer(32, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
     WGPUBindGroupEntry be[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
     be[0].binding = 0;
     be[0].buffer = g_scratch;
     be[0].size = WGPU_WHOLE_SIZE;
     be[1].binding = 1;
     be[1].buffer = g_blit_params;
-    be[1].size = 16;
+    be[1].size = 32;
     WGPUBindGroupDescriptor bd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bd.layout = layout;
     bd.entryCount = 2;
@@ -1024,10 +1088,17 @@ bool has_surface() { return g_surface != nullptr; }
 bool present(const DisplaySource &src) {
     if (!g_surface) return false;
     flush_all();
-    const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u});
+    const std::uint32_t current = (g_field & 1u) * kFieldWords, previous = ((g_field + 1) & 1u) * kFieldWords;
+    static const bool weave_off = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
+    const bool blend = src.halved && g_have_previous && g_last_width == src.width && g_last_height == src.height && !weave_off;
+    const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u, current});
     g_commands.push_back({kDisplay, (src.width + 7) / 8, (src.height + 7) / 8, param});
-    const std::uint32_t size[4] = {src.width, src.height, 0, 0};
-    wgpuQueueWriteBuffer(g_queue, g_blit_params, 0, size, sizeof size);
+    const std::uint32_t blit[8] = {src.width, src.height, current, previous, blend ? 1u : 0u, 0, 0, 0};
+    wgpuQueueWriteBuffer(g_queue, g_blit_params, 0, blit, sizeof blit);
+    ++g_field;
+    g_have_previous = true;
+    g_last_width = src.width;
+    g_last_height = src.height;
     WGPUSurfaceTexture st = WGPU_SURFACE_TEXTURE_INIT;
     wgpuSurfaceGetCurrentTexture(g_surface, &st);
     if (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal && st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
@@ -1044,6 +1115,11 @@ bool present(const DisplaySource &src) {
     wgpuTextureViewRelease(target);
     wgpuTextureRelease(st.texture);
     return true;
+}
+
+double busy_ms() {
+    if (!g_measured) return 0.0;
+    return static_cast<double>(g_measured_ns) / static_cast<double>(g_measured) * static_cast<double>(g_total_passes) / 1e6;
 }
 
 bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba) {

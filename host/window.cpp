@@ -4,6 +4,8 @@
 
 #include <SDL.h>
 #include <SDL_syswm.h>
+#include <sys/resource.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -194,19 +196,43 @@ void pace() {
     }
 }
 
+double process_cpu_seconds() {
+    rusage usage{};
+    getrusage(RUSAGE_SELF, &usage);
+    return static_cast<double>(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) + static_cast<double>(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6;
+}
+
+double resident_mb() {
+    long pages = 0, resident = 0;
+    if (std::FILE *f = std::fopen("/proc/self/statm", "r")) {
+        if (std::fscanf(f, "%ld %ld", &pages, &resident) != 2) resident = 0;
+        std::fclose(f);
+    }
+    return static_cast<double>(resident) * static_cast<double>(sysconf(_SC_PAGESIZE)) / (1024.0 * 1024.0);
+}
+
 void show_speed() {
     static std::uint64_t start = 0, frames = 0;
+    static double cpu_start = 0.0, gpu_start = 0.0;
     const std::uint64_t now = SDL_GetPerformanceCounter();
-    if (!start) start = now;
+    if (!start) {
+        start = now;
+        cpu_start = process_cpu_seconds();
+        gpu_start = ps2::gpu_busy_ms();
+    }
     ++frames;
     const double seconds = static_cast<double>(now - start) / static_cast<double>(SDL_GetPerformanceFrequency());
     if (seconds < 1.0) return;
-    char title[128];
+    const double cpu = process_cpu_seconds(), gpu = ps2::gpu_busy_ms();
+    char title[192];
     const double queued = g_audio ? SDL_GetQueuedAudioSize(g_audio) / static_cast<double>(kAudioBytesPerMs) : 0.0;
-    std::snprintf(title, sizeof title, "ps2-web-recomp  %.1f fps  audio %.0f ms", static_cast<double>(frames) / seconds, queued);
+    std::snprintf(title, sizeof title, "ps2-web-recomp  %.1f fps  CPU %.0f%%  GPU %.0f%%  RAM %.0f MB  audio %.0f ms", static_cast<double>(frames) / seconds,
+                  (cpu - cpu_start) / seconds * 100.0, (gpu - gpu_start) / (seconds * 10.0), resident_mb(), queued);
     SDL_SetWindowTitle(g_window, title);
     start = now;
     frames = 0;
+    cpu_start = cpu;
+    gpu_start = gpu;
 }
 
 void on_vblank() {

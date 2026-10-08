@@ -164,6 +164,7 @@ void gs_set_crt(std::uint32_t interlace, std::uint32_t mode, std::uint32_t field
     g_crt[1] = mode;
     g_crt[2] = field;
     std::fprintf(stderr, "[gs] SetGsCrt interlace %u mode 0x%X field %u\n", interlace, mode, field);
+    if (!g_options.rate_forced) g_options.pal = mode == 3u;
 }
 
 void dmac_raise(unsigned channel) {

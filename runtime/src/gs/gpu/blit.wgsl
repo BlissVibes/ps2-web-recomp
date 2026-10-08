@@ -1,8 +1,12 @@
 struct Blit {
     width: u32,
     height: u32,
+    current: u32,
+    previous: u32,
+    blend: u32,
     pad0: u32,
     pad1: u32,
+    pad2: u32,
 }
 
 @group(0) @binding(0) var<storage, read> pixels: array<u32>;
@@ -22,20 +26,28 @@ fn vs(@builtin(vertex_index) i: u32) -> VertexOut {
     return o;
 }
 
-fn texel(x: i32, y: i32) -> vec4<f32> {
+fn texel(base: u32, x: i32, y: i32) -> vec4<f32> {
     let cx = u32(clamp(x, 0, i32(blit.width) - 1));
     let cy = u32(clamp(y, 0, i32(blit.height) - 1));
-    return unpack4x8unorm(pixels[cy * blit.width + cx]);
+    return unpack4x8unorm(pixels[base + cy * blit.width + cx]);
+}
+
+fn sample(base: u32, uv: vec2<f32>) -> vec4<f32> {
+    let p = uv * vec2<f32>(f32(blit.width), f32(blit.height)) - 0.5;
+    let origin = floor(p);
+    let f = p - origin;
+    let x = i32(origin.x);
+    let y = i32(origin.y);
+    let top = mix(texel(base, x, y), texel(base, x + 1, y), f.x);
+    let bottom = mix(texel(base, x, y + 1), texel(base, x + 1, y + 1), f.x);
+    return mix(top, bottom, f.y);
 }
 
 @fragment
 fn fs(in: VertexOut) -> @location(0) vec4<f32> {
-    let p = in.uv * vec2<f32>(f32(blit.width), f32(blit.height)) - 0.5;
-    let base = floor(p);
-    let f = p - base;
-    let x = i32(base.x);
-    let y = i32(base.y);
-    let top = mix(texel(x, y), texel(x + 1, y), f.x);
-    let bottom = mix(texel(x, y + 1), texel(x + 1, y + 1), f.x);
-    return vec4<f32>(mix(top, bottom, f.y).rgb, 1.0);
+    var c = sample(blit.current, in.uv);
+    if (blit.blend != 0u) {
+        c = (c + sample(blit.previous, in.uv)) * 0.5;
+    }
+    return vec4<f32>(c.rgb, 1.0);
 }
