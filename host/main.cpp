@@ -14,6 +14,7 @@
 #include <vector>
 
 void register_generated_code();
+void register_generated_vu();
 
 namespace {
 
@@ -90,6 +91,7 @@ int main(int argc, char **argv) {
     if (window && !open_window()) return 1;
 #endif
     register_generated_code();
+    register_generated_vu();
     std::uint32_t entry = 0;
     if (!ps2::load_elf(argv[1], entry)) {
         std::fprintf(stderr, "cannot load %s\n", argv[1]);

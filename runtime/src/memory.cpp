@@ -1,4 +1,5 @@
 #include "hw.hpp"
+#include "vu_micro.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
 
@@ -74,6 +75,7 @@ void write_slow(std::uint32_t a, T v) {
     const Target t = resolve(a);
     if (t.host) {
         std::memcpy(t.host, &v, sizeof v);
+        if (t.region == Region::Vu && (t.address & 0x4000u) == 0) vu::code_changed((t.address >> 15) & 1u);
         return;
     }
     if (t.region == Region::Io) {

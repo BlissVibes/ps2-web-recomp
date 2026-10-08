@@ -14,6 +14,10 @@ if(NOT EMSCRIPTEN)
         recomp/analysis.cpp
         recomp/codegen.cpp)
     target_compile_options(eerecomp PRIVATE -Wall -Wextra)
+
+    add_executable(vurecomp recomp/vurecomp.cpp)
+    target_include_directories(vurecomp PRIVATE runtime/include)
+    target_compile_options(vurecomp PRIVATE -Wall -Wextra)
 endif()
 
 add_library(ps2runtime STATIC

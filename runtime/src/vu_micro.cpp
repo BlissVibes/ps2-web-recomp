@@ -5,10 +5,16 @@
 #include "ps2/fpu.hpp"
 #include "ps2/system.hpp"
 #include "ps2/vu.hpp"
+#include "ps2/vu_ops.hpp"
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <unordered_map>
 
 namespace ps2::vu {
 
@@ -177,6 +183,200 @@ UpperOut upper(Vu0Regs &r, std::uint32_t w) {
     }
     default: return UpperOut{};
     }
+}
+
+enum UpperKind : std::uint8_t { kNop, kAdd, kSub, kMadd, kMsub, kMax, kMin, kMul, kAbs, kFtoi, kItof, kClip, kOpmula, kOpmsub };
+enum UpperSource : std::uint8_t { kVec, kBc, kQ, kI };
+
+struct Decoded {
+    std::uint32_t lo = 0, hi = 0;
+    bool valid = false;
+    UpperKind kind = kNop;
+    UpperSource source = kVec;
+    std::uint8_t target = 0, dest = 0, fs = 0, ft = 0, bc = 0, frac = 0;
+    bool flags = false;
+};
+
+Decoded g_decoded[2][2048];
+bool g_flags_used[2] = {true, true};
+bool g_scan[2] = {true, true};
+
+Decoded decode_upper(std::uint32_t lo, std::uint32_t hi) {
+    Decoded d;
+    d.lo = lo;
+    d.hi = hi;
+    d.valid = true;
+    d.dest = static_cast<std::uint8_t>((hi >> 21) & 15u);
+    d.ft = static_cast<std::uint8_t>((hi >> 16) & 31u);
+    d.fs = static_cast<std::uint8_t>((hi >> 11) & 31u);
+    d.bc = static_cast<std::uint8_t>(hi & 3u);
+    const std::uint8_t fd = static_cast<std::uint8_t>((hi >> 6) & 31u);
+    const unsigned funct = hi & 63u;
+    const auto set = [&](UpperKind k, UpperSource src, int target, bool flags) {
+        d.kind = k;
+        d.source = src;
+        d.target = static_cast<std::uint8_t>(target);
+        d.flags = flags;
+    };
+    if (funct < 0x3C) {
+        switch (funct) {
+        case 0x00: case 0x01: case 0x02: case 0x03: set(kAdd, kBc, fd, true); break;
+        case 0x04: case 0x05: case 0x06: case 0x07: set(kSub, kBc, fd, true); break;
+        case 0x08: case 0x09: case 0x0A: case 0x0B: set(kMadd, kBc, fd, true); break;
+        case 0x0C: case 0x0D: case 0x0E: case 0x0F: set(kMsub, kBc, fd, true); break;
+        case 0x10: case 0x11: case 0x12: case 0x13: set(kMax, kBc, fd, false); break;
+        case 0x14: case 0x15: case 0x16: case 0x17: set(kMin, kBc, fd, false); break;
+        case 0x18: case 0x19: case 0x1A: case 0x1B: set(kMul, kBc, fd, true); break;
+        case 0x1C: set(kMul, kQ, fd, true); break;
+        case 0x1D: set(kMax, kI, fd, false); break;
+        case 0x1E: set(kMul, kI, fd, true); break;
+        case 0x1F: set(kMin, kI, fd, false); break;
+        case 0x20: set(kAdd, kQ, fd, true); break;
+        case 0x21: set(kMadd, kQ, fd, true); break;
+        case 0x22: set(kAdd, kI, fd, true); break;
+        case 0x23: set(kMadd, kI, fd, true); break;
+        case 0x24: set(kSub, kQ, fd, true); break;
+        case 0x25: set(kMsub, kQ, fd, true); break;
+        case 0x26: set(kSub, kI, fd, true); break;
+        case 0x27: set(kMsub, kI, fd, true); break;
+        case 0x28: set(kAdd, kVec, fd, true); break;
+        case 0x29: set(kMadd, kVec, fd, true); break;
+        case 0x2A: set(kMul, kVec, fd, true); break;
+        case 0x2B: set(kMax, kVec, fd, false); break;
+        case 0x2C: set(kSub, kVec, fd, true); break;
+        case 0x2D: set(kMsub, kVec, fd, true); break;
+        case 0x2E: set(kOpmsub, kVec, fd, true); d.dest = 0xE; break;
+        case 0x2F: set(kMin, kVec, fd, false); break;
+        default: break;
+        }
+        return d;
+    }
+    static const std::uint8_t kFrac[4] = {0, 4, 12, 15};
+    const unsigned index = ((hi >> 6) & 31u) * 4u + (funct & 3u);
+    switch (index) {
+    case 0x00: case 0x01: case 0x02: case 0x03: set(kAdd, kBc, kAcc, true); break;
+    case 0x04: case 0x05: case 0x06: case 0x07: set(kSub, kBc, kAcc, true); break;
+    case 0x08: case 0x09: case 0x0A: case 0x0B: set(kMadd, kBc, kAcc, true); break;
+    case 0x0C: case 0x0D: case 0x0E: case 0x0F: set(kMsub, kBc, kAcc, true); break;
+    case 0x10: case 0x11: case 0x12: case 0x13: set(kItof, kVec, d.ft, false); d.frac = kFrac[index & 3u]; break;
+    case 0x14: case 0x15: case 0x16: case 0x17: set(kFtoi, kVec, d.ft, false); d.frac = kFrac[index & 3u]; break;
+    case 0x18: case 0x19: case 0x1A: case 0x1B: set(kMul, kBc, kAcc, true); break;
+    case 0x1C: set(kMul, kQ, kAcc, true); break;
+    case 0x1D: set(kAbs, kVec, d.ft, false); break;
+    case 0x1E: set(kMul, kI, kAcc, true); break;
+    case 0x1F: set(kClip, kVec, 0, false); break;
+    case 0x20: set(kAdd, kQ, kAcc, true); break;
+    case 0x21: set(kMadd, kQ, kAcc, true); break;
+    case 0x22: set(kAdd, kI, kAcc, true); break;
+    case 0x23: set(kMadd, kI, kAcc, true); break;
+    case 0x24: set(kSub, kQ, kAcc, true); break;
+    case 0x25: set(kMsub, kQ, kAcc, true); break;
+    case 0x26: set(kSub, kI, kAcc, true); break;
+    case 0x27: set(kMsub, kI, kAcc, true); break;
+    case 0x28: set(kAdd, kVec, kAcc, true); break;
+    case 0x29: set(kMadd, kVec, kAcc, true); break;
+    case 0x2A: set(kMul, kVec, kAcc, true); break;
+    case 0x2C: set(kSub, kVec, kAcc, true); break;
+    case 0x2D: set(kMsub, kVec, kAcc, true); break;
+    case 0x2E: set(kOpmula, kVec, kAcc, true); d.dest = 0xE; break;
+    default: break;
+    }
+    return d;
+}
+
+float fin(std::uint32_t x) {
+    const std::uint32_t e = x & 0x7F800000u;
+    if (!e) x &= 0x80000000u;
+    else if (e == 0x7F800000u) x = (x & 0x80000000u) | 0x7F7FFFFFu;
+    float f;
+    std::memcpy(&f, &x, 4);
+    return f;
+}
+
+std::uint32_t fout(float f) {
+    std::uint32_t x;
+    std::memcpy(&x, &f, 4);
+    const std::uint32_t e = x & 0x7F800000u;
+    if (!e) return x & 0x80000000u;
+    if (e == 0x7F800000u) return (x & 0x80000000u) | 0x7F7FFFFFu;
+    return x;
+}
+
+float norm(float f) { return fin(fout(f)); }
+
+void fast_upper(Vu0Regs &r, const Decoded &d, UpperOut &o) {
+    o.target = -1;
+    if (d.kind == kNop) return;
+    const Reg128 &s = r.vf[d.fs], &t = r.vf[d.ft];
+    if (d.kind == kClip) {
+        const std::int32_t lim = fp::key(t.w[3] & fp::kAbs);
+        std::uint32_t flags = 0;
+        for (int i = 0; i < 3; ++i) {
+            const std::int32_t x = fp::key(s.w[i]);
+            if (x > lim) flags |= 1u << (i * 2);
+            if (x < -lim) flags |= 2u << (i * 2);
+        }
+        r.clip = ((r.clip << 6) | flags) & 0xFFFFFFu;
+        return;
+    }
+    o.target = d.target;
+    o.dest = d.dest;
+    o.flags = d.flags;
+    switch (d.kind) {
+    case kAbs:
+        for (int i = 0; i < 4; ++i) o.value.w[i] = s.w[i] & fp::kAbs;
+        return;
+    case kFtoi:
+        for (int i = 0; i < 4; ++i) if (d.dest & (8u >> i)) o.value.w[i] = fp::to_fixed(s.w[i], d.frac);
+        return;
+    case kItof:
+        for (int i = 0; i < 4; ++i) if (d.dest & (8u >> i)) o.value.w[i] = fp::from_fixed(s.sw[i], d.frac);
+        return;
+    case kOpmula:
+        o.value.w[0] = fout(norm(fin(s.w[1]) * fin(t.w[2])));
+        o.value.w[1] = fout(norm(fin(s.w[2]) * fin(t.w[0])));
+        o.value.w[2] = fout(norm(fin(s.w[0]) * fin(t.w[1])));
+        return;
+    case kOpmsub:
+        o.value.w[0] = fout(fin(r.acc.w[0]) - norm(fin(s.w[1]) * fin(t.w[2])));
+        o.value.w[1] = fout(fin(r.acc.w[1]) - norm(fin(s.w[2]) * fin(t.w[0])));
+        o.value.w[2] = fout(fin(r.acc.w[2]) - norm(fin(s.w[0]) * fin(t.w[1])));
+        return;
+    default: break;
+    }
+    std::uint32_t b[4];
+    switch (d.source) {
+    case kVec: for (int i = 0; i < 4; ++i) b[i] = t.w[i]; break;
+    case kBc: for (int i = 0; i < 4; ++i) b[i] = t.w[d.bc]; break;
+    case kQ: for (int i = 0; i < 4; ++i) b[i] = r.q; break;
+    case kI: for (int i = 0; i < 4; ++i) b[i] = r.i; break;
+    }
+    switch (d.kind) {
+    case kAdd: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(fin(s.w[i]) + fin(b[i])); break;
+    case kSub: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(fin(s.w[i]) - fin(b[i])); break;
+    case kMul: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(fin(s.w[i]) * fin(b[i])); break;
+    case kMadd: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(fin(r.acc.w[i]) + norm(fin(s.w[i]) * fin(b[i]))); break;
+    case kMsub: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(fin(r.acc.w[i]) - norm(fin(s.w[i]) * fin(b[i]))); break;
+    case kMax: for (int i = 0; i < 4; ++i) o.value.w[i] = fp::max(s.w[i], b[i]); break;
+    case kMin: for (int i = 0; i < 4; ++i) o.value.w[i] = fp::min(s.w[i], b[i]); break;
+    default: break;
+    }
+}
+
+void scan_flags(int unit, const std::uint8_t *code, std::uint32_t size) {
+    bool used = false;
+    for (std::uint32_t pc = 0; pc < size && !used; pc += 8) {
+        std::uint32_t lo, hi;
+        std::memcpy(&lo, code + pc, 4);
+        std::memcpy(&hi, code + pc + 4, 4);
+        if (hi & 0x80000000u) continue;
+        switch (lo >> 25) {
+        case 0x14: case 0x15: case 0x16: case 0x17: case 0x18: case 0x1A: case 0x1B: used = true; break;
+        default: break;
+        }
+    }
+    g_flags_used[unit] = used;
+    g_scan[unit] = false;
 }
 
 void commit(Vu0Regs &r, const UpperOut &o) {
@@ -422,9 +622,139 @@ void set_tops(std::uint32_t top, std::uint32_t itop) {
     g_itop = itop;
 }
 
-void code_changed(int) {}
+void run_fast(int n, std::uint32_t address);
+
+std::unordered_map<std::uint64_t, ProgramFn> g_programs;
+std::uint32_t g_generation[2] = {1, 1};
+
+struct EntryCache {
+    std::uint32_t generation = 0;
+    ProgramFn function = nullptr;
+};
+EntryCache g_entries[2048];
+
+void code_changed(int unit) {
+    g_scan[unit & 1] = true;
+    ++g_generation[unit & 1];
+}
+
+void register_programs(const Program *programs, std::uint32_t count) {
+    for (std::uint32_t i = 0; i < count; ++i)
+        if (programs[i].function) g_programs[programs[i].key] = programs[i].function;
+}
+
+void kick(int unit, std::uint32_t address) {
+    Unit u = unit_of(unit);
+    xgkick(u, address);
+}
+
+std::uint32_t top() { return g_top; }
+std::uint32_t itop() { return g_itop; }
+
+ProgramFn lookup(std::uint32_t address);
+
+void interpret(int unit, std::uint32_t pc) {
+    static const bool interpret_only = std::getenv("PS2_VU_INTERPRET") != nullptr;
+    static const bool count = std::getenv("PS2_VU_COUNT") != nullptr;
+    static std::uint64_t compiled = 0, interpreted = 0;
+    static std::unordered_map<std::uint32_t, std::uint64_t> misses;
+    if (unit == 1 && !interpret_only) {
+        if (const ProgramFn fn = lookup(pc)) {
+            ++compiled;
+            fn(g_vu1, g_vu1_mem);
+            return;
+        }
+    }
+    if (count && unit == 1) {
+        ++misses[pc];
+        if (++interpreted % 5000 == 0) {
+            std::fprintf(stderr, "[vu1] compiled %llu interpreted %llu:", static_cast<unsigned long long>(compiled), static_cast<unsigned long long>(interpreted));
+            for (const auto &[a, n] : misses) std::fprintf(stderr, " %04X:%llu", a, static_cast<unsigned long long>(n));
+            std::fprintf(stderr, "\n");
+        }
+    }
+    run_fast(unit, pc);
+}
+
+ProgramFn lookup(std::uint32_t address) {
+    EntryCache &e = g_entries[(address & 16383u) >> 3];
+    if (e.generation == g_generation[1]) return e.function;
+    e.generation = g_generation[1];
+    const std::vector<std::uint32_t> pcs = reachable(g_vu1_code, 16383u, address);
+    const std::uint64_t key = program_key(g_vu1_code, pcs, address & 16383u);
+    const auto it = g_programs.find(key);
+    e.function = it == g_programs.end() ? nullptr : it->second;
+    static const char *record = std::getenv("PS2_VU_RECORD");
+    if (!e.function && record) {
+        char name[64];
+        std::snprintf(name, sizeof name, "%016llX_%04X.bin", static_cast<unsigned long long>(key), address & 16383u);
+        const std::filesystem::path path = std::filesystem::path(record) / name;
+        if (!std::filesystem::exists(path)) {
+            std::filesystem::create_directories(record);
+            std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(g_vu1_code), 16384);
+        }
+    }
+    return e.function;
+}
+
+void run_fast(int n, std::uint32_t address) {
+    Unit u = unit_of(n);
+    Vu0Regs &r = *u.regs;
+    if (g_scan[n]) scan_flags(n, u.code, u.code_mask + 1);
+    const bool flags = g_flags_used[n];
+    Decoded *cache = g_decoded[n];
+    std::uint32_t pc = address & u.code_mask, npc = (pc + 8u) & u.code_mask;
+    bool ending = false;
+    UpperOut out;
+    static std::uint64_t total = 0, calls = 0;
+    static const bool count = std::getenv("PS2_VU_COUNT") != nullptr;
+    if (count && ++calls % 20000 == 0) std::fprintf(stderr, "[vu1] %llu calls, %llu instructions\n", (unsigned long long)calls, (unsigned long long)total);
+    for (std::uint32_t steps = 0; steps < 1'000'000; ++steps, ++total) {
+        std::uint32_t lo, hi;
+        std::memcpy(&lo, u.code + pc, 4);
+        std::memcpy(&hi, u.code + pc + 4, 4);
+        Decoded &d = cache[pc >> 3];
+        if (!d.valid || d.lo != lo || d.hi != hi) {
+            d = decode_upper(lo, hi);
+            if (g_scan[n]) scan_flags(n, u.code, u.code_mask + 1);
+        }
+        const std::uint32_t current = pc;
+        pc = npc;
+        npc = (npc + 8u) & u.code_mask;
+        fast_upper(r, d, out);
+        if (hi & 0x80000000u) {
+            r.i = lo;
+        } else {
+            bool branch = false;
+            std::uint32_t target = npc;
+            lower(u, lo, current, target, branch);
+            if (branch) npc = target;
+        }
+        if (out.target > 0) {
+            Reg128 &dst = out.target == kAcc ? r.acc : r.vf[out.target];
+            for (int i = 0; i < 4; ++i)
+                if (out.dest & (8u >> i)) dst.w[i] = out.value.w[i];
+            if (out.flags && flags) set_flags(r, out.value, out.dest);
+        }
+        r.vf[0].d[0] = 0;
+        r.vf[0].w[2] = 0;
+        r.vf[0].w[3] = fp::kOne;
+        r.vi[0] = 0;
+        if (ending) {
+            r.tpc = pc;
+            return;
+        }
+        if (hi & 0x40000000u) ending = true;
+    }
+    std::fprintf(stderr, "[vu%d] program at 0x%04X did not end\n", n, address);
+}
 
 void run(int n, std::uint32_t address) {
+    static const bool exact = std::getenv("PS2_VU_EXACT") != nullptr;
+    if (n == 1 && !exact) {
+        interpret(n, address);
+        return;
+    }
     Unit u = unit_of(n);
     Vu0Regs &r = *u.regs;
     std::uint32_t pc = address & u.code_mask, npc = (pc + 8u) & u.code_mask;
@@ -466,3 +796,5 @@ namespace ps2 {
 void vcallms(Cpu &, std::uint32_t address) { vu::run(0, address); }
 
 }
+
+__attribute__((weak)) void register_generated_vu() {}
