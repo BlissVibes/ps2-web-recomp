@@ -3,9 +3,11 @@
 #include "ps2/system.hpp"
 
 #include <SDL.h>
+#include <SDL_syswm.h>
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 namespace {
@@ -53,6 +55,47 @@ SDL_GameController *g_pad = nullptr;
 std::uint32_t g_tex_w = 0, g_tex_h = 0;
 std::uint64_t g_last = 0;
 std::vector<std::uint32_t> g_pixels;
+bool g_gpu_tried = false, g_gpu_present = false;
+
+bool create_renderer() {
+    g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED);
+    if (!g_renderer) g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE);
+    if (!g_renderer) {
+        std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
+        return false;
+    }
+    return true;
+}
+
+bool attach_gpu() {
+    if (std::getenv("PS2_SDL_RENDERER")) return false;
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(g_window, &info)) return false;
+    ps2::WindowTarget target;
+    int w = 0, h = 0;
+    SDL_GetWindowSizeInPixels(g_window, &w, &h);
+    target.width = static_cast<std::uint32_t>(w);
+    target.height = static_cast<std::uint32_t>(h);
+    switch (info.subsystem) {
+#if defined(SDL_VIDEO_DRIVER_X11)
+    case SDL_SYSWM_X11:
+        target.kind = ps2::WindowTarget::X11;
+        target.display = info.info.x11.display;
+        target.window = static_cast<std::uint64_t>(info.info.x11.window);
+        break;
+#endif
+#if defined(SDL_VIDEO_DRIVER_WAYLAND)
+    case SDL_SYSWM_WAYLAND:
+        target.kind = ps2::WindowTarget::Wayland;
+        target.display = info.info.wl.display;
+        target.surface = info.info.wl.surface;
+        break;
+#endif
+    default: return false;
+    }
+    return ps2::attach_window(target);
+}
 
 std::uint8_t axis(SDL_GameControllerAxis a) {
     const int v = SDL_GameControllerGetAxis(g_pad, a);
@@ -63,6 +106,11 @@ void poll() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_QUIT) ps2::halt("window closed");
+        if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED && g_gpu_present) {
+            int w = 0, h = 0;
+            SDL_GetWindowSizeInPixels(g_window, &w, &h);
+            ps2::resize_window(static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h));
+        }
         if (e.type == SDL_CONTROLLERDEVICEADDED && !g_pad) g_pad = SDL_GameControllerOpen(e.cdevice.which);
         if (e.type == SDL_CONTROLLERDEVICEREMOVED && g_pad && e.cdevice.which == SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_pad))) {
             SDL_GameControllerClose(g_pad);
@@ -96,6 +144,17 @@ void poll() {
 }
 
 void present() {
+    if (!g_gpu_tried) {
+        g_gpu_tried = true;
+        g_gpu_present = attach_gpu();
+        std::fprintf(stderr, "[window] %s\n", g_gpu_present ? "presenting through WebGPU" : "presenting through SDL");
+        if (!g_gpu_present && !create_renderer()) ps2::halt("no renderer");
+    }
+    if (g_gpu_present) {
+        ps2::present_frame();
+        return;
+    }
+    if (!g_renderer) return;
     std::uint32_t w = 0, h = 0;
     if (!ps2::display_frame(g_pixels, w, h)) return;
     if (w != g_tex_w || h != g_tex_h) {
@@ -141,10 +200,8 @@ bool open_window() {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return false;
     }
-    g_window = SDL_CreateWindow("ps2-web-recomp", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 960, 720, SDL_WINDOW_RESIZABLE);
-    g_renderer = g_window ? SDL_CreateRenderer(g_window, -1, SDL_RENDERER_ACCELERATED) : nullptr;
-    if (g_window && !g_renderer) g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE);
-    if (!g_renderer) {
+    g_window = SDL_CreateWindow("ps2-web-recomp", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 960, 720, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+    if (!g_window) {
         std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
         return false;
     }

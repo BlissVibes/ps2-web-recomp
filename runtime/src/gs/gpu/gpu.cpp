@@ -15,6 +15,7 @@
 #include <string>
 
 extern const char kGsShader[];
+extern const char kBlitShader[];
 
 namespace ps2::gs {
 void swizzle_tables(std::vector<std::uint32_t> &out);
@@ -40,6 +41,14 @@ Mode g_mode = Mode::off;
 std::uint64_t g_dispatches[kPipelines] = {}, g_submits = 0;
 
 WGPUInstance g_instance = nullptr;
+WGPUAdapter g_adapter = nullptr;
+WGPUSurface g_surface = nullptr;
+WGPUTextureFormat g_surface_format = WGPUTextureFormat_Undefined;
+WGPUPresentMode g_present_mode = WGPUPresentMode_Fifo;
+std::uint32_t g_surface_width = 0, g_surface_height = 0;
+WGPURenderPipeline g_blit = nullptr;
+WGPUBindGroup g_blit_group = nullptr;
+WGPUBuffer g_blit_params = nullptr;
 WGPUDevice g_device = nullptr;
 WGPUQueue g_queue = nullptr;
 WGPUBuffer g_vram = nullptr, g_tables = nullptr, g_params = nullptr, g_data = nullptr, g_clut = nullptr, g_scratch = nullptr, g_readback = nullptr;
@@ -415,8 +424,8 @@ void ensure_capacity() {
     if (changed || !g_group) rebuild_group();
 }
 
-void submit() {
-    if (g_commands.empty()) return;
+void submit(WGPUTextureView present_view = nullptr) {
+    if (g_commands.empty() && !present_view) return;
     ensure_capacity();
     if (!g_arena.empty()) wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
     wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
@@ -436,6 +445,25 @@ void submit() {
     }
     wgpuComputePassEncoderEnd(pass);
     wgpuComputePassEncoderRelease(pass);
+    if (present_view) {
+        WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+        color.view = present_view;
+        color.loadOp = WGPULoadOp_Clear;
+        color.storeOp = WGPUStoreOp_Store;
+        color.clearValue = WGPUColor{0.0, 0.0, 0.0, 1.0};
+        WGPURenderPassDescriptor rd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+        rd.colorAttachmentCount = 1;
+        rd.colorAttachments = &color;
+        WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(enc, &rd);
+        const float w = static_cast<float>(g_surface_width), h = static_cast<float>(g_surface_height);
+        const float vw = std::min(w, h * 4.0f / 3.0f), vh = vw * 3.0f / 4.0f;
+        wgpuRenderPassEncoderSetViewport(rp, (w - vw) * 0.5f, (h - vh) * 0.5f, vw, vh, 0.0f, 1.0f);
+        wgpuRenderPassEncoderSetPipeline(rp, g_blit);
+        wgpuRenderPassEncoderSetBindGroup(rp, 0, g_blit_group, 0, nullptr);
+        wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
+        wgpuRenderPassEncoderEnd(rp);
+        wgpuRenderPassEncoderRelease(rp);
+    }
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
     wgpuQueueSubmit(g_queue, 1, &cmd);
     wgpuCommandBufferRelease(cmd);
@@ -531,12 +559,22 @@ Mode mode() { return g_mode; }
 
 bool init(Mode m) {
     if (m == Mode::off) return false;
+#ifdef __EMSCRIPTEN__
     g_instance = wgpuCreateInstance(nullptr);
+#else
+    WGPUInstanceExtras extras = {};
+    extras.chain.sType = static_cast<WGPUSType>(WGPUSType_InstanceExtras);
+    extras.backends = WGPUInstanceBackend_Primary;
+    WGPUInstanceDescriptor id = WGPU_INSTANCE_DESCRIPTOR_INIT;
+    id.nextInChain = &extras.chain;
+    g_instance = wgpuCreateInstance(&id);
+#endif
     if (!g_instance) return false;
     WGPUAdapter adapter = nullptr;
     bool adapter_done = false;
     WGPURequestAdapterOptions options = WGPU_REQUEST_ADAPTER_OPTIONS_INIT;
     options.powerPreference = std::getenv("PS2_GPU_LOW_POWER") ? WGPUPowerPreference_LowPower : WGPUPowerPreference_HighPerformance;
+    options.forceFallbackAdapter = std::getenv("PS2_GPU_FALLBACK") != nullptr;
     WGPURequestAdapterCallbackInfo acb = WGPU_REQUEST_ADAPTER_CALLBACK_INFO_INIT;
     acb.mode = WGPUCallbackMode_AllowSpontaneous;
     acb.callback = [](WGPURequestAdapterStatus status, WGPUAdapter a, WGPUStringView, void *out, void *done) {
@@ -576,7 +614,7 @@ bool init(Mode m) {
     dcb.userdata2 = &device_done;
     wgpuAdapterRequestDevice(adapter, &dd, dcb);
     while (!device_done) wgpuInstanceProcessEvents(g_instance);
-    wgpuAdapterRelease(adapter);
+    g_adapter = adapter;
     if (!g_device) return false;
     g_queue = wgpuDeviceGetQueue(g_device);
 
@@ -864,6 +902,148 @@ void stats() {
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");
+}
+
+void configure_surface() {
+    WGPUSurfaceConfiguration config = WGPU_SURFACE_CONFIGURATION_INIT;
+    config.device = g_device;
+    config.format = g_surface_format;
+    config.usage = WGPUTextureUsage_RenderAttachment;
+    config.width = std::max(g_surface_width, 1u);
+    config.height = std::max(g_surface_height, 1u);
+    config.presentMode = g_present_mode;
+    config.alphaMode = WGPUCompositeAlphaMode_Auto;
+    wgpuSurfaceConfigure(g_surface, &config);
+}
+
+bool attach_surface(const SurfaceTarget &target) {
+    if (g_mode != Mode::primary || !g_device) return false;
+    WGPUSurfaceDescriptor sd = WGPU_SURFACE_DESCRIPTOR_INIT;
+#ifdef __EMSCRIPTEN__
+    WGPUEmscriptenSurfaceSourceCanvasHTMLSelector canvas = WGPU_EMSCRIPTEN_SURFACE_SOURCE_CANVAS_HTML_SELECTOR_INIT;
+    canvas.selector = view(target.selector ? target.selector : "#canvas");
+    sd.nextInChain = &canvas.chain;
+#else
+    WGPUSurfaceSourceXlibWindow xlib = WGPU_SURFACE_SOURCE_XLIB_WINDOW_INIT;
+    WGPUSurfaceSourceWaylandSurface wayland = WGPU_SURFACE_SOURCE_WAYLAND_SURFACE_INIT;
+    if (target.kind == SurfaceTarget::X11) {
+        xlib.display = target.display;
+        xlib.window = target.window;
+        sd.nextInChain = &xlib.chain;
+    } else if (target.kind == SurfaceTarget::Wayland) {
+        wayland.display = target.display;
+        wayland.surface = target.surface;
+        sd.nextInChain = &wayland.chain;
+    } else {
+        return false;
+    }
+#endif
+    g_surface = wgpuInstanceCreateSurface(g_instance, &sd);
+    if (!g_surface) return false;
+    WGPUSurfaceCapabilities caps = WGPU_SURFACE_CAPABILITIES_INIT;
+    if (wgpuSurfaceGetCapabilities(g_surface, g_adapter, &caps) != WGPUStatus_Success || !caps.formatCount) {
+        wgpuSurfaceRelease(g_surface);
+        g_surface = nullptr;
+        return false;
+    }
+    g_surface_format = caps.formats[0];
+    for (std::size_t i = 0; i < caps.formatCount; ++i)
+        if (caps.formats[i] == WGPUTextureFormat_BGRA8Unorm || caps.formats[i] == WGPUTextureFormat_RGBA8Unorm) {
+            g_surface_format = caps.formats[i];
+            break;
+        }
+    g_present_mode = WGPUPresentMode_Fifo;
+    for (std::size_t i = 0; i < caps.presentModeCount; ++i)
+        if (caps.presentModes[i] == WGPUPresentMode_Mailbox) g_present_mode = WGPUPresentMode_Mailbox;
+    wgpuSurfaceCapabilitiesFreeMembers(caps);
+    g_surface_width = target.width;
+    g_surface_height = target.height;
+    configure_surface();
+
+    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+    source.code = view(kBlitShader);
+    WGPUShaderModuleDescriptor md = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+    md.nextInChain = &source.chain;
+    WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_device, &md);
+    WGPUBindGroupLayoutEntry le[2] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
+    le[0].binding = 0;
+    le[0].visibility = WGPUShaderStage_Fragment;
+    le[0].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+    le[1].binding = 1;
+    le[1].visibility = WGPUShaderStage_Fragment;
+    le[1].buffer.type = WGPUBufferBindingType_Uniform;
+    WGPUBindGroupLayoutDescriptor ld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+    ld.entryCount = 2;
+    ld.entries = le;
+    WGPUBindGroupLayout layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
+    WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    pld.bindGroupLayoutCount = 1;
+    pld.bindGroupLayouts = &layout;
+    WGPUPipelineLayout pipeline_layout = wgpuDeviceCreatePipelineLayout(g_device, &pld);
+    WGPUColorTargetState color = WGPU_COLOR_TARGET_STATE_INIT;
+    color.format = g_surface_format;
+    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+    fragment.module = module;
+    fragment.entryPoint = view("fs");
+    fragment.targetCount = 1;
+    fragment.targets = &color;
+    WGPURenderPipelineDescriptor rd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+    rd.layout = pipeline_layout;
+    rd.vertex.module = module;
+    rd.vertex.entryPoint = view("vs");
+    rd.fragment = &fragment;
+    g_blit = wgpuDeviceCreateRenderPipeline(g_device, &rd);
+    wgpuShaderModuleRelease(module);
+    wgpuPipelineLayoutRelease(pipeline_layout);
+    g_blit_params = make_buffer(16, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst);
+    WGPUBindGroupEntry be[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    be[0].binding = 0;
+    be[0].buffer = g_scratch;
+    be[0].size = WGPU_WHOLE_SIZE;
+    be[1].binding = 1;
+    be[1].buffer = g_blit_params;
+    be[1].size = 16;
+    WGPUBindGroupDescriptor bd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    bd.layout = layout;
+    bd.entryCount = 2;
+    bd.entries = be;
+    g_blit_group = wgpuDeviceCreateBindGroup(g_device, &bd);
+    wgpuBindGroupLayoutRelease(layout);
+    return g_blit != nullptr;
+}
+
+void resize_surface(std::uint32_t width, std::uint32_t height) {
+    if (!g_surface || (width == g_surface_width && height == g_surface_height)) return;
+    g_surface_width = width;
+    g_surface_height = height;
+    configure_surface();
+}
+
+bool has_surface() { return g_surface != nullptr; }
+
+bool present(const DisplaySource &src) {
+    if (!g_surface) return false;
+    flush_all();
+    const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u});
+    g_commands.push_back({kDisplay, (src.width + 7) / 8, (src.height + 7) / 8, param});
+    const std::uint32_t size[4] = {src.width, src.height, 0, 0};
+    wgpuQueueWriteBuffer(g_queue, g_blit_params, 0, size, sizeof size);
+    WGPUSurfaceTexture st = WGPU_SURFACE_TEXTURE_INIT;
+    wgpuSurfaceGetCurrentTexture(g_surface, &st);
+    if (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal && st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
+        if (st.texture) wgpuTextureRelease(st.texture);
+        submit();
+        configure_surface();
+        return true;
+    }
+    WGPUTextureView target = wgpuTextureCreateView(st.texture, nullptr);
+    submit(target);
+#ifndef __EMSCRIPTEN__
+    wgpuSurfacePresent(g_surface);
+#endif
+    wgpuTextureViewRelease(target);
+    wgpuTextureRelease(st.texture);
+    return true;
 }
 
 bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba) {

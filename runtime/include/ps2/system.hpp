@@ -69,6 +69,20 @@ bool halted();
 std::uint64_t frame_count();
 
 bool display_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
+
+struct WindowTarget {
+    enum Kind { X11, Wayland, Canvas } kind = X11;
+    void *display = nullptr;
+    std::uint64_t window = 0;
+    void *surface = nullptr;
+    const char *selector = nullptr;
+    std::uint32_t width = 0, height = 0;
+};
+
+// Lets the WebGPU renderer present straight to a window or canvas instead of handing frames back.
+bool attach_window(const WindowTarget &target);
+void resize_window(std::uint32_t width, std::uint32_t height);
+bool present_frame();
 void set_pad_buttons(std::uint16_t pressed);
 void set_pad_axis(int axis, std::uint8_t value);
 void set_audio_sink(std::function<void(const std::int16_t *samples, std::size_t frames)> sink);

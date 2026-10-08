@@ -56,6 +56,9 @@ std::uint32_t read_pixel(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, 
 void write_pixel(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y, std::uint32_t value);
 
 bool display(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
+bool attach_window(int kind, void *display, std::uint64_t window, void *surface, const char *selector, std::uint32_t width, std::uint32_t height);
+void resize_window(std::uint32_t width, std::uint32_t height);
+bool present();
 std::uint64_t primitives_drawn();
 void stats();
 

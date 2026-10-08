@@ -274,6 +274,9 @@ int run() {
 }
 
 bool display_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) { return gs::display(rgba, width, height); }
+bool attach_window(const WindowTarget &t) { return gs::attach_window(static_cast<int>(t.kind), t.display, t.window, t.surface, t.selector, t.width, t.height); }
+void resize_window(std::uint32_t width, std::uint32_t height) { gs::resize_window(width, height); }
+bool present_frame() { return gs::present(); }
 void set_pad_buttons(std::uint16_t pressed) { iop::sio2::set_buttons(0, pressed); }
 void set_pad_axis(int axis, std::uint8_t value) { iop::sio2::set_axis(0, axis, value); }
 void set_audio_sink(std::function<void(const std::int16_t *, std::size_t)> sink) { iop::spu2::set_sink(std::move(sink)); }

@@ -656,6 +656,42 @@ void vblank(bool start) {
 
 bool interlaced_odd_field() { return g_odd_field; }
 
+bool attach_window(int kind, void *display, std::uint64_t window, void *surface, const char *selector, std::uint32_t width, std::uint32_t height) {
+#ifdef PS2_GPU
+    if (gpu::mode() != gpu::Mode::primary) return false;
+    const gpu::SurfaceTarget target{static_cast<gpu::SurfaceTarget::Kind>(kind), display, window, surface, selector, width, height};
+    return gpu::attach_surface(target);
+#else
+    (void)kind, (void)display, (void)window, (void)surface, (void)selector, (void)width, (void)height;
+    return false;
+#endif
+}
+
+void resize_window(std::uint32_t width, std::uint32_t height) {
+#ifdef PS2_GPU
+    gpu::resize_surface(width, height);
+#else
+    (void)width, (void)height;
+#endif
+}
+
+bool present() {
+#ifdef PS2_GPU
+    if (!gpu::has_surface()) return false;
+    const int circuit = (g_pmode & 2u) ? 1 : (g_pmode & 1u) ? 0 : -1;
+    if (circuit < 0) return true;
+    const std::uint64_t fb = g_dispfb[circuit], disp = g_display[circuit];
+    const std::uint32_t magh = (static_cast<std::uint32_t>(disp >> 23) & 0xFu) + 1, magv = (static_cast<std::uint32_t>(disp >> 27) & 3u) + 1;
+    const std::uint32_t width = ((static_cast<std::uint32_t>(disp >> 32) & 0xFFFu) + 1) / magh, height = ((static_cast<std::uint32_t>(disp >> 44) & 0x7FFu) + 1) / magv;
+    if (!width || !height || width > 2048 || height > 2048) return true;
+    const gpu::DisplaySource src{(static_cast<std::uint32_t>(fb) & 0x1FFu) * 32, static_cast<std::uint32_t>(fb >> 9) & 0x3Fu, static_cast<std::uint32_t>(fb >> 15) & 0x1Fu,
+                                 static_cast<std::uint32_t>(fb >> 32) & 0x7FFu, static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, width, height, (g_smode2 & 3u) == 3u};
+    return gpu::present(src);
+#else
+    return false;
+#endif
+}
+
 bool display(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
     const int circuit = (g_pmode & 2u) ? 1 : (g_pmode & 1u) ? 0 : -1;
     if (circuit < 0) return false;
