@@ -15,6 +15,12 @@ inline constexpr std::uint32_t kIdle = 0x00001010u;
 
 extern Cpu g_cpu;
 
+struct Press {
+    std::uint64_t frame;
+    std::uint32_t frames;
+    std::uint16_t buttons;
+};
+
 struct Options {
     bool trace_syscalls = false;
     bool trace_io = false;
@@ -27,6 +33,7 @@ struct Options {
     bool trace_iop_hle = false;
     std::string frames_dir;
     std::uint32_t frame_every = 60;
+    std::vector<Press> presses;
 };
 
 extern Options g_options;

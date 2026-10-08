@@ -53,8 +53,8 @@ void controller(int port, std::size_t at, std::uint32_t out_size) {
     put(2, 0x5A);
     const std::uint16_t raw = static_cast<std::uint16_t>(~p.buttons);
     auto data = [&]() {
-        put(3, static_cast<std::uint8_t>(raw >> 8));
-        put(4, static_cast<std::uint8_t>(raw));
+        put(3, static_cast<std::uint8_t>(raw));
+        put(4, static_cast<std::uint8_t>(raw >> 8));
         if (p.mode != kDigital) {
             put(5, p.axes[0]);
             put(6, p.axes[1]);
@@ -62,7 +62,7 @@ void controller(int port, std::size_t at, std::uint32_t out_size) {
             put(8, p.axes[3]);
         }
         if (p.mode == kPressure) {
-            static const int kBits[12] = {5 + 8, 7 + 8, 4 + 8, 6 + 8, 4, 5, 6, 7, 2, 3, 0, 1};
+            static const int kBits[12] = {5, 7, 4, 6, 12, 13, 14, 15, 10, 11, 8, 9};
             for (int i = 0; i < 12; ++i) put(9 + static_cast<std::size_t>(i), (p.buttons >> kBits[i]) & 1u ? 0xFF : 0x00);
         }
     };

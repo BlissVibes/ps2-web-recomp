@@ -5,6 +5,7 @@
 #include "hw.hpp"
 #include "iop/iop.hpp"
 #include "iop/sif.hpp"
+#include "iop/sio2.hpp"
 #include "ps2/disc.hpp"
 #include "kernel.hpp"
 #include "ps2/generated.hpp"
@@ -84,8 +85,17 @@ void dump_frame() {
     std::fclose(f);
 }
 
+void apply_presses() {
+    if (g_options.presses.empty()) return;
+    std::uint16_t mask = 0;
+    for (const Press &p : g_options.presses)
+        if (g_frames >= p.frame && g_frames < p.frame + p.frames) mask |= p.buttons;
+    iop::sio2::set_buttons(0, mask);
+}
+
 void vblank() {
     ++g_frames;
+    apply_presses();
     if (g_options.trace_iop_modules && g_frames % 25 == 0) std::fprintf(stderr, "[frame] %llu prims %llu\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(gs::primitives_drawn()));
     if (!g_options.frames_dir.empty() && g_options.frame_every && g_frames % g_options.frame_every == 0) dump_frame();
     hw::vblank_start();

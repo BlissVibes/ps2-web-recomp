@@ -10,11 +10,41 @@ void register_generated_code();
 
 namespace {
 
+bool parse_press(const std::string &spec, ps2::Press &press) {
+    static const char *const kNames[16] = {"select", "l3", "r3", "start", "up", "right", "down", "left",
+                                           "l2", "r2", "l1", "r1", "triangle", "circle", "cross", "square"};
+    const auto colon = spec.find(':');
+    if (colon == std::string::npos) return false;
+    press.frame = std::strtoull(spec.c_str(), nullptr, 10);
+    std::string rest = spec.substr(colon + 1);
+    press.frames = 6;
+    const auto second = rest.find(':');
+    if (second != std::string::npos) {
+        press.frames = static_cast<std::uint32_t>(std::strtoul(rest.c_str() + second + 1, nullptr, 10));
+        rest = rest.substr(0, second);
+    }
+    press.buttons = 0;
+    std::size_t start = 0;
+    while (start <= rest.size()) {
+        const auto plus = rest.find('+', start);
+        const std::string name = rest.substr(start, plus == std::string::npos ? std::string::npos : plus - start);
+        int bit = -1;
+        for (int i = 0; i < 16; ++i)
+            if (name == kNames[i]) bit = i;
+        if (bit < 0) return false;
+        press.buttons |= static_cast<std::uint16_t>(1u << bit);
+        if (plus == std::string::npos) break;
+        start = plus + 1;
+    }
+    return true;
+}
+
 int usage() {
     std::fprintf(stderr,
                  "usage: ps2run <elf> [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
                  "              [--disc image.iso] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
-                 "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n]\n");
+                 "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n]\n"
+                 "              [--press frame:button[+button][:frames]]...\n");
     return 2;
 }
 
@@ -36,6 +66,11 @@ int main(int argc, char **argv) {
         else if (a == "--trace-iop") ps2::g_options.trace_iop_modules = true;
         else if (a == "--trace-iop-hle") ps2::g_options.trace_iop_hle = true;
         else if (a == "--frames-dir" && i + 1 < argc) ps2::g_options.frames_dir = argv[++i];
+        else if (a == "--press" && i + 1 < argc) {
+            ps2::Press press;
+            if (!parse_press(argv[++i], press)) return usage();
+            ps2::g_options.presses.push_back(press);
+        }
         else if (a == "--frame-every" && i + 1 < argc) ps2::g_options.frame_every = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         else return usage();
     }
