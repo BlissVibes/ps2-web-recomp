@@ -432,6 +432,7 @@ const std::map<int, Module> &modules() { return g_modules; }
 void register_hle_module(const std::string &name, HleModuleStart start) { g_hle_modules[name] = std::move(start); }
 
 void register_interrupt(unsigned line, std::uint32_t handler, std::uint32_t arg, std::uint32_t mode) {
+    if (g_trace_modules) std::fprintf(stderr, "[iop] interrupt %u -> 0x%08X (arg 0x%X)\n", line, handler, arg);
     g_interrupts[line] = Interrupt{handler, arg, mode};
 }
 

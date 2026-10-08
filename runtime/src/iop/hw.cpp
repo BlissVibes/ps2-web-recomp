@@ -2,6 +2,7 @@
 
 #include "iop.hpp"
 #include "kernel.hpp"
+#include "sio2.hpp"
 #include "spu2.hpp"
 
 #include <cstdio>
@@ -79,6 +80,7 @@ struct Dma {
     std::uint32_t madr, bcr, chcr, tadr;
 };
 Dma g_dma[14];
+std::uint32_t g_ohci[0x18];
 
 int dma_channel(std::uint32_t a, std::uint32_t &reg) {
     if (a >= 0x1F801080u && a < 0x1F8010F0u) {
@@ -99,10 +101,15 @@ void report(const char *what, std::uint32_t a, std::uint32_t v) {
 
 void start_dma(unsigned ch) {
     Dma &d = g_dma[ch];
+    if (kernel::g_trace_modules) std::fprintf(stderr, "[iop-dma] start ch %u madr 0x%08X bcr 0x%08X chcr 0x%08X\n", ch, d.madr, d.bcr, d.chcr);
     const std::uint32_t words = (d.bcr & 0xFFFFu) * ((d.bcr >> 16) ? (d.bcr >> 16) : 1u);
     if (ch == 4 || ch == 7) {
         spu2::dma(ch == 4 ? 0 : 1, d.madr, words, (d.chcr & 1u) != 0);
         kernel::schedule(kernel::now() + 64u + words / 4u, [ch]() { dma_done(ch); });
+        return;
+    }
+    if (ch == 11 || ch == 12) {
+        sio2::arm_dma(static_cast<int>(ch), d.madr, d.bcr & 0xFFFFu, d.bcr >> 16);
         return;
     }
     std::fprintf(stderr, "[iop-dma] channel %u start madr 0x%08X bcr 0x%08X chcr 0x%08X (not emulated)\n", ch, d.madr, d.bcr, d.chcr);
@@ -118,6 +125,8 @@ void reset() {
     std::memset(g_dma, 0, sizeof g_dma);
     std::memset(g_scratchpad, 0, sizeof g_scratchpad);
     spu2::reset();
+    sio2::reset();
+    std::memset(g_ohci, 0, sizeof g_ohci);
 }
 
 void raise_interrupt(unsigned line) {
@@ -128,12 +137,18 @@ void set_interrupt_mask(unsigned line, bool enabled) {
     if (line < 32) {
         if (enabled) g_imask |= 1u << line;
         else g_imask &= ~(1u << line);
-    } else if (line < 39) {
+        return;
+    }
+    if (enabled) {
+        g_imask |= 8u;
+        g_dicr |= 0x800000u;
+    }
+    if (line < 39) {
         const std::uint32_t bit = 1u << (16 + line - 32);
         if (enabled) g_dicr |= bit;
         else g_dicr &= ~bit;
-    } else if (line < 46) {
-        const std::uint32_t bit = 1u << (16 + line - 39);
+    } else if (line >= 40 && line < 46) {
+        const std::uint32_t bit = 1u << (16 + line - 40);
         if (enabled) g_dicr2 |= bit;
         else g_dicr2 &= ~bit;
     }
@@ -146,7 +161,7 @@ int next_pending_interrupt() {
         const std::uint32_t flags = (g_dicr >> 24) & (g_dicr >> 16) & 0x7Fu;
         if (flags) return 32 + __builtin_ctz(flags);
         const std::uint32_t flags2 = (g_dicr2 >> 24) & (g_dicr2 >> 16) & 0x3Fu;
-        if (flags2) return 39 + __builtin_ctz(flags2);
+        if (flags2) return 40 + __builtin_ctz(flags2);
         g_istat &= ~8u;
     }
     const std::uint32_t rest = g_istat & g_imask & ~8u;
@@ -159,7 +174,7 @@ void acknowledge_interrupt(unsigned line) {
         return;
     }
     if (line < 39) g_dicr &= ~(1u << (24 + line - 32));
-    else g_dicr2 &= ~(1u << (24 + line - 39));
+    else if (line >= 40) g_dicr2 &= ~(1u << (24 + line - 40));
     if (!(((g_dicr >> 24) & 0x7Fu) | ((g_dicr2 >> 24) & 0x3Fu))) g_istat &= ~8u;
 }
 
@@ -170,8 +185,30 @@ void dma_done(unsigned ch) {
     g_istat |= 8u;
 }
 
+std::uint32_t ohci_read(std::uint32_t a) {
+    const std::uint32_t reg = (a - 0x1F801600u) >> 2;
+    switch (reg) {
+    case 0x00: return 0x110u;
+    case 0x02: return g_ohci[reg] & ~1u;
+    case 0x0E: return static_cast<std::uint32_t>(kernel::now() / 36864u) & 0xFFFFu;
+    case 0x12: return 0x00000202u;
+    default: return reg < 0x18 ? g_ohci[reg] : 0u;
+    }
+}
+
+void ohci_write(std::uint32_t a, std::uint32_t v) {
+    const std::uint32_t reg = (a - 0x1F801600u) >> 2;
+    if (reg >= 0x18) return;
+    if (reg == 0x03) g_ohci[reg] &= ~v;
+    else if (reg == 0x05) g_ohci[0x04] &= ~v;
+    else if (reg == 0x04) g_ohci[reg] |= v;
+    else g_ohci[reg] = v;
+}
+
 std::uint32_t read(std::uint32_t a, unsigned size) {
     if (a >= 0x1F900000u && a < 0x1F900800u) return spu2::read(a, size);
+    if (a >= 0x1F801600u && a < 0x1F801660u) return ohci_read(a);
+    if (a >= 0x1F808200u && a < 0x1F808280u) return sio2::read(a);
     if (a == kIStat) return g_istat;
     if (a == kIMask) return g_imask;
     if (a == kICtrl) {
@@ -198,6 +235,8 @@ std::uint32_t read(std::uint32_t a, unsigned size) {
 
 void write(std::uint32_t a, std::uint32_t v, unsigned size) {
     if (a >= 0x1F900000u && a < 0x1F900800u) { spu2::write(a, v, size); return; }
+    if (a >= 0x1F801600u && a < 0x1F801660u) { ohci_write(a, v); return; }
+    if (a >= 0x1F808200u && a < 0x1F808280u) { sio2::write(a, v); return; }
     if (a == kIStat) { g_istat &= v; return; }
     if (a == kIMask) { g_imask = v; return; }
     if (a == kICtrl) { g_ictrl = v & 1u; return; }

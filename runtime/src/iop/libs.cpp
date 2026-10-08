@@ -885,10 +885,31 @@ void install_timrman() {
     def("timrman", 16, "GetHardTimerIntrCode", [](Cpu &c) { c.r[2] = 14; });
 }
 
+std::uint32_t dma_register(std::uint32_t ch, std::uint32_t reg) {
+    return (ch < 7 ? 0x1F801080u + ch * 0x10u : 0x1F801500u + (ch - 7) * 0x10u) + reg * 4u;
+}
+
+std::uint32_t g_dma_direction[16];
+
 void install_dmacman() {
     register_hle_library("dmacman", 0x0101);
-    for (std::uint32_t i : {16u, 17u, 28u, 32u, 33u, 34u, 35u})
-        def("dmacman", i, "dmac", [](Cpu &c) { c.r[2] = 0; });
+    def("dmacman", 16, "dmac_set_dpcr2", [](Cpu &c) { c.r[2] = 0; });
+    def("dmacman", 17, "dmac_get_dpcr2", [](Cpu &c) { c.r[2] = 0; });
+    def("dmacman", 28, "sceSetSliceDMA", [](Cpu &c) {
+        const std::uint32_t ch = arg(c, 0) & 15u;
+        write32(dma_register(ch, 0), arg(c, 1));
+        write32(dma_register(ch, 1), (arg(c, 3) << 16) | (arg(c, 2) & 0xFFFFu));
+        g_dma_direction[ch] = arg(c, 4);
+        c.r[2] = 1;
+    });
+    def("dmacman", 32, "sceStartDMA", [](Cpu &c) {
+        const std::uint32_t ch = arg(c, 0) & 15u;
+        write32(dma_register(ch, 2), 0x01000200u | (g_dma_direction[ch] & 1u));
+        c.r[2] = 1;
+    });
+    def("dmacman", 33, "sceSetDMAPriority", [](Cpu &c) { c.r[2] = 1; });
+    def("dmacman", 34, "sceEnableDMAChannel", [](Cpu &c) { c.r[2] = 1; });
+    def("dmacman", 35, "sceDisableDMAChannel", [](Cpu &c) { c.r[2] = 1; });
 }
 
 void install_heaplib() {
