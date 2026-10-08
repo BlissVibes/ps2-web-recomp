@@ -44,6 +44,23 @@ add_library(ps2runtime STATIC
 target_include_directories(ps2runtime PUBLIC runtime/include)
 target_compile_options(ps2runtime PRIVATE -Wall -Wextra)
 
+set(PS2_WGPU_DIR "${CMAKE_SOURCE_DIR}/third_party/wgpu-native" CACHE PATH "wgpu-native release folder")
+if(EMSCRIPTEN OR EXISTS "${PS2_WGPU_DIR}/lib/libwgpu_native.a")
+    set(PS2_GS_WGSL "${CMAKE_BINARY_DIR}/gs_wgsl.cpp")
+    add_custom_command(OUTPUT "${PS2_GS_WGSL}"
+        COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR}/runtime/src/gs/gpu/gs.wgsl -DOUT=${PS2_GS_WGSL} -DNAME=kGsShader -P ${CMAKE_SOURCE_DIR}/cmake/embed.cmake
+        DEPENDS runtime/src/gs/gpu/gs.wgsl cmake/embed.cmake)
+    target_sources(ps2runtime PRIVATE runtime/src/gs/gpu/gpu.cpp "${PS2_GS_WGSL}")
+    target_compile_definitions(ps2runtime PUBLIC PS2_GPU)
+    if(EMSCRIPTEN)
+        target_compile_options(ps2runtime PUBLIC --use-port=emdawnwebgpu)
+        target_link_options(ps2runtime PUBLIC --use-port=emdawnwebgpu)
+    else()
+        target_include_directories(ps2runtime PRIVATE "${PS2_WGPU_DIR}/include")
+        target_link_libraries(ps2runtime PUBLIC "${PS2_WGPU_DIR}/lib/libwgpu_native.a" dl pthread m)
+    endif()
+endif()
+
 if(PS2_GENERATED)
     file(GLOB PS2_UNITS CONFIGURE_DEPENDS "${PS2_GENERATED}/*.cpp")
     add_library(ps2game STATIC ${PS2_UNITS})

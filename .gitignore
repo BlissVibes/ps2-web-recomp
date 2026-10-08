@@ -16,3 +16,4 @@
 __pycache__/
 
 /.claude/
+/third_party/wgpu-native/

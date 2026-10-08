@@ -2,6 +2,9 @@
 
 #include "raster.hpp"
 #include "../hw.hpp"
+#ifdef PS2_GPU
+#include "gpu/gpu.hpp"
+#endif
 
 #include <algorithm>
 #include <cstdio>
@@ -22,11 +25,20 @@ std::uint64_t g_dispfb[2], g_display[2], g_extbuf, g_extdata, g_extwrite, g_bgco
 std::uint64_t g_csr = 0x551B4000ull, g_imr = 0x7F00ull, g_busdir, g_siglblid;
 std::uint64_t g_primitives = 0;
 
+#ifdef PS2_GPU
+bool gpu_on() { return gpu::mode() != gpu::Mode::off; }
+bool cpu_raster() { return gpu::mode() != gpu::Mode::primary; }
+#else
+constexpr bool gpu_on() { return false; }
+constexpr bool cpu_raster() { return true; }
+#endif
+
 bool trace_display() {
     static const bool enabled = std::getenv("PS2_TRACE_DISPLAY") != nullptr;
     return enabled;
 }
 std::uint64_t g_writes[128];
+std::vector<std::uint32_t> g_gpu_frame;
 bool g_odd_field = false;
 
 struct Transfer {
@@ -145,6 +157,10 @@ std::uint8_t g_carry[4];
 std::size_t g_carried = 0;
 
 void feed_image(const std::uint8_t *data, std::size_t bytes) {
+#ifdef PS2_GPU
+    if (gpu_on() && (g_state.trxdir & 3u) == 0) gpu::image_data(data, bytes);
+#endif
+    if (!cpu_raster()) return;
     if (!g_transfer.active || (g_state.trxdir & 3u) != 0) return;
     const std::uint32_t psm = static_cast<std::uint32_t>(g_state.bitbltbuf >> 56) & 0x3Fu;
     const std::uint32_t bits = bits_per_pixel(psm);
@@ -204,6 +220,10 @@ void load_clut(std::uint64_t tex0) {
     const std::uint32_t cpsm = static_cast<std::uint32_t>(tex0 >> 51) & 0xFu;
     const std::uint32_t csm = static_cast<std::uint32_t>(tex0 >> 55) & 1u;
     const std::uint32_t csa = static_cast<std::uint32_t>(tex0 >> 56) & 0x1Fu;
+#ifdef PS2_GPU
+    if (gpu_on()) gpu::load_clut(tex0, g_state.texclut);
+#endif
+    if (!cpu_raster()) return;
     const bool eight = psm == PSMT8 || psm == PSMT8H;
     const std::uint32_t entries = eight ? 256u : 16u;
     const std::uint32_t texclut = static_cast<std::uint32_t>(g_state.texclut);
@@ -235,6 +255,18 @@ void load_clut(std::uint64_t tex0) {
 }
 
 std::uint8_t *memory() { return g_memory; }
+
+void swizzle_tables(std::vector<std::uint32_t> &out) {
+    out.clear();
+    for (auto &row : g_off32) out.insert(out.end(), std::begin(row), std::end(row));
+    for (auto &row : g_offz32) out.insert(out.end(), std::begin(row), std::end(row));
+    for (auto &row : g_off16) out.insert(out.end(), std::begin(row), std::end(row));
+    for (auto &row : g_off16s) out.insert(out.end(), std::begin(row), std::end(row));
+    for (auto &row : g_offz16) out.insert(out.end(), std::begin(row), std::end(row));
+    for (auto &row : g_offz16s) out.insert(out.end(), std::begin(row), std::end(row));
+    for (auto &row : g_off8) out.insert(out.end(), std::begin(row), std::end(row));
+    for (auto &row : g_off4) out.insert(out.end(), std::begin(row), std::end(row));
+}
 
 std::uint32_t address32(std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y) {
     return wrap(page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63]);
@@ -314,6 +346,11 @@ void reset() {
     if (!built) {
         build_tables();
         built = true;
+#ifdef PS2_GPU
+        const char *backend = std::getenv("PS2_GS");
+        const gpu::Mode wanted = !backend ? gpu::Mode::off : std::strcmp(backend, "gpu") == 0 ? gpu::Mode::primary : std::strcmp(backend, "both") == 0 ? gpu::Mode::mirror : gpu::Mode::off;
+        if (wanted != gpu::Mode::off && !gpu::init(wanted)) std::fprintf(stderr, "[gs] WebGPU unavailable, using the software renderer\n");
+#endif
     }
     std::memset(&g_state, 0, sizeof g_state);
     std::memset(g_memory, 0, sizeof g_memory);
@@ -330,7 +367,10 @@ void kick(bool draw) {
     const int needed = prim == 0 ? 1 : (prim == 1 || prim == 2 || prim == 6) ? 2 : prim == 7 ? 1 : 3;
     if (s.count < needed) return;
     if (draw) {
-        raster::draw(s, s.queue, needed);
+        if (cpu_raster()) raster::draw(s, s.queue, needed);
+#ifdef PS2_GPU
+        if (gpu_on()) gpu::draw(s, s.queue, needed);
+#endif
         ++g_primitives;
     }
     switch (prim) {
@@ -443,8 +483,15 @@ void write(std::uint32_t reg, std::uint64_t value) {
         s.trxdir = value;
         g_transfer = Transfer{};
         g_carried = 0;
+#ifdef PS2_GPU
+        if (gpu_on()) {
+            if ((value & 3u) == 0) gpu::image_begin(s);
+            else if ((value & 3u) == 2) gpu::local_copy(s);
+            else if ((value & 3u) == 1 && !cpu_raster()) gpu::download(g_memory);
+        }
+#endif
         if ((value & 3u) == 0) g_transfer.active = true;
-        else if ((value & 3u) == 2) local_copy();
+        else if ((value & 3u) == 2) { if (cpu_raster()) local_copy(); }
         else if ((value & 3u) == 1) g_transfer.active = true;
         break;
     case 0x54:
@@ -601,6 +648,9 @@ void vblank(bool start) {
     if (start) {
         g_odd_field = !g_odd_field;
         raise(8);
+#ifdef PS2_GPU
+        if (gpu_on()) gpu::flush();
+#endif
     }
 }
 
@@ -619,6 +669,14 @@ bool display(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32
     height = dh / magv;
     if (!width || !height || width > 2048 || height > 2048) return false;
     const bool halved = (g_smode2 & 3u) == 3u;
+#ifdef PS2_GPU
+    if (gpu_on()) {
+        const gpu::DisplaySource src{fbp * 32, fbw, psm, dbx, dby, width, height, halved};
+        if (!cpu_raster()) return gpu::display(src, rgba);
+        static const bool compare = std::getenv("PS2_GS_COMPARE") != nullptr;
+        if (compare) g_gpu_frame.clear(), gpu::display(src, g_gpu_frame);
+    }
+#endif
     rgba.resize(static_cast<std::size_t>(width) * height);
     for (std::uint32_t y = 0; y < height; ++y)
         for (std::uint32_t x = 0; x < width; ++x) {
@@ -627,12 +685,30 @@ bool display(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32
                 c = ((c & 0x1Fu) << 3) | ((c & 0x3E0u) << 6) | ((c & 0x7C00u) << 9) | 0xFF000000u;
             rgba[static_cast<std::size_t>(y) * width + x] = c | 0xFF000000u;
         }
+#ifdef PS2_GPU
+    if (!g_gpu_frame.empty() && g_gpu_frame.size() == rgba.size()) {
+        std::size_t differ = 0;
+        int worst = 0;
+        for (std::size_t i = 0; i < rgba.size(); ++i) {
+            int delta = 0;
+            for (int ch = 0; ch < 24; ch += 8)
+                delta = std::max(delta, std::abs(static_cast<int>((rgba[i] >> ch) & 0xFFu) - static_cast<int>((g_gpu_frame[i] >> ch) & 0xFFu)));
+            if (delta > 2) ++differ;
+            worst = std::max(worst, delta);
+        }
+        std::fprintf(stderr, "[gs] gpu differs in %zu of %zu pixels (max %d)\n", differ, rgba.size(), worst);
+        if (std::strcmp(std::getenv("PS2_GS_COMPARE"), "show") == 0) rgba.swap(g_gpu_frame);
+    }
+#endif
     return true;
 }
 
 std::uint64_t primitives_drawn() { return g_primitives; }
 
 void dump_region(const char *spec) {
+#ifdef PS2_GPU
+    if (gpu_on() && !cpu_raster()) gpu::download(g_memory);
+#endif
     unsigned bp = 0, bw = 0, psm = 0, w = 0, h = 0;
     char path[256] = {};
     if (std::sscanf(spec, "%x,%u,%u,%u,%u,%255s", &bp, &bw, &psm, &w, &h, path) != 6) return;
