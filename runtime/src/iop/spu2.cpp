@@ -84,7 +84,8 @@ void check_irq(std::uint32_t address, std::uint32_t words) {
         if (((k.irqa - address) & kRamMask) >= words) continue;
         k.irq = true;
         static const bool trace = std::getenv("PS2_TRACE_SPU2") != nullptr;
-        if (trace) std::fprintf(stderr, "[spu2] irq at 0x%05X time %llu\n", k.irqa, static_cast<unsigned long long>(kernel::now()));
+        if (trace) std::fprintf(stderr, "[spu2] core %d irq at 0x%05X (access 0x%05X+%u) time %llu\n", static_cast<int>(&k - g_cores), k.irqa, address, words,
+                                static_cast<unsigned long long>(kernel::now()));
         hw::raise_interrupt(kSpuLine);
     }
 }
@@ -92,7 +93,6 @@ void check_irq(std::uint32_t address, std::uint32_t words) {
 void decode_block(Voice &v, std::int16_t *out) {
     static const int kFilter[5][2] = {{0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}};
     const std::uint32_t at = v.next & kRamMask;
-    check_irq(at, 8);
     const std::uint16_t header = g_ram[at];
     const int shift = header & 0xF, filter = std::min((header >> 4) & 0xF, 4);
     const unsigned flags = header >> 8;
@@ -129,6 +129,7 @@ void key_on(Voice &v) {
     v.env = Envelope{};
     decode_block(v, v.buffer);
     decode_block(v, v.buffer + 28);
+    check_irq(v.block[0], 8);
 }
 
 void update_envelope(Voice &v) {
@@ -170,6 +171,7 @@ void render_voice(Voice &v, std::int32_t &left, std::int32_t &right) {
         v.position -= 28u << 12;
         std::memmove(v.buffer, v.buffer + 28, 28 * sizeof(std::int16_t));
         v.block[0] = v.block[1];
+        check_irq(v.block[0], 8);
         decode_block(v, v.buffer + 28);
     }
     update_envelope(v);
@@ -475,6 +477,17 @@ void dma(int core, std::uint32_t madr, std::uint32_t words, bool to_spu, std::fu
 }
 
 void set_sink(std::function<void(const std::int16_t *, std::size_t)> sink) { g_sink = std::move(sink); }
+
+void dump_voices() {
+    for (int c = 0; c < 2; ++c)
+        for (int i = 0; i < 24; ++i) {
+            const Voice &v = g_cores[c].voices[i];
+            if (v.phase == kOff && !v.end) continue;
+            const std::uint16_t header = g_ram[v.block[0] & kRamMask];
+            std::fprintf(stderr, "[spu2] core %d voice %d phase %d ssa 0x%05X lsax 0x%05X block 0x%05X flags %X next 0x%05X pitch 0x%04X env %d end %d\n", c, i,
+                         static_cast<int>(v.phase), v.ssa, v.lsax, v.block[0], header >> 8, v.next, v.pitch, v.env.level, v.end ? 1 : 0);
+        }
+}
 
 void dump_audio(const char *path) {
     std::FILE *f = std::fopen(path, "wb");
