@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -75,16 +76,21 @@ std::vector<Handler> g_intc_handlers;
 std::vector<Handler> g_dmac_handlers;
 std::map<int, Alarm> g_alarms;
 int g_current = 0;
-int g_next_thread = 1;
-int g_next_sema = 1;
 int g_next_handler = 1;
-int g_next_alarm = 1;
 std::uint64_t g_order = 0;
 bool g_in_handler = false;
+std::vector<std::uint32_t> g_guest_calls;
 bool g_reschedule = false;
 std::vector<int> g_pending_alarms;
 std::uint32_t g_vsync_flag = 0, g_vsync_data = 0;
 std::uint32_t g_osd_config = 0;
+
+template <typename Map>
+int lowest_free(const Map &map, int limit) {
+    for (int id = 1; id < limit; ++id)
+        if (!map.count(id)) return id;
+    return -1;
+}
 
 std::uint32_t arg(const Cpu &c, int i) { return c.r[4 + i].w[0]; }
 void ret(Cpu &c, std::int64_t v) { c.r[2].sd[0] = v; }
@@ -166,6 +172,8 @@ std::uint32_t run_guest(Cpu &c, std::uint32_t address, std::uint32_t a0, std::ui
     save_context(c, saved);
     const bool nested = g_in_handler;
     g_in_handler = true;
+    const std::uint32_t status = c.cop0[12];
+    c.cop0[12] = (status & ~0x10001u) | 0x2u;
     c.r[4].sd[0] = static_cast<std::int32_t>(a0);
     c.r[5].sd[0] = static_cast<std::int32_t>(a1);
     c.r[6].sd[0] = static_cast<std::int32_t>(a2);
@@ -174,14 +182,17 @@ std::uint32_t run_guest(Cpu &c, std::uint32_t address, std::uint32_t a0, std::ui
     c.r[29].sd[0] = static_cast<std::int32_t>(kKernelStackTop - (nested ? 0x4000u : 0u));
     c.r[31].sd[0] = static_cast<std::int32_t>(kHandlerReturn);
     c.pc = address;
+    g_guest_calls.push_back(address);
     while (!halted()) {
         c.pc &= ~kUnwind;
         if (c.pc == kHandlerReturn) break;
         if (c.budget <= 0) set_budget(c, 20000);
         dispatch(c, 0, 0);
     }
+    g_guest_calls.pop_back();
     const std::uint32_t result = c.r[2].w[0];
     load_context(c, saved);
+    c.cop0[12] = status;
     g_in_handler = nested;
     return result;
 }
@@ -198,6 +209,8 @@ void run_intc(Cpu &c, unsigned cause) {
 
 void run_dmac(Cpu &c, unsigned channel) {
     hw::dmac_ack(channel);
+    static const bool trace = std::getenv("PS2_TRACE_DMA") != nullptr;
+    if (trace) std::fprintf(stderr, "[dmac] interrupt ch%u thread %d\n", channel, g_current);
     const std::vector<Handler> handlers = g_dmac_handlers;
     for (const Handler &h : handlers) {
         if (h.cause != channel) continue;
@@ -255,7 +268,8 @@ void run_alarms(Cpu &c) {
 int create_thread(Cpu &c) {
     const std::uint32_t p = arg(c, 0);
     Thread t;
-    t.id = g_next_thread++;
+    t.id = lowest_free(g_threads, 256);
+    if (t.id < 0) return -1;
     t.status = kDormant;
     t.entry = ld32(p + 4);
     t.stack = ld32(p + 8);
@@ -342,7 +356,7 @@ void wait_sema(Cpu &c, int id) {
         return;
     }
     if (g_in_handler) {
-        std::fprintf(stderr, "[kernel] WaitSema(%d) inside an interrupt handler\n", id);
+        std::fprintf(stderr, "[kernel] WaitSema(%d) inside an interrupt handler (ra 0x%08X, thread %d, handler 0x%08X)\n", id, c.r[31].w[0], g_current, g_guest_calls.empty() ? 0u : g_guest_calls.back());
         return;
     }
     s.waiters.push_back(g_current);
@@ -360,7 +374,7 @@ void reset() {
     g_dmac_handlers.clear();
     g_alarms.clear();
     g_current = 0;
-    g_next_thread = g_next_sema = g_next_handler = g_next_alarm = 1;
+    g_next_handler = 1;
     g_in_handler = g_reschedule = false;
     g_pending_alarms.clear();
     std::memset(g_ram + kSyscallTable, 0, 0x400);
@@ -368,7 +382,7 @@ void reset() {
 
 void start_main_thread(std::uint32_t entry, std::uint32_t gp, std::uint32_t argc, std::uint32_t argv) {
     Thread t;
-    t.id = g_next_thread++;
+    t.id = 1;
     t.status = kRun;
     t.entry = entry;
     t.gp = gp;
@@ -391,6 +405,7 @@ bool must_unwind() {
 }
 
 bool in_handler() { return g_in_handler; }
+int current_thread() { return g_current; }
 
 void service(Cpu &c) {
     if (g_in_handler) return;
@@ -461,7 +476,8 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
     case 0x16: case 0x1C: ret(c, hw::dmac_set_mask(arg(c, 0), true) ? 1 : 0); break;
     case 0x17: case 0x1D: ret(c, hw::dmac_set_mask(arg(c, 0), false) ? 1 : 0); break;
     case 0x18: case 0x1E: {
-        const int id = g_next_alarm++;
+        const int id = lowest_free(g_alarms, 64);
+        if (id < 0) { ret(c, -1); break; }
         g_alarms[id] = Alarm{arg(c, 1), arg(c, 2), c.r[28].w[0], now() + static_cast<std::uint64_t>(arg(c, 0) & 0xFFFFu) * 18874u};
         arm_alarm(id);
         ret(c, id);
@@ -600,7 +616,8 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
         s.attr = ld32(p + 16);
         s.option = ld32(p + 20);
         s.count = s.init;
-        const int id = g_next_sema++;
+        const int id = lowest_free(g_semas, 256);
+        if (id < 0) { ret(c, -1); break; }
         g_semas[id] = s;
         ret(c, id);
         break;
