@@ -137,6 +137,7 @@ void run_chain(int ch) {
             vif::transfer(ch, q, 1);
         }
         bool end = false;
+        const std::uint32_t tag_at = c.tadr;
         std::uint32_t data = c.tadr + 16;
         switch (id) {
         case 0: data = addr_full; c.tadr += 16; end = true; break;
@@ -164,6 +165,8 @@ void run_chain(int ch) {
         }
         c.madr = data;
         if (ch == 2 && g_starts[2] <= 2) std::fprintf(stderr, "[dma] gif tag id %u qwc %u addr 0x%08X data 0x%08X\n", id, qwc, addr_full, data);
+        static const bool trace_tags = std::getenv("PS2_TRACE_DMA1") != nullptr;
+        if (trace_tags && ch == 1) std::fprintf(stderr, "[dma] ch1 tag at 0x%08X id %u qwc %u irq %d addr 0x%08X next 0x%08X\n", tag_at, id, qwc, irq ? 1 : 0, addr_full, c.tadr);
         deliver(ch, data, qwc);
         c.madr = data + qwc * 16;
         if (vif_stalled(ch)) {

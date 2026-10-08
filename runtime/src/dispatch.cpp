@@ -58,6 +58,8 @@ void dispatch(Cpu &c, std::uint32_t, std::uint32_t depth) {
         char reason[64];
         std::snprintf(reason, sizeof reason, "missing code at 0x%08X (ra 0x%08X)", pc, c.r[31].w[0]);
         std::fprintf(stderr, "[ee] no translated code at 0x%08X (ra 0x%08X)\n", pc, c.r[31].w[0]);
+        for (int i = 1; i < 32; i += 4)
+            std::fprintf(stderr, "[ee]   r%-2d %08X %08X %08X %08X\n", i, c.r[i].w[0], c.r[i + 1].w[0], c.r[i + 2].w[0], i + 3 < 32 ? c.r[i + 3].w[0] : 0u);
         halt(reason);
         c.pc = pc | kUnwind;
         return;
