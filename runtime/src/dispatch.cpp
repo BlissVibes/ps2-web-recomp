@@ -55,8 +55,10 @@ void dispatch(Cpu &c, std::uint32_t, std::uint32_t depth) {
     const std::uint16_t id = u ? u->entries[(pc - u->base) >> 2] : 0;
     if (!id) {
         record_miss(pc);
+        char reason[64];
+        std::snprintf(reason, sizeof reason, "missing code at 0x%08X (ra 0x%08X)", pc, c.r[31].w[0]);
         std::fprintf(stderr, "[ee] no translated code at 0x%08X (ra 0x%08X)\n", pc, c.r[31].w[0]);
-        halt("missing code");
+        halt(reason);
         c.pc = pc | kUnwind;
         return;
     }

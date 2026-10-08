@@ -475,7 +475,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
     case 0x15: case 0x1B: ret(c, hw::intc_set_mask(arg(c, 0), false) ? 1 : 0); break;
     case 0x16: case 0x1C: ret(c, hw::dmac_set_mask(arg(c, 0), true) ? 1 : 0); break;
     case 0x17: case 0x1D: ret(c, hw::dmac_set_mask(arg(c, 0), false) ? 1 : 0); break;
-    case 0x18: case 0x1E: {
+    case 0x18: case 0x1E: case 0xFC: case 0xFE: {
         const int id = lowest_free(g_alarms, 64);
         if (id < 0) { ret(c, -1); break; }
         g_alarms[id] = Alarm{arg(c, 1), arg(c, 2), c.r[28].w[0], now() + static_cast<std::uint64_t>(arg(c, 0) & 0xFFFFu) * 18874u};
@@ -483,7 +483,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
         ret(c, id);
         break;
     }
-    case 0x19: case 0x1F: g_alarms.erase(static_cast<int>(arg(c, 0))); ret(c, 0); break;
+    case 0x19: case 0x1F: case 0xFD: case 0xFF: g_alarms.erase(static_cast<int>(arg(c, 0))); ret(c, 0); break;
     case 0x20: ret(c, create_thread(c)); break;
     case 0x21: g_threads.erase(static_cast<int>(arg(c, 0))); ret(c, 0); break;
     case 0x22: {
