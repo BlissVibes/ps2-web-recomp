@@ -161,23 +161,31 @@ std::int32_t volume(std::uint16_t reg, Envelope &e) {
     return e.level;
 }
 
-void render_voice(Voice &v, std::int32_t &left, std::int32_t &right) {
+void render_voice(Voice &v, std::int32_t (*sum)[2]) {
     if (v.key_on) key_on(v);
-    if (v.phase == kOff) return;
-    const std::uint32_t index = v.position >> 12, frac = v.position & 0xFFFu;
-    const std::int32_t sample = (v.buffer[index] * static_cast<std::int32_t>(0x1000 - frac) + v.buffer[index + 1] * static_cast<std::int32_t>(frac)) >> 12;
-    v.position += std::min<std::uint32_t>(v.pitch, 0x3FFFu);
-    while ((v.position >> 12) >= 28) {
-        v.position -= 28u << 12;
-        std::memmove(v.buffer, v.buffer + 28, 28 * sizeof(std::int16_t));
-        v.block[0] = v.block[1];
-        check_irq(v.block[0], 8);
-        decode_block(v, v.buffer + 28);
+    const std::uint32_t step = std::min<std::uint32_t>(v.pitch, 0x3FFFu);
+    const bool sweep_l = v.voll & 0x8000u, sweep_r = v.volr & 0x8000u;
+    const std::int32_t fixed_l = static_cast<std::int16_t>(v.voll << 1), fixed_r = static_cast<std::int16_t>(v.volr << 1);
+    std::uint32_t position = v.position;
+    for (unsigned n = 0; n < kBatch; ++n) {
+        if (v.phase == kOff) break;
+        const std::uint32_t index = position >> 12, frac = position & 0xFFFu;
+        const std::int32_t sample = (v.buffer[index] * static_cast<std::int32_t>(0x1000 - frac) + v.buffer[index + 1] * static_cast<std::int32_t>(frac)) >> 12;
+        position += step;
+        while ((position >> 12) >= 28) {
+            position -= 28u << 12;
+            std::memmove(v.buffer, v.buffer + 28, 28 * sizeof(std::int16_t));
+            v.block[0] = v.block[1];
+            v.position = position;
+            check_irq(v.block[0], 8);
+            decode_block(v, v.buffer + 28);
+        }
+        update_envelope(v);
+        const std::int32_t out = sample * v.env.level >> 15;
+        sum[n][0] += out * (sweep_l ? volume(v.voll, v.vol[0]) : fixed_l) >> 15;
+        sum[n][1] += out * (sweep_r ? volume(v.volr, v.vol[1]) : fixed_r) >> 15;
     }
-    update_envelope(v);
-    const std::int32_t out = sample * v.env.level >> 15;
-    left += out * volume(v.voll, v.vol[0]) >> 15;
-    right += out * volume(v.volr, v.vol[1]) >> 15;
+    v.position = position;
 }
 
 void feed_input(int core) {
@@ -224,10 +232,16 @@ std::int32_t master(std::uint16_t reg) { return reg & 0x8000u ? 0x7FFF : static_
 void tick() {
     std::int16_t out[kBatch * 2];
     std::int32_t sum[2][kBatch][2] = {};
+    static const bool count = std::getenv("PS2_SPU2_COUNT") != nullptr;
+    static std::uint64_t ticks = 0, active = 0, phases[5] = {};
     for (int c = 0; c < 2; ++c) {
         for (Voice &v : g_cores[c].voices) {
             if (!v.key_on && v.phase == kOff) continue;
-            for (unsigned n = 0; n < kBatch; ++n) render_voice(v, sum[c][n][0], sum[c][n][1]);
+            if (count) {
+                ++active;
+                ++phases[v.phase];
+            }
+            render_voice(v, sum[c]);
         }
         for (unsigned n = 0; n < kBatch; ++n) render_input(c, sum[c][n][0], sum[c][n][1]);
     }
@@ -240,6 +254,9 @@ void tick() {
         out[n * 2] = static_cast<std::int16_t>(std::clamp(mix[0], -32768, 32767));
         out[n * 2 + 1] = static_cast<std::int16_t>(std::clamp(mix[1], -32768, 32767));
     }
+    if (count && ++ticks % 15000 == 0)
+        std::fprintf(stderr, "[spu2] %.1f voices per batch (attack %.1f decay %.1f sustain %.1f release %.1f)\n", static_cast<double>(active) / ticks,
+                     static_cast<double>(phases[1]) / ticks, static_cast<double>(phases[2]) / ticks, static_cast<double>(phases[3]) / ticks, static_cast<double>(phases[4]) / ticks);
     if (g_record) g_audio.insert(g_audio.end(), out, out + kBatch * 2);
     if (g_sink) g_sink(out, kBatch);
     feed_input(0);
