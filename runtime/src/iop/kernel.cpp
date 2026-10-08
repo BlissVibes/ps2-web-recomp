@@ -332,12 +332,16 @@ std::uint32_t call_guest(std::uint32_t address, std::uint32_t a0, std::uint32_t 
     g_cpu.pc = address;
     g_cpu.npc = address + 4;
     std::int64_t guard = 50'000'000;
+    bool switch_wanted = g_switch;
+    g_switch = false;
     while (!g_nested_done && guard > 0) {
         std::int64_t budget = kSlice;
         execute(g_cpu, budget);
         guard -= kSlice - budget;
-        if (g_switch && !g_nested_done) g_switch = false;
+        switch_wanted |= g_switch;
+        g_switch = false;
     }
+    g_switch = switch_wanted;
     if (guard <= 0) std::fprintf(stderr, "[iop] guest call to 0x%08X did not return\n", address);
     const std::uint32_t result = g_cpu.r[2];
     g_cpu = saved;
