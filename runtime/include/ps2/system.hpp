@@ -84,6 +84,8 @@ struct WindowTarget {
 bool attach_window(const WindowTarget &target);
 void resize_window(std::uint32_t width, std::uint32_t height);
 bool present_frame();
+// Latest frame for hosts that draw it themselves, fields blended; may lag a frame and is false while none is ready.
+bool copy_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 // Parses "frame:button[+button][:frames]" as used by --press.
 bool parse_press(const std::string &spec, Press &press);
 // GPU time spent on emulation so far, estimated from timestamp queries (0 when unsupported).

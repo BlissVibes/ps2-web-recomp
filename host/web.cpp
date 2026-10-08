@@ -122,7 +122,7 @@ void on_vblank() {
     }
     if (g_window) ps2::present_frame();
     std::uint32_t w = 0, h = 0;
-    if (g_copy && ps2::display_frame(g_frame, w, h)) ps2web_blit(g_frame.data(), static_cast<int>(w), static_cast<int>(h));
+    if (g_copy && ps2::copy_frame(g_frame, w, h)) ps2web_blit(g_frame.data(), static_cast<int>(w), static_cast<int>(h));
     if (EM_ASM_INT({ return Module.wantSnapshot ? 1 : 0; })) {
         std::vector<std::uint32_t> rgba;
         std::uint32_t w = 0, h = 0;

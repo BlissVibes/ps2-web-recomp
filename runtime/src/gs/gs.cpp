@@ -747,6 +747,38 @@ bool display(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32
     return true;
 }
 
+bool copy_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
+    static std::vector<std::uint32_t> previous;
+    bool got = false;
+#ifdef PS2_GPU
+    if (gpu_on() && !cpu_raster()) {
+        const int circuit = (g_pmode & 2u) ? 1 : (g_pmode & 1u) ? 0 : -1;
+        if (circuit < 0) return false;
+        const std::uint64_t fb = g_dispfb[circuit], disp = g_display[circuit];
+        const std::uint32_t magh = (static_cast<std::uint32_t>(disp >> 23) & 0xFu) + 1, magv = (static_cast<std::uint32_t>(disp >> 27) & 3u) + 1;
+        const std::uint32_t w = ((static_cast<std::uint32_t>(disp >> 32) & 0xFFFu) + 1) / magh, h = ((static_cast<std::uint32_t>(disp >> 44) & 0x7FFu) + 1) / magv;
+        if (!w || !h || w > 2048 || h > 2048) return false;
+        const gpu::DisplaySource src{(static_cast<std::uint32_t>(fb) & 0x1FFu) * 32, static_cast<std::uint32_t>(fb >> 9) & 0x3Fu, static_cast<std::uint32_t>(fb >> 15) & 0x1Fu,
+                                     static_cast<std::uint32_t>(fb >> 32) & 0x7FFu, static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, w, h, (g_smode2 & 3u) == 3u};
+        got = gpu::display_async(src, rgba, width, height);
+    } else
+#endif
+        got = display(rgba, width, height);
+    if (!got) return false;
+    if (previous.size() != rgba.size()) {
+        previous = rgba;
+        return true;
+    }
+    static const bool weave_off = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
+    const bool blend = (g_smode2 & 3u) == 3u && !weave_off;
+    for (std::size_t i = 0; i < rgba.size(); ++i) {
+        const std::uint32_t c = rgba[i];
+        if (blend) rgba[i] = (c & previous[i]) + (((c ^ previous[i]) & 0xFEFEFEFEu) >> 1);
+        previous[i] = c;
+    }
+    return true;
+}
+
 std::uint64_t primitives_drawn() { return g_primitives; }
 
 void dump_region(const char *spec) {

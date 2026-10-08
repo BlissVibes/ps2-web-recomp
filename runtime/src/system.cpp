@@ -281,6 +281,7 @@ bool display_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::
 bool attach_window(const WindowTarget &t) { return gs::attach_window(static_cast<int>(t.kind), t.display, t.window, t.surface, t.selector, t.width, t.height); }
 void resize_window(std::uint32_t width, std::uint32_t height) { gs::resize_window(width, height); }
 bool present_frame() { return gs::present(); }
+bool copy_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) { return gs::copy_frame(rgba, width, height); }
 
 bool parse_press(const std::string &spec, Press &press) {
     static const char *const kNames[16] = {"select", "l3", "r3", "start", "up", "right", "down", "left",

@@ -1134,6 +1134,77 @@ double busy_ms() {
     return static_cast<double>(g_measured_ns) / static_cast<double>(g_measured) * static_cast<double>(g_total_passes) / 1e6;
 }
 
+struct Copy {
+    WGPUBuffer buffer = nullptr;
+    std::uint64_t size = 0, order = 0;
+    std::uint32_t width = 0, height = 0;
+    bool busy = false, ready = false;
+};
+Copy g_copies[3];
+std::uint64_t g_copy_order = 0;
+
+bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
+#ifdef __EMSCRIPTEN__
+    wgpuInstanceProcessEvents(g_instance);
+#else
+    wgpuDevicePoll(g_device, false, nullptr);
+#endif
+    Copy *newest = nullptr;
+    for (Copy &c : g_copies)
+        if (c.ready && (!newest || c.order > newest->order)) newest = &c;
+    if (newest) {
+        const std::uint64_t bytes = static_cast<std::uint64_t>(newest->width) * newest->height * 4;
+        const void *mapped = wgpuBufferGetConstMappedRange(newest->buffer, 0, bytes);
+        if (mapped) {
+            rgba.resize(static_cast<std::size_t>(newest->width) * newest->height);
+            std::memcpy(rgba.data(), mapped, bytes);
+            width = newest->width;
+            height = newest->height;
+        }
+        for (Copy &c : g_copies)
+            if (c.ready && c.order <= newest->order) {
+                wgpuBufferUnmap(c.buffer);
+                c.ready = c.busy = false;
+            }
+        if (!mapped) newest = nullptr;
+    }
+    Copy *slot = nullptr;
+    for (Copy &c : g_copies)
+        if (!c.busy) slot = &c;
+    if (slot) {
+        const std::uint64_t bytes = static_cast<std::uint64_t>(src.width) * src.height * 4;
+        if (slot->size < bytes) {
+            if (slot->buffer) wgpuBufferRelease(slot->buffer);
+            slot->size = bytes;
+            slot->buffer = make_buffer(bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
+        }
+        flush_all();
+        const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u});
+        g_commands.push_back({kDisplay, (src.width + 7) / 8, (src.height + 7) / 8, param});
+        submit();
+        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
+        wgpuCommandEncoderCopyBufferToBuffer(enc, g_scratch, 0, slot->buffer, 0, bytes);
+        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
+        wgpuQueueSubmit(g_queue, 1, &cmd);
+        wgpuCommandBufferRelease(cmd);
+        wgpuCommandEncoderRelease(enc);
+        slot->busy = true;
+        slot->order = ++g_copy_order;
+        slot->width = src.width;
+        slot->height = src.height;
+        WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+        cb.mode = WGPUCallbackMode_AllowProcessEvents;
+        cb.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void *copy, void *) {
+            Copy &c = *static_cast<Copy *>(copy);
+            if (status == WGPUMapAsyncStatus_Success) c.ready = true;
+            else c.busy = false;
+        };
+        cb.userdata1 = slot;
+        wgpuBufferMapAsync(slot->buffer, WGPUMapMode_Read, 0, bytes, cb);
+    }
+    return newest != nullptr;
+}
+
 bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba) {
     flush_all();
     const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u});
