@@ -136,6 +136,11 @@ void poll() {
         rx = axis(SDL_CONTROLLER_AXIS_RIGHTX);
         ry = axis(SDL_CONTROLLER_AXIS_RIGHTY);
     }
+    static std::uint64_t last = ~0ull;
+    const std::uint64_t state = pressed | (static_cast<std::uint64_t>(rx) << 16) | (static_cast<std::uint64_t>(ry) << 24) | (static_cast<std::uint64_t>(lx) << 32) |
+                                (static_cast<std::uint64_t>(ly) << 40);
+    if (state == last) return;
+    last = state;
     ps2::set_pad_buttons(pressed);
     ps2::set_pad_axis(0, rx);
     ps2::set_pad_axis(1, ry);
@@ -170,7 +175,14 @@ void present() {
     SDL_RenderPresent(g_renderer);
 }
 
+constexpr Uint32 kAudioBytesPerMs = 48 * 4;
+
 void pace() {
+    if (g_audio) {
+        // The audio device clock paces emulation: wait while more than ~80 ms of sound is queued.
+        while (SDL_GetQueuedAudioSize(g_audio) > 80 * kAudioBytesPerMs) SDL_Delay(1);
+        return;
+    }
     const std::uint64_t frequency = SDL_GetPerformanceFrequency();
     const std::uint64_t period = frequency / (ps2::g_options.pal ? 50 : 60);
     const std::uint64_t now = SDL_GetPerformanceCounter();
@@ -182,14 +194,30 @@ void pace() {
     }
 }
 
+void show_speed() {
+    static std::uint64_t start = 0, frames = 0;
+    const std::uint64_t now = SDL_GetPerformanceCounter();
+    if (!start) start = now;
+    ++frames;
+    const double seconds = static_cast<double>(now - start) / static_cast<double>(SDL_GetPerformanceFrequency());
+    if (seconds < 1.0) return;
+    char title[128];
+    const double queued = g_audio ? SDL_GetQueuedAudioSize(g_audio) / static_cast<double>(kAudioBytesPerMs) : 0.0;
+    std::snprintf(title, sizeof title, "ps2-web-recomp  %.1f fps  audio %.0f ms", static_cast<double>(frames) / seconds, queued);
+    SDL_SetWindowTitle(g_window, title);
+    start = now;
+    frames = 0;
+}
+
 void on_vblank() {
+    show_speed();
     poll();
     present();
     pace();
 }
 
 void queue_audio(const std::int16_t *samples, std::size_t frames) {
-    if (SDL_GetQueuedAudioSize(g_audio) > 48000u * 4u / 5u) return;
+    if (SDL_GetQueuedAudioSize(g_audio) > 500 * kAudioBytesPerMs) return;
     SDL_QueueAudio(g_audio, samples, static_cast<Uint32>(frames * 4));
 }
 

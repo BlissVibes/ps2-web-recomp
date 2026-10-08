@@ -77,6 +77,7 @@ std::vector<std::int16_t> g_audio;
 bool g_record = false;
 std::function<void(const std::int16_t *, std::size_t)> g_sink;
 std::uint64_t g_next_tick = 0;
+bool g_tick_pending = false;
 
 void check_irq(std::uint32_t address, std::uint32_t words) {
     for (Core &k : g_cores) {
@@ -261,12 +262,13 @@ void tick() {
     if (g_sink) g_sink(out, kBatch);
     feed_input(0);
     feed_input(1);
-    g_next_tick = kernel::now() + kBatch * kCyclesPerSample;
+    g_next_tick += kBatch * kCyclesPerSample;
     kernel::schedule(g_next_tick, tick);
 }
 
 void keep_ticking() {
-    if (kernel::now() <= g_next_tick) return;
+    if (g_tick_pending) return;
+    g_tick_pending = true;
     g_next_tick = kernel::now() + kBatch * kCyclesPerSample;
     kernel::schedule(g_next_tick, tick);
 }
@@ -446,6 +448,7 @@ void reset() {
     g_audio.clear();
     g_record = std::getenv("PS2_DUMP_AUDIO") != nullptr;
     g_next_tick = 0;
+    g_tick_pending = false;
 }
 
 std::uint16_t *ram() { return g_ram.data(); }
