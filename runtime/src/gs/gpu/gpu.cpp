@@ -84,9 +84,10 @@ std::uint32_t g_clut_slot = 0, g_clut_loads = 0;
 
 struct Image {
     bool active = false;
-    std::uint32_t dbp = 0, dbw = 0, dpsm = 0, dsax = 0, dsay = 0, rrw = 0, total = 0, done = 0, bpp = 32, lead_bits = 0;
+    std::uint32_t dbp = 0, dbw = 0, dpsm = 0, dsax = 0, dsay = 0, rrw = 0, total = 0, done = 0, bpp = 32, lead_bits = 0, id = 0;
     std::vector<std::uint8_t> pending;
 } g_image;
+std::uint32_t g_image_ids = 0;
 
 struct Range {
     std::uint64_t lo = ~0ull, hi = 0;
@@ -111,10 +112,11 @@ struct PreOp {
     bool clut = false;
     std::uint32_t rec[12] = {};
     Range range;
-    std::uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    std::uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0, image = 0;
 };
 
 bool uploads_overlap(const PreOp &a, const PreOp &b) {
+    if (a.image && a.image == b.image) return false;
     if (!a.range.overlaps(b.range.lo, b.range.hi)) return false;
     if (a.rec[0] != b.rec[0] || a.rec[1] != b.rec[1] || a.rec[2] != b.rec[2]) return true;
     return a.x0 <= b.x1 && b.x0 <= a.x1 && a.y0 <= b.y1 && b.y0 <= a.y1;
@@ -309,34 +311,46 @@ void queue_pre(const PreOp &op) {
     g_pre.push_back(op);
 }
 
-void flush_image() {
+std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uint32_t lead_bits) {
     Image &im = g_image;
-    if (!im.active || im.pending.empty()) return;
-    const std::uint64_t bits = static_cast<std::uint64_t>(im.pending.size()) * 8;
-    if (bits <= im.lead_bits) return;
-    std::uint32_t pixels = static_cast<std::uint32_t>((bits - im.lead_bits) / im.bpp);
-    pixels = std::min(pixels, im.total - im.done);
-    if (!pixels) return;
+    const std::uint64_t bits = static_cast<std::uint64_t>(size) * 8;
+    if (bits <= lead_bits) return 0;
+    const std::uint32_t pixels = static_cast<std::uint32_t>(std::min<std::uint64_t>((bits - lead_bits) / im.bpp, im.total - im.done));
+    if (!pixels) return 0;
+    const std::uint64_t used = lead_bits + static_cast<std::uint64_t>(pixels) * im.bpp;
     PreOp op;
-    const std::uint32_t offset = arena_append(im.pending.data(), im.pending.size());
-    const std::uint32_t rec[11] = {im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.done, pixels, offset, im.lead_bits, im.bpp};
+    const std::uint32_t offset = arena_append(bytes, static_cast<std::size_t>((used + 7) / 8));
+    const std::uint32_t rec[11] = {im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.done, pixels, offset, lead_bits, im.bpp};
     std::memcpy(op.rec, rec, sizeof rec);
     const std::uint32_t first = im.done / im.rrw, last = (im.done + pixels - 1) / im.rrw;
     op.range = region(im.dbp, im.dbw, im.dpsm, static_cast<int>(im.dsax), static_cast<int>(im.dsay + first), static_cast<int>(im.dsax + im.rrw - 1),
                       static_cast<int>(im.dsay + last));
     op.x0 = im.dsax;
     op.x1 = im.dsax + im.rrw - 1;
-    op.y0 = im.dsay + (im.done % im.rrw ? first : first);
+    op.y0 = im.dsay + first;
     op.y1 = im.dsay + last;
+    op.image = im.id;
     queue_pre(op);
-    const std::uint64_t used = im.lead_bits + static_cast<std::uint64_t>(pixels) * im.bpp;
-    im.pending.erase(im.pending.begin(), im.pending.begin() + static_cast<std::ptrdiff_t>(used / 8));
-    im.lead_bits = static_cast<std::uint32_t>(used % 8);
     im.done += pixels;
+    return used;
+}
+
+void finish_image_if_done() {
+    Image &im = g_image;
     if (im.done >= im.total) {
         im.active = false;
         im.pending.clear();
     }
+}
+
+void flush_image() {
+    Image &im = g_image;
+    if (!im.active || im.pending.empty()) return;
+    const std::uint64_t used = queue_upload(im.pending.data(), im.pending.size(), im.lead_bits);
+    if (!used) return;
+    im.pending.erase(im.pending.begin(), im.pending.begin() + static_cast<std::ptrdiff_t>(used / 8));
+    im.lead_bits = static_cast<std::uint32_t>(used % 8);
+    finish_image_if_done();
 }
 
 void flush_all() {
@@ -778,12 +792,21 @@ void image_begin(const State &s) {
     im.rrw = static_cast<std::uint32_t>(reg) & 0xFFFu;
     im.total = im.rrw * (static_cast<std::uint32_t>(reg >> 32) & 0xFFFu);
     im.bpp = bits_per_pixel(im.dpsm);
+    im.id = ++g_image_ids ? g_image_ids : ++g_image_ids;
     im.active = im.total != 0;
 }
 
 void image_data(const std::uint8_t *data, std::size_t bytes) {
     Image &im = g_image;
     if (!im.active) return;
+    if (im.pending.empty() && !im.lead_bits) {
+        const std::uint64_t used = queue_upload(data, bytes, 0);
+        const std::size_t whole = static_cast<std::size_t>(used / 8);
+        if (im.done < im.total && whole < bytes) im.pending.assign(data + whole, data + bytes);
+        im.lead_bits = static_cast<std::uint32_t>(used % 8);
+        finish_image_if_done();
+        return;
+    }
     im.pending.insert(im.pending.end(), data, data + bytes);
 }
 
