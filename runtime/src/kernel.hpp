@@ -15,5 +15,6 @@ bool in_handler();
 void on_vblank_start();
 void on_hblank();
 void wake_idle();
+void dump();
 
 }

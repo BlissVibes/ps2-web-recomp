@@ -1,0 +1,545 @@
+#include "sif.hpp"
+
+#include "../hw.hpp"
+#include "iop.hpp"
+#include "io.hpp"
+#include "kernel.hpp"
+#include "ps2/memory.hpp"
+#include "ps2/system.hpp"
+
+#include <cstdio>
+#include <deque>
+#include <map>
+#include <vector>
+
+namespace ps2::sif {
+
+namespace {
+
+constexpr std::uint32_t kRpcRecvAddr = 0xDEADBEF0u;
+constexpr std::uint32_t kServerXor = 0xACACACACu;
+constexpr std::uint32_t kCmdBuffer = 0x0001E000u;
+constexpr std::uint32_t kCmdRend = 0x80000008u;
+constexpr std::uint32_t kCmdSetSreg = 0x80000001u;
+
+struct Header {
+    std::uint32_t size_word, dest, cid, opt;
+    std::uint32_t packet_size() const { return size_word & 0xFFu; }
+};
+
+struct Call {
+    Header header;
+    std::uint32_t record_id, packet_addr, rpc_id, client_data, rpc_number, send_size, recv, recv_size, recv_mode, server_data;
+};
+
+struct Rend {
+    Header header;
+    std::uint32_t record_id, packet_addr, rpc_id, client_data, command, server_data, buffer, cbuffer;
+};
+
+struct Server {
+    bool hle = false;
+    HleServer invoke;
+    std::uint32_t sd = 0, func = 0, buf = 0, queue = 0;
+};
+
+struct Request {
+    Call call;
+    std::uint32_t size;
+};
+
+struct PendingBind {
+    Rend reply;
+    std::uint64_t deadline;
+};
+
+struct CmdHandler {
+    std::uint32_t handler, data;
+};
+
+std::uint32_t g_mainaddr = 0, g_msflag = 0, g_smflag = 0x60000u;
+std::uint32_t g_ee_recv = 0;
+std::uint32_t g_data_addr = 0;
+bool g_processed = true;
+std::deque<std::vector<std::uint8_t>> g_outgoing;
+std::map<std::uint32_t, Server> g_servers;
+std::map<std::uint32_t, PendingBind> g_binds;
+std::map<std::uint32_t, Call> g_held_calls;
+std::map<std::uint32_t, std::deque<Request>> g_requests;
+std::map<std::uint32_t, int> g_queue_threads;
+std::map<std::uint32_t, CmdHandler> g_cmd_handlers;
+std::uint32_t g_sreg[32] = {};
+std::uint32_t g_loop_stub = 0, g_finish_stub = 0;
+
+template <typename T>
+T ee_read(std::uint32_t a) {
+    T v;
+    std::memcpy(&v, g_ram + (a & (kRamSize - 1)), sizeof v);
+    return v;
+}
+
+void send(const void *packet, std::uint32_t size) {
+    const auto *bytes = static_cast<const std::uint8_t *>(packet);
+    g_outgoing.emplace_back(bytes, bytes + size);
+    pump();
+}
+
+Rend make_rend(const Header &h, std::uint32_t record, std::uint32_t packet, std::uint32_t rpc, std::uint32_t client, std::uint32_t command) {
+    Rend r{};
+    r.header.size_word = sizeof(Rend);
+    r.header.dest = h.dest;
+    r.header.cid = kCmdRend;
+    r.record_id = record;
+    r.packet_addr = packet;
+    r.rpc_id = rpc;
+    r.client_data = client;
+    r.command = command;
+    return r;
+}
+
+void reply_call(const Call &call) {
+    Rend r = make_rend(call.header, call.record_id, call.packet_addr, call.rpc_id, call.client_data, 0x8000000Au);
+    send(&r, sizeof r);
+}
+
+void deliver_request(std::uint32_t queue) {
+    auto t = g_queue_threads.find(queue);
+    if (t == g_queue_threads.end()) return;
+    iop::kernel::Thread *th = iop::kernel::thread(t->second);
+    if (th && th->status == iop::kernel::kWait && th->wait == iop::kernel::kWaitRpc) {
+        iop::kernel::wake(*th, 0);
+        iop::kernel::reschedule();
+    }
+}
+
+void bind(const std::uint8_t *packet) {
+    const auto *h = reinterpret_cast<const Header *>(packet);
+    std::uint32_t record, paddr, rpc, client, server;
+    std::memcpy(&record, packet + 16, 4);
+    std::memcpy(&paddr, packet + 20, 4);
+    std::memcpy(&rpc, packet + 24, 4);
+    std::memcpy(&client, packet + 28, 4);
+    std::memcpy(&server, packet + 32, 4);
+    Rend r = make_rend(*h, record, paddr, rpc, client, 0x80000009u);
+    r.server_data = server ^ kServerXor;
+    r.buffer = kRpcRecvAddr;
+    r.cbuffer = 0xDEADCAFEu;
+    if (g_servers.count(server)) {
+        send(&r, sizeof r);
+        return;
+    }
+    std::fprintf(stderr, "[sif] bind to 0x%08X waits for the server\n", server);
+    g_binds[server] = PendingBind{r, now() + kEeClock * 4};
+}
+
+void call(const std::uint8_t *packet) {
+    Call c;
+    std::memcpy(&c, packet, sizeof c);
+    const std::uint32_t server = c.server_data ^ kServerXor;
+    auto it = g_servers.find(server);
+    if (it == g_servers.end()) {
+        std::fprintf(stderr, "[sif] call %u to unknown server 0x%08X\n", c.rpc_number, server);
+        reply_call(c);
+        return;
+    }
+    if (it->second.hle) {
+        g_held_calls[server] = c;
+        if (it->second.invoke(c.rpc_number, g_data_addr, c.send_size, c.recv & (kRamSize - 1), c.recv_size)) {
+            g_held_calls.erase(server);
+            reply_call(c);
+        }
+        return;
+    }
+    const Server &s = it->second;
+    if (s.buf) {
+        const std::uint32_t size = (c.send_size + 15u) & ~15u;
+        std::memcpy(iop::ram_ptr(s.buf), g_ram + (g_data_addr & (kRamSize - 1)), std::min(size, kRamSize - (g_data_addr & (kRamSize - 1))));
+    }
+    g_requests[s.queue].push_back(Request{c, c.send_size});
+    deliver_request(s.queue);
+}
+
+void other_data(const std::uint8_t *packet) {
+    std::uint32_t record, paddr, rpc, receive, src, dst, size;
+    std::memcpy(&record, packet + 16, 4);
+    std::memcpy(&paddr, packet + 20, 4);
+    std::memcpy(&rpc, packet + 24, 4);
+    std::memcpy(&receive, packet + 28, 4);
+    std::memcpy(&src, packet + 32, 4);
+    std::memcpy(&dst, packet + 36, 4);
+    std::memcpy(&size, packet + 40, 4);
+    std::memcpy(g_ram + (dst & (kRamSize - 1)), iop::ram_ptr(src), size);
+    Rend r = make_rend(*reinterpret_cast<const Header *>(packet), record, paddr, rpc, receive, 0x8000000Cu);
+    send(&r, sizeof r);
+}
+
+void command(std::uint32_t src, std::uint32_t size) {
+    const std::uint8_t *packet = g_ram + (src & (kRamSize - 1));
+    const auto *h = reinterpret_cast<const Header *>(packet);
+    switch (h->cid) {
+    case 0x80000002u: {
+        std::uint32_t address;
+        std::memcpy(&address, packet + 16, 4);
+        if (h->opt == 0) {
+            g_ee_recv = address & (kRamSize - 1);
+        } else {
+            std::uint32_t sreg[8] = {sizeof(std::uint32_t) * 6, 0, kCmdSetSreg, 0, 0, 1};
+            send(sreg, 24);
+        }
+        break;
+    }
+    case 0x80000009u: bind(packet); break;
+    case 0x8000000Au: call(packet); break;
+    case 0x8000000Cu: other_data(packet); break;
+    default: {
+        auto it = g_cmd_handlers.find(h->cid);
+        if (it == g_cmd_handlers.end()) {
+            std::fprintf(stderr, "[sif] command 0x%08X has no handler\n", h->cid);
+            break;
+        }
+        std::memcpy(iop::ram_ptr(kCmdBuffer), packet, std::min<std::uint32_t>(size, 0x400u));
+        iop::kernel::call_guest(it->second.handler, kCmdBuffer, it->second.data);
+        break;
+    }
+    }
+}
+
+void reboot(std::uint32_t src) {
+    const std::uint8_t *packet = g_ram + (src & (kRamSize - 1));
+    std::uint32_t args_size;
+    std::memcpy(&args_size, packet + 16, 4);
+    const std::string path(reinterpret_cast<const char *>(packet + 24), std::min<std::uint32_t>(args_size, 80));
+    std::fprintf(stderr, "[sif] IOP reboot requested with \"%s\"\n", path.c_str());
+}
+
+std::uint32_t arg(const iop::Cpu &c, int i) { return i < 4 ? c.r[4 + i] : iop::read32(c.r[29] + 16u + static_cast<std::uint32_t>(i - 4) * 4u); }
+
+void def(const char *library, std::uint32_t index, const char *name, std::function<void(iop::Cpu &)> body) {
+    iop::register_hle(library, index, [library, name, body = std::move(body)](iop::Cpu &c) {
+        iop::kernel::trace_hle(library, name, c);
+        body(c);
+    });
+}
+
+void rpc_loop(iop::Cpu &c) {
+    iop::kernel::Thread *t = iop::kernel::current();
+    if (!t) return;
+    auto &queue = g_requests[t->rpc_queue];
+    if (queue.empty()) {
+        c.pc = g_loop_stub;
+        c.npc = c.pc + 4;
+        iop::kernel::block(c, iop::kernel::kWaitRpc, static_cast<int>(t->rpc_queue));
+        return;
+    }
+    const Request request = queue.front();
+    queue.pop_front();
+    const std::uint32_t server = request.call.server_data ^ kServerXor;
+    const Server &s = g_servers[server];
+    t->rpc_server = server;
+    g_held_calls[server] = request.call;
+    c.r[4] = request.call.rpc_number;
+    c.r[5] = s.buf;
+    c.r[6] = request.size;
+    c.r[31] = g_finish_stub;
+    c.pc = s.func;
+    c.npc = c.pc + 4;
+}
+
+void rpc_finish(iop::Cpu &c) {
+    iop::kernel::Thread *t = iop::kernel::current();
+    if (!t) return;
+    auto it = g_held_calls.find(t->rpc_server);
+    if (it != g_held_calls.end()) {
+        const Call call = it->second;
+        g_held_calls.erase(it);
+        const std::uint32_t result = c.r[2];
+        if (call.recv && result && call.recv_size)
+            std::memcpy(g_ram + (call.recv & (kRamSize - 1)), iop::ram_ptr(result), (call.recv_size + 3u) & ~3u);
+        reply_call(call);
+    }
+    c.pc = g_loop_stub;
+    c.npc = c.pc + 4;
+}
+
+void install_iop_side() {
+    g_loop_stub = iop::kernel::hle_stub(rpc_loop);
+    g_finish_stub = iop::kernel::hle_stub(rpc_finish);
+
+    iop::kernel::register_hle_library("sifman", 0x0101);
+    def("sifman", 4, "sceSifDma2Init", [](iop::Cpu &c) { c.r[2] = 0; });
+    def("sifman", 5, "sceSifInit", [](iop::Cpu &c) { c.r[2] = 0; });
+    def("sifman", 6, "sceSifSetDChain", [](iop::Cpu &c) { c.r[2] = 0; });
+    auto set_dma = [](iop::Cpu &c, std::uint32_t callback, std::uint32_t data) {
+        const std::uint32_t list = arg(c, 0), count = arg(c, 1);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const std::uint32_t src = iop::read32(list + i * 16), dst = iop::read32(list + i * 16 + 4), size = iop::read32(list + i * 16 + 8);
+            std::memcpy(g_ram + (dst & (kRamSize - 1)), iop::ram_ptr(src), std::min(size, kRamSize - (dst & (kRamSize - 1))));
+        }
+        static std::uint32_t id = 1;
+        c.r[2] = id++;
+        if (callback) iop::kernel::schedule(iop::kernel::now() + 32, [callback, data]() { iop::kernel::call_guest(callback, data); });
+    };
+    def("sifman", 7, "sceSifSetDma", [set_dma](iop::Cpu &c) { set_dma(c, 0, 0); });
+    def("sifman", 8, "sceSifDmaStat", [](iop::Cpu &c) { c.r[2] = static_cast<std::uint32_t>(-1); });
+    def("sifman", 29, "sceSifCheckInit", [](iop::Cpu &c) { c.r[2] = 1; });
+    def("sifman", 32, "sceSifSetDmaIntr", [set_dma](iop::Cpu &c) { set_dma(c, arg(c, 2), arg(c, 3)); });
+    def("sifman", 23, "sceSifGetSMFlag", [](iop::Cpu &c) { c.r[2] = g_smflag; });
+    def("sifman", 24, "sceSifSetSMFlag", [](iop::Cpu &c) { g_smflag |= arg(c, 0); c.r[2] = 0; });
+
+    iop::kernel::register_hle_library("sifcmd", 0x0101);
+    def("sifcmd", 4, "sceSifInitCmd", [](iop::Cpu &c) { c.r[2] = 0; });
+    def("sifcmd", 6, "sceSifGetSreg", [](iop::Cpu &c) { c.r[2] = g_sreg[arg(c, 0) & 31u]; });
+    def("sifcmd", 7, "sceSifSetSreg", [](iop::Cpu &c) { g_sreg[arg(c, 0) & 31u] = arg(c, 1); c.r[2] = 0; });
+    def("sifcmd", 8, "sceSifSetCmdBuffer", [](iop::Cpu &c) { c.r[2] = 0; });
+    def("sifcmd", 10, "sceSifAddCmdHandler", [](iop::Cpu &c) {
+        g_cmd_handlers[arg(c, 0)] = CmdHandler{arg(c, 1), arg(c, 2)};
+        c.r[2] = 0;
+    });
+    def("sifcmd", 11, "sceSifRemoveCmdHandler", [](iop::Cpu &c) { g_cmd_handlers.erase(arg(c, 0)); c.r[2] = 0; });
+    auto send_cmd = [](iop::Cpu &c) {
+        const std::uint32_t cid = arg(c, 0), packet = arg(c, 1), size = arg(c, 2);
+        const std::uint32_t src = arg(c, 3), dst = arg(c, 4), extra = arg(c, 5);
+        if (extra) std::memcpy(g_ram + (dst & (kRamSize - 1)), iop::ram_ptr(src), extra);
+        std::vector<std::uint8_t> bytes(size);
+        std::memcpy(bytes.data(), iop::ram_ptr(packet), size);
+        const std::uint32_t words[2] = {(size & 0xFFu) | (extra << 8), dst};
+        std::memcpy(bytes.data(), words, 8);
+        std::memcpy(bytes.data() + 8, &cid, 4);
+        send(bytes.data(), size);
+        c.r[2] = 1;
+    };
+    def("sifcmd", 12, "sceSifSendCmd", send_cmd);
+    def("sifcmd", 13, "isceSifSendCmd", send_cmd);
+    def("sifcmd", 14, "sceSifInitRpc", [](iop::Cpu &c) { c.r[2] = 0; });
+    def("sifcmd", 17, "sceSifRegisterRpc", [](iop::Cpu &c) {
+        const std::uint32_t sd = arg(c, 0), id = arg(c, 1);
+        Server s;
+        s.sd = sd;
+        s.func = arg(c, 2);
+        s.buf = arg(c, 3);
+        s.queue = arg(c, 6);
+        iop::write32(sd + 0, id);
+        iop::write32(sd + 4, s.func);
+        iop::write32(sd + 8, s.buf);
+        g_servers[id] = s;
+        if (iop::kernel::g_trace_modules) std::fprintf(stderr, "[sif] server 0x%08X registered (func 0x%08X buf 0x%08X)\n", id, s.func, s.buf);
+        auto b = g_binds.find(id);
+        if (b != g_binds.end()) {
+            send(&b->second.reply, sizeof(Rend));
+            g_binds.erase(b);
+        }
+        c.r[2] = 0;
+    });
+    def("sifcmd", 19, "sceSifSetRpcQueue", [](iop::Cpu &c) {
+        g_queue_threads[arg(c, 0)] = static_cast<int>(arg(c, 1));
+        c.r[2] = 0;
+    });
+    def("sifcmd", 22, "sceSifRpcLoop", [](iop::Cpu &c) {
+        iop::kernel::Thread *t = iop::kernel::current();
+        if (t) t->rpc_queue = arg(c, 0);
+        rpc_loop(c);
+    });
+    def("sifcmd", 23, "sceSifGetOtherData", [](iop::Cpu &c) {
+        const std::uint32_t src = arg(c, 1), dst = arg(c, 2), size = arg(c, 3);
+        std::memcpy(iop::ram_ptr(dst), g_ram + (src & (kRamSize - 1)), size);
+        c.r[2] = 0;
+    });
+    def("sifcmd", 24, "sceSifRemoveRpc", [](iop::Cpu &c) {
+        for (auto it = g_servers.begin(); it != g_servers.end(); ++it)
+            if (it->second.sd == arg(c, 0)) { g_servers.erase(it); break; }
+        c.r[2] = 0;
+    });
+    def("sifcmd", 25, "sceSifRemoveRpcQueue", [](iop::Cpu &c) { g_queue_threads.erase(arg(c, 0)); c.r[2] = 0; });
+    def("sifcmd", 28, "sceSifSendCmdIntr", send_cmd);
+}
+
+void install_servers() {
+    register_hle_server(0x80000006u, [](std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t) {
+        if (method == 0x00) {
+            const std::string path(reinterpret_cast<const char *>(g_ram + args + 8));
+            const std::uint32_t arg_len = ee_read<std::uint32_t>(args);
+            const std::string margs(reinterpret_cast<const char *>(g_ram + args + 8 + 252), std::min<std::uint32_t>(arg_len, 252));
+            std::fprintf(stderr, "[loadfile] %s\n", path.c_str());
+            const std::int32_t id = iop::load_module(path, margs, [ret](int module, int result) {
+                store<std::int32_t>(g_ram + ret, module);
+                store<std::int32_t>(g_ram + ret + 4, result);
+                complete_call(0x80000006u);
+            });
+            if (id < 0) {
+                store<std::int32_t>(g_ram + ret, id);
+                store<std::int32_t>(g_ram + ret + 4, 0);
+                return true;
+            }
+            return false;
+        }
+        if (method == 0x09) {
+            store<std::int32_t>(g_ram + ret, -202);
+            return true;
+        }
+        if (method != 0xFF) std::fprintf(stderr, "[loadfile] method %u\n", method);
+        store<std::int32_t>(g_ram + ret, 0);
+        return true;
+    });
+    register_hle_server(0x80000001u, [](std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t) {
+        const auto word = [args](int i) { return ee_read<std::uint32_t>(args + 4u * static_cast<std::uint32_t>(i)); };
+        const auto text = [args](int i) { return std::string(reinterpret_cast<const char *>(g_ram + args + 4u * static_cast<std::uint32_t>(i))); };
+        std::int32_t result = 0;
+        switch (method) {
+        case 0:
+            result = iop::io::open(text(1), word(0));
+            std::fprintf(stderr, "[fileio] open %s -> %d\n", text(1).c_str(), result);
+            break;
+        case 1: result = iop::io::close(static_cast<int>(word(0))); break;
+        case 2: {
+            std::vector<std::uint8_t> buffer(word(2));
+            result = iop::io::read(static_cast<int>(word(0)), buffer.data(), word(2));
+            if (result > 0) std::memcpy(g_ram + (word(1) & (kRamSize - 1)), buffer.data(), static_cast<std::size_t>(result));
+            break;
+        }
+        case 3: result = static_cast<std::int32_t>(word(2)); break;
+        case 4: result = static_cast<std::int32_t>(iop::io::seek(static_cast<int>(word(0)), static_cast<std::int32_t>(word(1)), static_cast<int>(word(2)))); break;
+        case 12: {
+            std::uint32_t mode = 0, size = 0;
+            if (iop::io::stat(text(1), mode, size)) {
+                const std::uint32_t p = word(0) & (kRamSize - 1);
+                std::memset(g_ram + p, 0, 40);
+                store<std::uint32_t>(g_ram + p, mode);
+                store<std::uint32_t>(g_ram + p + 8, size);
+            } else {
+                result = -2;
+            }
+            break;
+        }
+        case 255: break;
+        default:
+            std::fprintf(stderr, "[fileio] method %u\n", method);
+            result = -1;
+            break;
+        }
+        store<std::int32_t>(g_ram + ret, result);
+        return true;
+    });
+    register_hle_server(0x80000003u, [](std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t) {
+        switch (method) {
+        case 1: store<std::uint32_t>(g_ram + ret, iop::kernel::alloc(ee_read<std::uint32_t>(args))); break;
+        case 2: iop::kernel::free(ee_read<std::uint32_t>(args)); store<std::uint32_t>(g_ram + ret, 0); break;
+        case 5: store<std::uint32_t>(g_ram + ret, iop::kRamSize); break;
+        case 6: store<std::uint32_t>(g_ram + ret, iop::kernel::free_max()); break;
+        case 7: store<std::uint32_t>(g_ram + ret, iop::kernel::free_total()); break;
+        default:
+            std::fprintf(stderr, "[iopheap] method %u\n", method);
+            store<std::uint32_t>(g_ram + ret, 0);
+            break;
+        }
+        return true;
+    });
+}
+
+}
+
+void reset() {
+    g_mainaddr = g_msflag = 0;
+    g_smflag = 0x60000u;
+    g_ee_recv = g_data_addr = 0;
+    g_processed = true;
+    g_outgoing.clear();
+    g_servers.clear();
+    g_binds.clear();
+    g_held_calls.clear();
+    g_requests.clear();
+    g_queue_threads.clear();
+    g_cmd_handlers.clear();
+    std::memset(g_sreg, 0, sizeof g_sreg);
+}
+
+std::uint32_t get_reg(std::uint32_t reg) {
+    switch (reg) {
+    case 1: return g_mainaddr;
+    case 2: return kCmdBuffer;
+    case 3: return g_msflag;
+    case 4: return g_smflag;
+    case 0x80000000u: return 0;
+    case 0x80000002u: return 1;
+    default: return 0;
+    }
+}
+
+void set_reg(std::uint32_t reg, std::uint32_t value) {
+    if (reg == 1) g_mainaddr = value;
+    else if (reg == 3) g_msflag |= value;
+}
+
+std::uint32_t set_dma(std::uint32_t transfers, std::uint32_t count) {
+    static std::uint32_t id = 1;
+    if (!count) count = 1;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint32_t base = transfers + i * 16;
+        const std::uint32_t src = ee_read<std::uint32_t>(base) & (kRamSize - 1);
+        const std::uint32_t dst = ee_read<std::uint32_t>(base + 4);
+        const std::uint32_t size = ee_read<std::uint32_t>(base + 8) & 0x7FFFFFFFu;
+        if (dst == kRpcRecvAddr) g_data_addr = src;
+        else if (dst == 0) reboot(src);
+        else if (dst == kCmdBuffer) command(src, size);
+        else std::memcpy(iop::ram_ptr(dst), g_ram + src, std::min(size, iop::kRamSize - (iop::phys(dst) & (iop::kRamSize - 1))));
+    }
+    return id++;
+}
+
+void packet_processed() {
+    g_processed = true;
+    pump();
+}
+
+void pump() {
+    const std::uint64_t t = now();
+    for (auto it = g_binds.begin(); it != g_binds.end();) {
+        if (t > it->second.deadline) {
+            std::fprintf(stderr, "[sif] bind to 0x%08X timed out\n", it->first);
+            Rend r = it->second.reply;
+            r.server_data = 0;
+            g_outgoing.emplace_back(reinterpret_cast<const std::uint8_t *>(&r), reinterpret_cast<const std::uint8_t *>(&r) + sizeof r);
+            it = g_binds.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (!g_processed || g_outgoing.empty() || !g_ee_recv) return;
+    const std::vector<std::uint8_t> packet = std::move(g_outgoing.front());
+    g_outgoing.pop_front();
+    std::memcpy(g_ram + g_ee_recv, packet.data(), packet.size());
+    g_processed = false;
+    hw::dmac_raise(5);
+}
+
+void register_hle_server(std::uint32_t id, HleServer server) {
+    Server s;
+    s.hle = true;
+    s.invoke = std::move(server);
+    g_servers[id] = std::move(s);
+    auto b = g_binds.find(id);
+    if (b != g_binds.end()) {
+        send(&b->second.reply, sizeof(Rend));
+        g_binds.erase(b);
+    }
+}
+
+void complete_call(std::uint32_t id) {
+    auto it = g_held_calls.find(id);
+    if (it == g_held_calls.end()) return;
+    const Call c = it->second;
+    g_held_calls.erase(it);
+    reply_call(c);
+}
+
+}
+
+namespace ps2::iop::kernel {
+
+void install_sif() {
+    sif::reset();
+    sif::install_iop_side();
+    sif::install_servers();
+    install_cdvdfsv();
+}
+
+}

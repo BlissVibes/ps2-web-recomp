@@ -13,7 +13,8 @@ namespace {
 int usage() {
     std::fprintf(stderr,
                  "usage: ps2run <elf> [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
-                 "              [--trace-syscalls] [--trace-io] [--trace-threads]\n");
+                 "              [--disc image.iso] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
+                 "              [--trace-iop] [--trace-iop-hle]\n");
     return 2;
 }
 
@@ -31,6 +32,9 @@ int main(int argc, char **argv) {
         else if (a == "--trace-syscalls") ps2::g_options.trace_syscalls = true;
         else if (a == "--trace-io") ps2::g_options.trace_io = true;
         else if (a == "--trace-threads") ps2::g_options.trace_threads = true;
+        else if (a == "--disc" && i + 1 < argc) ps2::g_options.disc_path = argv[++i];
+        else if (a == "--trace-iop") ps2::g_options.trace_iop_modules = true;
+        else if (a == "--trace-iop-hle") ps2::g_options.trace_iop_hle = true;
         else return usage();
     }
 

@@ -1,5 +1,6 @@
 #include "hw.hpp"
 
+#include "iop/sif.hpp"
 #include "kernel.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
@@ -20,7 +21,6 @@ constexpr std::uint32_t kGsCsr = 0x12001000u, kGsImr = 0x12001010u;
 std::uint32_t g_intc_stat = 0, g_intc_mask = 0;
 std::uint32_t g_dmac_stat = 0;
 std::uint64_t g_gs_csr = 0x551B0000ull, g_gs_imr = 0x7F00ull;
-std::uint32_t g_sif[8] = {};
 std::map<std::uint32_t, std::uint64_t> g_regs;
 std::set<std::uint32_t> g_reported;
 std::uint32_t g_crt[3] = {};
@@ -51,7 +51,6 @@ void reset() {
     g_intc_stat = g_intc_mask = g_dmac_stat = 0;
     g_gs_csr = 0x551B0000ull;
     g_gs_imr = 0x7F00ull;
-    std::memset(g_sif, 0, sizeof g_sif);
     g_regs.clear();
     g_regs[0x10001810u] = 0x183u;
 }
@@ -106,14 +105,9 @@ void gs_set_crt(std::uint32_t interlace, std::uint32_t mode, std::uint32_t field
     std::fprintf(stderr, "[gs] SetGsCrt interlace %u mode 0x%X field %u\n", interlace, mode, field);
 }
 
-std::uint32_t sif_get(std::uint32_t reg) {
-    if (reg & 0x80000000u) return g_sif[7];
-    return g_sif[reg & 7u];
-}
-
-void sif_set(std::uint32_t reg, std::uint32_t value) {
-    if (reg & 0x80000000u) g_sif[7] = value;
-    else g_sif[reg & 7u] = value;
+void dmac_raise(unsigned channel) {
+    g_dmac_stat |= 1u << channel;
+    if (g_dmac_stat & (0x10000u << channel)) kernel::wake_idle();
 }
 
 std::uint32_t read32(std::uint32_t a) {
@@ -124,7 +118,7 @@ std::uint32_t read32(std::uint32_t a) {
     if (a == kGsCsr + 4) return static_cast<std::uint32_t>(g_gs_csr >> 32);
     if (a == kGsImr) return static_cast<std::uint32_t>(g_gs_imr);
     if (is_timer(a) && (a & 0x3Fu) == 0) return timer_count(a);
-    if (a >= 0x1000F200u && a < 0x1000F280u) return g_sif[(a >> 4) & 7u];
+    if (a >= 0x1000F200u && a < 0x1000F240u) return sif::get_reg(((a >> 4) & 7u) + 1u);
     if (a == 0x1000F130u) return 0;
     if (a == 0x1000F520u) return static_cast<std::uint32_t>(g_regs[0x1000F590u]);
     auto it = g_regs.find(a);
@@ -152,7 +146,7 @@ void write32(std::uint32_t a, std::uint32_t v) {
         g_regs[a + 0x40] = static_cast<std::uint64_t>(timer_count(a)) - v;
         return;
     }
-    if (a >= 0x1000F200u && a < 0x1000F280u) { g_sif[(a >> 4) & 7u] = v; return; }
+    if (a >= 0x1000F200u && a < 0x1000F240u) { sif::set_reg(((a >> 4) & 7u) + 1u, v); return; }
     report("write", a, v);
     g_regs[a] = v;
 }

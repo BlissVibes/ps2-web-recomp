@@ -1,4 +1,7 @@
 #include "hw.hpp"
+#include "iop/iop.hpp"
+#include "iop/sif.hpp"
+#include "ps2/disc.hpp"
 #include "kernel.hpp"
 #include "ps2/generated.hpp"
 #include "ps2/memory.hpp"
@@ -31,6 +34,7 @@ std::vector<Event> g_events;
 bool g_halted = false;
 std::string g_halt_reason;
 std::uint64_t g_frames = 0;
+std::uint64_t g_iop_synced = 0;
 
 std::uint64_t next_event_time() {
     std::uint64_t t = UINT64_MAX;
@@ -39,6 +43,7 @@ std::uint64_t next_event_time() {
 }
 
 void run_due_events() {
+    sync_iop();
     for (;;) {
         const std::uint64_t t = now();
         auto it = std::min_element(g_events.begin(), g_events.end(), [](const Event &a, const Event &b) { return a.at < b.at; });
@@ -61,17 +66,20 @@ std::uint64_t frame_cycles() { return kEeClock / (g_options.pal ? 50u : 60u); }
 void vblank() {
     ++g_frames;
     hw::vblank_start();
+    iop::vblank(true);
+    schedule(hw::kEventVblankEnd + 100, now() + 18874u * 22u, [] { iop::vblank(false); });
     kernel::on_vblank_start();
     if (g_options.max_frames && g_frames >= g_options.max_frames) halt("frame limit reached");
     schedule(hw::kEventVblank, now() + frame_cycles(), vblank);
 }
 
 void idle(Cpu &c) {
-    const std::uint64_t next = next_event_time();
-    if (next == UINT64_MAX) {
+    std::uint64_t next = next_event_time();
+    if (next == UINT64_MAX && iop::idle()) {
         halt("deadlock: every thread waits and no event is pending");
         return;
     }
+    next = std::min(next, now() + kEeClock / 2000);
     g_base = std::max(now(), next);
     g_given = 0;
     c.budget = 0;
@@ -151,9 +159,26 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
     return true;
 }
 
+void sync_iop() {
+    const std::uint64_t t = now();
+    if (t > g_iop_synced) {
+        iop::run(t - g_iop_synced);
+        g_iop_synced = t;
+    }
+    sif::pump();
+}
+
+void request_iop_sync() {
+    if (g_cpu.budget > 64) set_budget(g_cpu, 64);
+}
+
 void boot(std::uint32_t entry, const std::vector<std::string> &args) {
     hw::reset();
     kernel::reset();
+    if (!g_options.disc_path.empty() && !disc::open(g_options.disc_path))
+        std::fprintf(stderr, "[ee] cannot open disc image %s\n", g_options.disc_path.c_str());
+    iop::set_trace(g_options.trace_iop_modules, g_options.trace_iop_hle);
+    iop::reset();
     std::uint32_t argv = 0x00000800u, payload = argv + 4u * static_cast<std::uint32_t>(args.size() + 1);
     for (std::size_t i = 0; i < args.size(); ++i) {
         store<std::uint32_t>(g_ram + argv + 4 * i, payload);
@@ -180,6 +205,8 @@ int run() {
         if (c.budget <= 0) refill(c);
         dispatch(c, 0, 0);
     }
+    kernel::dump();
+    iop::dump();
     std::fprintf(stderr, "[ee] stopped after %llu frames, %llu cycles: %s\n",
                  static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(now()), g_halt_reason.c_str());
     return 0;

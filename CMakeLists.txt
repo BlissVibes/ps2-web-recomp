@@ -22,7 +22,17 @@ add_library(ps2runtime STATIC
     runtime/src/system.cpp
     runtime/src/kernel.cpp
     runtime/src/hw.cpp
-    runtime/src/cop.cpp)
+    runtime/src/cop.cpp
+    runtime/src/disc.cpp
+    runtime/src/iop/cpu.cpp
+    runtime/src/iop/kernel.cpp
+    runtime/src/iop/libs.cpp
+    runtime/src/iop/hw.cpp
+    runtime/src/iop/spu2.cpp
+    runtime/src/iop/io.cpp
+    runtime/src/iop/cdvd.cpp
+    runtime/src/iop/sif.cpp
+    runtime/src/iop/cdvdfsv.cpp)
 target_include_directories(ps2runtime PUBLIC runtime/include)
 target_compile_options(ps2runtime PRIVATE -Wall -Wextra)
 

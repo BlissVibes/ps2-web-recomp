@@ -1,6 +1,7 @@
 #include "kernel.hpp"
 
 #include "hw.hpp"
+#include "iop/sif.hpp"
 #include "ps2/generated.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
@@ -348,8 +349,6 @@ void wait_sema(Cpu &c, int id) {
     block_current(c, kWaitSema, id);
 }
 
-void sif_set_dma(Cpu &c);
-
 const char *syscall_name(std::uint32_t n);
 
 }
@@ -412,15 +411,24 @@ void service(Cpu &c) {
 void on_vblank_start() {
     if (g_vsync_flag) {
         st32(g_vsync_flag, 1);
-        if (g_vsync_data) st64(g_vsync_data, hw::sif_get(0x80000000u));
+        if (g_vsync_data) st64(g_vsync_data, frame_count());
     }
 }
 
 void wake_idle() { g_reschedule = true; }
 
+void dump() {
+    for (const auto &[id, t] : g_threads)
+        std::fprintf(stderr, "[thread] %d status %d prio %d wait %d/%d pc 0x%08X ra 0x%08X\n", id, t.status, t.priority, t.wait, t.wait_id,
+                     id == g_current ? g_cpu.pc : t.context.pc, id == g_current ? g_cpu.r[31].w[0] : t.context.r[31].w[0]);
+    for (const auto &[id, s] : g_semas)
+        if (!s.waiters.empty()) std::fprintf(stderr, "[sema] %d count %d waiters %zu\n", id, s.count, s.waiters.size());
+}
+
 void handle_syscall(Cpu &c, std::uint32_t pc) {
     std::uint32_t n = c.r[3].w[0];
-    if (n & 0x80000000u) n = 0u - n;
+    const bool interrupt_variant = (n & 0x80000000u) != 0;
+    if (interrupt_variant) n = 0u - n;
     if (n < 0x100u) {
         const std::uint32_t custom = ld32(kSyscallTable + n * 4u);
         if (custom && has_code(custom & 0x1FFFFFFFu)) {
@@ -634,10 +642,13 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
         ret(c, 0);
         break;
     case 0x76: ret(c, -1); break;
-    case 0x77: sif_set_dma(c); break;
-    case 0x78: ret(c, 0); break;
-    case 0x79: hw::sif_set(arg(c, 0), arg(c, 1)); ret(c, 0); break;
-    case 0x7A: ret(c, static_cast<std::int32_t>(hw::sif_get(arg(c, 0)))); break;
+    case 0x77: ret(c, sif::set_dma(arg(c, 0), arg(c, 1))); request_iop_sync(); break;
+    case 0x78:
+        if (interrupt_variant) sif::packet_processed();
+        ret(c, 0);
+        break;
+    case 0x79: sif::set_reg(arg(c, 0), arg(c, 1)); ret(c, 0); break;
+    case 0x7A: ret(c, static_cast<std::int32_t>(sif::get_reg(arg(c, 0)))); break;
     case 0x7C: ret(c, 0); break;
     case 0x7E: ret(c, 0); break;
     case 0x7F: ret(c, kRamSize); break;
@@ -649,11 +660,6 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
 }
 
 namespace {
-
-void sif_set_dma(Cpu &c) {
-    std::fprintf(stderr, "[sif] SifSetDma(0x%08X, %u) not implemented yet\n", arg(c, 0), arg(c, 1));
-    ret(c, 1);
-}
 
 const char *syscall_name(std::uint32_t n) {
     switch (n) {

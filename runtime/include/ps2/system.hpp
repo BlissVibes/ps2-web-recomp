@@ -22,6 +22,9 @@ struct Options {
     bool pal = true;
     std::uint64_t max_frames = 0;
     std::string misses_path;
+    std::string disc_path;
+    bool trace_iop_modules = false;
+    bool trace_iop_hle = false;
 };
 
 extern Options g_options;
@@ -45,6 +48,8 @@ bool preempt(Cpu &c);
 bool has_code(std::uint32_t pc);
 void raise_intc(unsigned cause);
 void request_reschedule();
+void request_iop_sync();
+void sync_iop();
 
 bool load_elf(const std::string &path, std::uint32_t &entry);
 void boot(std::uint32_t entry, const std::vector<std::string> &args);
