@@ -19,6 +19,7 @@ namespace {
 constexpr std::size_t kSlots = 1u << 23;
 constexpr std::size_t kOutside = 1u << 16;
 std::uint32_t g_hits[kSlots];
+std::uint32_t g_caller_hits[kSlots];
 std::uintptr_t g_outside_pc[kOutside];
 std::uint32_t g_outside_hits[kOutside];
 std::uintptr_t g_base = 0;
@@ -34,6 +35,9 @@ void sample(int, siginfo_t *, void *context) {
         ++g_hits[offset];
         return;
     }
+    const std::uintptr_t caller = *reinterpret_cast<const std::uintptr_t *>(uc->uc_mcontext.gregs[REG_RSP]);
+    const std::uintptr_t coff = (caller - g_base) >> 4;
+    if (caller >= g_base && coff < kSlots) ++g_caller_hits[coff];
     const std::uintptr_t key = pc >> 4;
     for (std::size_t i = 0, h = (key * 0x9E3779B97F4A7C15ull) >> 48; i < 64; ++i, h = (h + 1) & (kOutside - 1)) {
         if (g_outside_pc[h] == key) { ++g_outside_hits[h]; return; }
@@ -85,6 +89,8 @@ void write_profile(const char *path) {
     std::fprintf(f, "# samples %llu lost %llu\n", static_cast<unsigned long long>(g_samples), static_cast<unsigned long long>(g_lost));
     for (std::size_t i = 0; i < kSlots; ++i)
         if (g_hits[i]) std::fprintf(f, "%zx %u\n", i << 4, g_hits[i]);
+    for (std::size_t i = 0; i < kSlots; ++i)
+        if (g_caller_hits[i]) std::fprintf(f, "^ %zx %u\n", i << 4, g_caller_hits[i]);
     std::map<std::string, std::uint64_t> outside;
     for (std::size_t i = 0; i < kOutside; ++i) {
         if (!g_outside_pc[i]) continue;
