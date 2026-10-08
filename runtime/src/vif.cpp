@@ -1,5 +1,6 @@
 #include "vif.hpp"
 
+#include "dmac.hpp"
 #include "gs/gif.hpp"
 #include "hw.hpp"
 #include "vu_micro.hpp"
@@ -16,7 +17,7 @@ struct Unit {
     std::uint32_t stat = 0, err = 0, mark = 0, cycle = 0, mode = 0, num = 0, mask = 0, code = 0;
     std::uint32_t itops = 0, base = 0, ofst = 0, tops = 0, itop = 0, top = 0;
     std::uint32_t row[4] = {}, col[4] = {};
-    bool dbf = false;
+    bool dbf = false, stalled = false;
     std::vector<std::uint32_t> pending;
 };
 
@@ -180,10 +181,25 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
         else std::fprintf(stderr, "[vif%d] unknown command 0x%08X\n", unit, cmd);
         break;
     }
-    if (cmd & 0x80000000u) {
-        u.stat |= 0x800u;
+    if ((cmd & 0x80000000u) && !(u.err & 1u)) {
+        u.stat |= 0xC00u;
+        u.stalled = true;
         hw::intc_raise(4u + static_cast<unsigned>(unit));
     }
+}
+
+void process(int unit) {
+    Unit &u = g_units[unit];
+    std::size_t pos = 0;
+    while (pos < u.pending.size() && !u.stalled) {
+        const std::uint32_t cmd = u.pending[pos];
+        const std::size_t start = pos + 1;
+        const std::uint32_t need = data_words(unit, cmd);
+        if (start + need > u.pending.size()) break;
+        execute(unit, cmd, u.pending.data() + start);
+        pos = start + need;
+    }
+    u.pending.erase(u.pending.begin(), u.pending.begin() + static_cast<std::ptrdiff_t>(pos));
 }
 
 }
@@ -206,17 +222,10 @@ void transfer(int unit, const std::uint8_t *data, std::uint32_t qwc) {
     const std::size_t old = u.pending.size();
     u.pending.resize(old + static_cast<std::size_t>(qwc) * 4);
     std::memcpy(u.pending.data() + old, data, static_cast<std::size_t>(qwc) * 16);
-    std::size_t pos = 0;
-    while (pos < u.pending.size()) {
-        const std::uint32_t cmd = u.pending[pos];
-        const std::size_t start = pos + 1;
-        const std::uint32_t need = data_words(unit, cmd);
-        if (start + need > u.pending.size()) break;
-        execute(unit, cmd, u.pending.data() + start);
-        pos = start + need;
-    }
-    u.pending.erase(u.pending.begin(), u.pending.begin() + static_cast<std::ptrdiff_t>(pos));
+    process(unit);
 }
+
+bool stalled(int unit) { return g_units[unit].stalled; }
 
 std::uint32_t read(int unit, std::uint32_t reg) {
     const Unit &u = g_units[unit];
@@ -249,7 +258,14 @@ void write(int unit, std::uint32_t reg, std::uint32_t value) {
         if (value & 1u) {
             u = Unit{};
         }
-        if (value & 8u) u.stat &= ~0xF00u;
+        if (value & 8u) {
+            u.stat &= ~0x3F00u;
+            if (u.stalled) {
+                u.stalled = false;
+                process(unit);
+                if (!u.stalled) dmac::resume(unit);
+            }
+        }
         break;
     case 0x20: u.err = value; break;
     case 0x30: u.mark = value; break;

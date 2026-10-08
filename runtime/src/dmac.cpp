@@ -1,5 +1,7 @@
 #include "dmac.hpp"
 
+#include "kernel.hpp"
+
 #include "gs/gif.hpp"
 #include "hw.hpp"
 #include "ps2/memory.hpp"
@@ -7,6 +9,7 @@
 #include "vif.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -16,6 +19,7 @@ namespace {
 
 struct Channel {
     std::uint32_t chcr = 0, madr = 0, qwc = 0, tadr = 0, asr[2] = {}, sadr = 0;
+    bool paused = false, pause_end = false;
 };
 
 Channel g_ch[10];
@@ -55,8 +59,17 @@ void deliver(int ch, std::uint32_t address, std::uint32_t qwc) {
     }
 }
 
+bool vif_stalled(int ch) { return (ch == 0 || ch == 1) && vif::stalled(ch); }
+
+void pause(int ch, bool end) {
+    g_ch[ch].paused = true;
+    g_ch[ch].pause_end = end;
+}
+
 void finish(int ch) {
     Channel &c = g_ch[ch];
+    static const bool trace = std::getenv("PS2_TRACE_DMA") != nullptr;
+    if (trace && ch <= 2) std::fprintf(stderr, "[dma] ch%d done chcr 0x%08X tadr 0x%08X madr 0x%08X\n", ch, c.chcr, c.tadr, c.madr);
     c.chcr &= ~0x100u;
     hw::dmac_raise(static_cast<unsigned>(ch));
 }
@@ -74,6 +87,10 @@ void run_normal(int ch) {
     }
     c.madr += c.qwc * 16;
     c.qwc = 0;
+    if (vif_stalled(ch)) {
+        pause(ch, true);
+        return;
+    }
     finish(ch);
 }
 
@@ -83,6 +100,10 @@ void run_chain(int ch) {
         deliver(ch, c.madr, c.qwc);
         c.madr += c.qwc * 16;
         c.qwc = 0;
+        if (vif_stalled(ch)) {
+            pause(ch, false);
+            return;
+        }
     }
     const bool tte = c.chcr & 0x40u, tie = c.chcr & 0x80u;
     for (int guard = 0; guard < 1'000'000; ++guard) {
@@ -131,6 +152,10 @@ void run_chain(int ch) {
         if (ch == 2 && g_starts[2] <= 2) std::fprintf(stderr, "[dma] gif tag id %u qwc %u addr 0x%08X data 0x%08X\n", id, qwc, addr_full, data);
         deliver(ch, data, qwc);
         c.madr = data + qwc * 16;
+        if (vif_stalled(ch)) {
+            pause(ch, end || (tie && irq));
+            return;
+        }
         if (end || (tie && irq)) break;
     }
     c.qwc = 0;
@@ -139,9 +164,11 @@ void run_chain(int ch) {
 
 void start(int ch) {
     Channel &c = g_ch[ch];
+    c.paused = false;
     ++g_starts[ch];
-    if (ch == 2 && g_starts[ch] <= 3)
-        std::fprintf(stderr, "[dma] gif chcr 0x%08X madr 0x%08X qwc %u tadr 0x%08X\n", c.chcr, c.madr, c.qwc, c.tadr);
+    static const bool trace = std::getenv("PS2_TRACE_DMA") != nullptr;
+    if (trace) std::fprintf(stderr, "[dma] ch%d chcr 0x%08X madr 0x%08X qwc %u tadr 0x%08X thread %d%s\n", ch, c.chcr, c.madr, c.qwc, c.tadr,
+                            kernel::current_thread(), kernel::in_handler() ? " (handler)" : "");
     if (ch == 5 || ch == 6 || ch == 7) {
         finish(ch);
         return;
@@ -151,6 +178,18 @@ void start(int ch) {
     else run_normal(ch);
 }
 
+}
+
+void resume(int ch) {
+    Channel &c = g_ch[ch];
+    if (!c.paused) return;
+    c.paused = false;
+    if (c.pause_end || ((c.chcr >> 2) & 3u) != 1) {
+        c.qwc = 0;
+        finish(ch);
+        return;
+    }
+    run_chain(ch);
 }
 
 void reset() {
@@ -210,6 +249,7 @@ void write(std::uint32_t a, std::uint32_t v) {
         case 0x00: {
             const bool was = c.chcr & 0x100u;
             c.chcr = v;
+            if (!(v & 0x100u)) c.paused = false;
             if (!was && (v & 0x100u)) start(ch);
             break;
         }
