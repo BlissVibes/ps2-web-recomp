@@ -2,6 +2,9 @@
 #include "kernel.hpp"
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
 
 namespace ps2::iop {
 
@@ -11,6 +14,36 @@ Cpu g_cpu;
 namespace {
 
 inline std::int32_t simm(std::uint32_t w) { return static_cast<std::int16_t>(w & 0xFFFFu); }
+
+std::vector<std::uint8_t> g_probes;
+
+bool load_probes() {
+    const char *spec = std::getenv("PS2_IOP_PROBE");
+    if (!spec) return false;
+    g_probes.assign(kRamSize / 32, 0);
+    for (const char *p = spec; *p;) {
+        char *end = nullptr;
+        const std::uint32_t a = static_cast<std::uint32_t>(std::strtoul(p, &end, 16)) & (kRamSize - 1);
+        g_probes[a >> 5] |= static_cast<std::uint8_t>(1u << ((a >> 2) & 7u));
+        p = *end ? end + 1 : end;
+    }
+    return true;
+}
+
+void probe(const Cpu &c, std::uint32_t pc) {
+    const kernel::Thread *t = kernel::current();
+    std::fprintf(stderr, "[iop-probe] 0x%08X a0 %08X a1 %08X a2 %08X a3 %08X v0 %08X v1 %08X s0 %08X s1 %08X ra %08X thread %d time %llu\n", pc, c.r[4], c.r[5], c.r[6],
+                 c.r[7], c.r[2], c.r[3], c.r[16], c.r[17], c.r[31], t ? t->id : 0, static_cast<unsigned long long>(kernel::now()));
+    static const char *reg = std::getenv("PS2_IOP_PROBE_MEM");
+    if (reg) {
+        const std::uint32_t base = phys(c.r[std::atoi(reg) & 31]);
+        if (base + 64 <= kRamSize) {
+            std::fprintf(stderr, "[iop-probe]   r%s:", reg);
+            for (std::uint32_t i = 0; i < 16; ++i) std::fprintf(stderr, " %08X", ram32(base + i * 4));
+            std::fprintf(stderr, "\n");
+        }
+    }
+}
 
 void bad(Cpu &c, std::uint32_t pc, std::uint32_t w) {
     std::fprintf(stderr, "[iop] unknown instruction %08X at 0x%08X (ra 0x%08X)\n", w, pc, c.r[31]);
@@ -26,8 +59,13 @@ std::uint32_t fetch(std::uint32_t pc) {
 }
 
 void execute(Cpu &c, std::int64_t &budget) {
+    static const bool probing = load_probes();
     while (budget-- > 0) {
         const std::uint32_t pc = c.pc;
+        if (probing) {
+            const std::uint32_t a = pc & (kRamSize - 1);
+            if (g_probes[a >> 5] & (1u << ((a >> 2) & 7u))) probe(c, pc);
+        }
         const std::uint32_t w = fetch(pc);
         c.pc = c.npc;
         c.npc += 4;
