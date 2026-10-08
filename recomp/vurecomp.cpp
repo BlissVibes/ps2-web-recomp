@@ -128,7 +128,7 @@ Upper upper(std::uint32_t hi, bool flags_live) {
     }
     unsigned d = dest;
     if (kind == Opmula || kind == Opmsub) d = 0xE;
-    if (target == 0 || d == 0) return u;
+    if (d == 0 || (target == 0 && !(flags && flags_live))) return u;
     const auto b = [&](int i) -> std::string {
         switch (src) {
         case Vec: return vf(ft, i);
@@ -160,6 +160,11 @@ Upper upper(std::uint32_t hi, bool flags_live) {
         default: e = std::format("vabs({})", vs); break;
         }
         u.pre += std::format("const v4u uv = {}; ", e);
+        if (target == 0) {
+            u.post = std::format("{{ Reg128 uf; vstore(uf, uv); flags(r, uf, {}u); fl.set_mac(r.mac, r.status); }} ", d);
+            u.sets_flags = true;
+            return u;
+        }
         if (d == 0xF) {
             u.post += std::format("vstore({}, uv); ", dst);
         } else {
@@ -199,6 +204,14 @@ Upper upper(std::uint32_t hi, bool flags_live) {
         default: break;
         }
         u.pre += std::format("const std::uint32_t u{} = {}; ", kLane[i], e);
+    }
+    if (target == 0) {
+        u.post = "{ Reg128 uf{}; ";
+        for (int i = 0; i < 4; ++i)
+            if (lane(d, i)) u.post += std::format("uf.w[{}] = u{}; ", i, kLane[i]);
+        u.post += std::format("flags(r, uf, {}u); fl.set_mac(r.mac, r.status); }} ", d);
+        u.sets_flags = true;
+        return u;
     }
     for (int i = 0; i < 4; ++i)
         if (lane(d, i)) u.post += std::format("{}.w[{}] = u{}; ", dst, i, kLane[i]);
@@ -377,7 +390,7 @@ Lower lower(std::uint32_t w, std::uint32_t pc) {
     return l;
 }
 
-bool upper_sets_flags(std::uint32_t hi) { return upper(hi, false).sets_flags; }
+bool upper_sets_flags(std::uint32_t hi) { return upper(hi, true).sets_flags; }
 
 std::string generate(const Program &p, std::string &name) {
     const std::vector<std::uint32_t> pcs = ps2::vu::reachable(p.code.data(), kMask, p.entry);

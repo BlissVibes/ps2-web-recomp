@@ -374,10 +374,11 @@ void scan_flags(int unit, const std::uint8_t *code, std::uint32_t size) {
 
 void commit(Vu0Regs &r, const UpperOut &o) {
     if (o.target < 0) return;
-    Reg128 &dst = o.target == kAcc ? r.acc : r.vf[o.target];
-    if (o.target == 0) return;
-    for (int i = 0; i < 4; ++i)
-        if (o.dest & (8u >> i)) dst.w[i] = o.value.w[i];
+    if (o.target > 0) {
+        Reg128 &dst = o.target == kAcc ? r.acc : r.vf[o.target];
+        for (int i = 0; i < 4; ++i)
+            if (o.dest & (8u >> i)) dst.w[i] = o.value.w[i];
+    }
     if (o.flags) set_flags(r, o.value, o.dest);
 }
 
@@ -740,10 +741,10 @@ void run_fast(int n, std::uint32_t address) {
             Reg128 &dst = out.target == kAcc ? r.acc : r.vf[out.target];
             for (int i = 0; i < 4; ++i)
                 if (out.dest & (8u >> i)) dst.w[i] = out.value.w[i];
-            if (out.flags && flags) {
-                set_flags(r, out.value, out.dest);
-                pipe.set_mac(r.mac, r.status);
-            }
+        }
+        if (out.target >= 0 && out.flags && flags) {
+            set_flags(r, out.value, out.dest);
+            pipe.set_mac(r.mac, r.status);
         }
         if (out.has_clip) {
             r.clip = out.clip;
@@ -793,7 +794,7 @@ void run(int n, std::uint32_t address) {
             if (branch) npc = target;
         }
         commit(r, out);
-        if (out.target > 0 && out.flags) pipe.set_mac(r.mac, r.status);
+        if (out.target >= 0 && out.flags) pipe.set_mac(r.mac, r.status);
         if (out.has_clip) {
             r.clip = out.clip;
             pipe.set_clip(out.clip, pipe.t);
