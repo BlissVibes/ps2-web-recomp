@@ -69,6 +69,8 @@ std::map<std::uint32_t, std::deque<Request>> g_requests;
 std::map<std::uint32_t, int> g_queue_threads;
 std::map<std::uint32_t, CmdHandler> g_cmd_handlers;
 std::uint32_t g_sreg[32] = {};
+std::map<std::uint32_t, int> g_iop_clients;
+std::uint32_t g_iop_rpc_id = 1;
 std::uint32_t g_loop_stub = 0, g_finish_stub = 0;
 
 template <typename T>
@@ -176,6 +178,13 @@ void other_data(const std::uint8_t *packet) {
 void command(std::uint32_t src, std::uint32_t size) {
     const std::uint8_t *packet = g_ram + (src & (kRamSize - 1));
     const auto *h = reinterpret_cast<const Header *>(packet);
+    if (g_options.trace_iop_modules) {
+        std::uint32_t words[14];
+        std::memcpy(words, packet, sizeof words);
+        if (h->cid == 0x8000000Au) std::fprintf(stderr, "[sif] call server 0x%08X fn %u send %u recv %u mode %u\n", words[13] ^ kServerXor, words[8], words[9], words[11], words[12]);
+        else if (h->cid == 0x80000009u) std::fprintf(stderr, "[sif] bind 0x%08X\n", words[8]);
+        else std::fprintf(stderr, "[sif] command 0x%08X\n", h->cid);
+    }
     switch (h->cid) {
     case 0x80000002u: {
         std::uint32_t address;
@@ -185,6 +194,27 @@ void command(std::uint32_t src, std::uint32_t size) {
         } else {
             std::uint32_t sreg[8] = {sizeof(std::uint32_t) * 6, 0, kCmdSetSreg, 0, 0, 1};
             send(sreg, 24);
+        }
+        break;
+    }
+    case 0x80000008u: {
+        std::uint32_t words[12];
+        std::memcpy(words, packet, sizeof words);
+        const std::uint32_t client = words[7], cmd = words[8];
+        if (cmd == 0x80000009u) {
+            iop::write32(client + 36, words[9]);
+            iop::write32(client + 20, words[10]);
+            iop::write32(client + 24, words[11]);
+        } else if (cmd == 0x8000000Au) {
+            const std::uint32_t end = iop::read32(client + 28);
+            if (end) iop::kernel::call_guest(end, iop::read32(client + 32));
+        }
+        iop::write32(client + 0, 0);
+        auto it = g_iop_clients.find(client);
+        if (it != g_iop_clients.end()) {
+            if (iop::kernel::Thread *t = iop::kernel::thread(it->second)) iop::kernel::wake(*t, 0);
+            iop::kernel::reschedule();
+            g_iop_clients.erase(it);
         }
         break;
     }
@@ -204,12 +234,16 @@ void command(std::uint32_t src, std::uint32_t size) {
     }
 }
 
+bool g_fileio_async = false;
+std::uint32_t g_fileio_result = 0;
+
 void reboot(std::uint32_t src) {
     const std::uint8_t *packet = g_ram + (src & (kRamSize - 1));
     std::uint32_t args_size;
     std::memcpy(&args_size, packet + 16, 4);
     const std::string path(reinterpret_cast<const char *>(packet + 24), std::min<std::uint32_t>(args_size, 80));
     std::fprintf(stderr, "[sif] IOP reboot requested with \"%s\"\n", path.c_str());
+    if (path.find("IOPRP") != std::string::npos) g_fileio_async = true;
 }
 
 std::uint32_t arg(const iop::Cpu &c, int i) { return i < 4 ? c.r[4 + i] : iop::read32(c.r[29] + 16u + static_cast<std::uint32_t>(i - 4) * 4u); }
@@ -311,6 +345,36 @@ void install_iop_side() {
     def("sifcmd", 12, "sceSifSendCmd", send_cmd);
     def("sifcmd", 13, "isceSifSendCmd", send_cmd);
     def("sifcmd", 14, "sceSifInitRpc", [](iop::Cpu &c) { c.r[2] = 0; });
+    def("sifcmd", 15, "sceSifBindRpc", [](iop::Cpu &c) {
+        const std::uint32_t client = arg(c, 0), server = arg(c, 1), mode = arg(c, 2);
+        iop::write32(client + 36, 0);
+        iop::write32(client + 4, g_iop_rpc_id);
+        iop::write32(client + 0, 1);
+        const std::uint32_t packet[9] = {0x24u, 0, 0x80000009u, 0, 0, client, g_iop_rpc_id++, client, server};
+        send(packet, sizeof packet);
+        c.r[2] = 0;
+        if (!(mode & 1u) && iop::kernel::current()) {
+            g_iop_clients[client] = iop::kernel::current()->id;
+            iop::kernel::block(c, iop::kernel::kWaitRpc, 0);
+        }
+    });
+    def("sifcmd", 16, "sceSifCallRpc", [](iop::Cpu &c) {
+        const std::uint32_t client = arg(c, 0), fn = arg(c, 1), mode = arg(c, 2);
+        const std::uint32_t send_ptr = arg(c, 3), send_size = arg(c, 4), recv = arg(c, 5), recv_size = arg(c, 6);
+        iop::write32(client + 28, arg(c, 7));
+        iop::write32(client + 32, arg(c, 8));
+        const std::uint32_t buff = iop::read32(client + 20) & (kRamSize - 1);
+        if (send_size && buff) std::memcpy(g_ram + buff, iop::ram_ptr(send_ptr), std::min(send_size, kRamSize - buff));
+        iop::write32(client + 0, 1);
+        const std::uint32_t packet[14] = {0x38u, 0, 0x8000000Au, 0, 0, client, g_iop_rpc_id++, client, fn, send_size, recv, recv_size, 0, iop::read32(client + 36)};
+        send(packet, sizeof packet);
+        c.r[2] = 0;
+        if (!(mode & 1u) && iop::kernel::current()) {
+            g_iop_clients[client] = iop::kernel::current()->id;
+            iop::kernel::block(c, iop::kernel::kWaitRpc, 0);
+        }
+    });
+    def("sifcmd", 18, "sceSifCheckStatRpc", [](iop::Cpu &c) { c.r[2] = iop::read32(arg(c, 0)) ? 1u : 0u; });
     def("sifcmd", 17, "sceSifRegisterRpc", [](iop::Cpu &c) {
         const std::uint32_t sd = arg(c, 0), id = arg(c, 1);
         Server s;
@@ -353,6 +417,78 @@ void install_iop_side() {
     def("sifcmd", 28, "sceSifSendCmdIntr", send_cmd);
 }
 
+void fileio_reply(std::uint32_t args, std::uint32_t command, const std::vector<std::uint32_t> &body) {
+    if (g_fileio_result) {
+        const std::uint32_t header[4] = {ee_read<std::uint32_t>(args), command, ee_read<std::uint32_t>(args + 4), ee_read<std::uint32_t>(args + 8)};
+        std::memcpy(g_ram + (g_fileio_result & (kRamSize - 1)), header, 16);
+        std::memcpy(g_ram + (g_fileio_result & (kRamSize - 1)) + 16, body.data(), body.size() * 4);
+    }
+    const std::uint32_t packet[4] = {16, 0, 0x80000011u, 0};
+    send(packet, 16);
+}
+
+bool fileio_async(std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t) {
+    const auto word = [args](std::uint32_t offset) { return ee_read<std::uint32_t>(args + offset); };
+    const auto text = [args](std::uint32_t offset) { return std::string(reinterpret_cast<const char *>(g_ram + args + offset)); };
+    store<std::uint32_t>(g_ram + ret, 1);
+    switch (method) {
+    case 255:
+        g_fileio_result = word(0);
+        return true;
+    case 0: {
+        const std::int32_t fd = iop::io::open(text(20), word(12));
+        std::fprintf(stderr, "[fileio] open %s -> %d\n", text(20).c_str(), fd);
+        fileio_reply(args, 0, {static_cast<std::uint32_t>(fd), 0, 0, 0});
+        return true;
+    }
+    case 1:
+        fileio_reply(args, 1, {static_cast<std::uint32_t>(iop::io::close(static_cast<int>(word(12)))), 0, 0, 0});
+        return true;
+    case 2: {
+        const std::uint32_t size = word(20);
+        std::vector<std::uint8_t> buffer(size);
+        const int n = iop::io::read(static_cast<int>(word(12)), buffer.data(), size);
+        if (n > 0) std::memcpy(g_ram + (word(16) & (kRamSize - 1)), buffer.data(), static_cast<std::size_t>(n));
+        fileio_reply(args, 2, {static_cast<std::uint32_t>(n), 0, 0, 0});
+        return true;
+    }
+    case 3:
+        fileio_reply(args, 3, {word(20), 0, 0, 0});
+        return true;
+    case 4: {
+        const std::int64_t pos = iop::io::seek(static_cast<int>(word(12)), static_cast<std::int32_t>(word(16)), static_cast<int>(word(20)));
+        fileio_reply(args, 4, {static_cast<std::uint32_t>(pos), 0, 0, 0});
+        return true;
+    }
+    case 12: {
+        std::uint32_t mode = 0, fsize = 0;
+        const bool found = iop::io::stat(text(16), mode, fsize);
+        std::vector<std::uint32_t> body(2 + 10, 0);
+        body[0] = found ? 0u : static_cast<std::uint32_t>(-2);
+        body[1] = word(12);
+        body[2] = mode;
+        body[4] = fsize;
+        fileio_reply(args, 12, body);
+        return true;
+    }
+    case 23: {
+        const std::string device = text(12);
+        const std::uint32_t cmd = word(12 + 0x800), out = word(12 + 0x808) & (kRamSize - 1);
+        std::uint32_t result = 0;
+        if (cmd == 0x4322u) store<std::uint32_t>(g_ram + out, 0x0Au);
+        else if (cmd == 0x4325u) store<std::uint32_t>(g_ram + out, 2u);
+        else if (cmd == 0x4320u) store<std::uint32_t>(g_ram + out, 0u);
+        else if (cmd != 0x430Cu) std::fprintf(stderr, "[fileio] devctl %s 0x%X\n", device.c_str(), cmd);
+        fileio_reply(args, 23, {result, 0, 0, 0});
+        return true;
+    }
+    default:
+        std::fprintf(stderr, "[fileio] async method %u\n", method);
+        fileio_reply(args, method, {static_cast<std::uint32_t>(-1), 0, 0, 0});
+        return true;
+    }
+}
+
 void install_servers() {
     register_hle_server(0x80000006u, [](std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t) {
         if (method == 0x00) {
@@ -376,11 +512,16 @@ void install_servers() {
             store<std::int32_t>(g_ram + ret, -202);
             return true;
         }
-        if (method != 0xFF) std::fprintf(stderr, "[loadfile] method %u\n", method);
+        if (method == 0xFF) {
+            std::memcpy(g_ram + ret, "3000", 4);
+            return true;
+        }
+        std::fprintf(stderr, "[loadfile] method %u\n", method);
         store<std::int32_t>(g_ram + ret, 0);
         return true;
     });
-    register_hle_server(0x80000001u, [](std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t) {
+    register_hle_server(0x80000001u, [](std::uint32_t method, std::uint32_t args, std::uint32_t size, std::uint32_t ret, std::uint32_t ret_size) {
+        if (g_fileio_async) return fileio_async(method, args, size, ret, ret_size);
         const auto word = [args](int i) { return ee_read<std::uint32_t>(args + 4u * static_cast<std::uint32_t>(i)); };
         const auto text = [args](int i) { return std::string(reinterpret_cast<const char *>(g_ram + args + 4u * static_cast<std::uint32_t>(i))); };
         std::int32_t result = 0;
@@ -449,6 +590,7 @@ void reset() {
     g_requests.clear();
     g_queue_threads.clear();
     g_cmd_handlers.clear();
+    g_iop_clients.clear();
     std::memset(g_sreg, 0, sizeof g_sreg);
 }
 
@@ -503,7 +645,13 @@ void pump() {
             ++it;
         }
     }
+    if (g_options.trace_iop_hle && !g_outgoing.empty() && !g_processed) std::fprintf(stderr, "[sif] %zu packets wait for the EE\n", g_outgoing.size());
     if (!g_processed || g_outgoing.empty() || !g_ee_recv) return;
+    if (g_options.trace_iop_modules) {
+        std::uint32_t cid;
+        std::memcpy(&cid, g_outgoing.front().data() + 8, 4);
+        std::fprintf(stderr, "[sif] to EE: command 0x%08X\n", cid);
+    }
     const std::vector<std::uint8_t> packet = std::move(g_outgoing.front());
     g_outgoing.pop_front();
     std::memcpy(g_ram + g_ee_recv, packet.data(), packet.size());
@@ -521,6 +669,14 @@ void register_hle_server(std::uint32_t id, HleServer server) {
         send(&b->second.reply, sizeof(Rend));
         g_binds.erase(b);
     }
+}
+
+void dump() {
+    for (const auto &[id, c] : g_held_calls) std::fprintf(stderr, "[sif] call to 0x%08X fn %u is waiting for its reply\n", id, c.rpc_number);
+    for (const auto &[queue, list] : g_requests)
+        if (!list.empty()) std::fprintf(stderr, "[sif] queue 0x%08X has %zu requests\n", queue, list.size());
+    for (const auto &[id, b] : g_binds) std::fprintf(stderr, "[sif] bind to 0x%08X is waiting\n", id);
+    std::fprintf(stderr, "[sif] %zu packets wait for the EE (processed %d)\n", g_outgoing.size(), g_processed ? 1 : 0);
 }
 
 void complete_call(std::uint32_t id) {
