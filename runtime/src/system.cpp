@@ -14,6 +14,10 @@
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -277,7 +281,55 @@ bool display_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::
 bool attach_window(const WindowTarget &t) { return gs::attach_window(static_cast<int>(t.kind), t.display, t.window, t.surface, t.selector, t.width, t.height); }
 void resize_window(std::uint32_t width, std::uint32_t height) { gs::resize_window(width, height); }
 bool present_frame() { return gs::present(); }
+
+bool parse_press(const std::string &spec, Press &press) {
+    static const char *const kNames[16] = {"select", "l3", "r3", "start", "up", "right", "down", "left",
+                                           "l2", "r2", "l1", "r1", "triangle", "circle", "cross", "square"};
+    const auto colon = spec.find(':');
+    if (colon == std::string::npos) return false;
+    press.frame = std::strtoull(spec.c_str(), nullptr, 10);
+    std::string rest = spec.substr(colon + 1);
+    press.frames = 6;
+    const auto second = rest.find(':');
+    if (second != std::string::npos) {
+        press.frames = static_cast<std::uint32_t>(std::strtoul(rest.c_str() + second + 1, nullptr, 10));
+        rest = rest.substr(0, second);
+    }
+    press.buttons = 0;
+    std::size_t start = 0;
+    while (start <= rest.size()) {
+        const auto plus = rest.find('+', start);
+        const std::string name = rest.substr(start, plus == std::string::npos ? std::string::npos : plus - start);
+        int bit = -1;
+        for (int i = 0; i < 16; ++i)
+            if (name == kNames[i]) bit = i;
+        if (bit < 0) return false;
+        press.buttons |= static_cast<std::uint16_t>(1u << bit);
+        if (plus == std::string::npos) break;
+        start = plus + 1;
+    }
+    return true;
+}
+
 double gpu_busy_ms() { return gs::gpu_busy_ms(); }
+
+#ifdef __EMSCRIPTEN__
+EM_ASYNC_JS(void, ps2_browser_yield, (), {
+    if (!Module.yieldPort) {
+        const channel = new MessageChannel();
+        Module.yieldWaiters = [];
+        channel.port1.onmessage = () => Module.yieldWaiters.shift()();
+        Module.yieldPort = channel.port2;
+    }
+    await new Promise((resolve) => { Module.yieldWaiters.push(resolve); Module.yieldPort.postMessage(0); });
+});
+void browser_yield() { ps2_browser_yield(); }
+#else
+void browser_yield() {}
+#endif
+
+std::uint64_t frames_run() { return g_frames; }
+std::uint64_t primitives_drawn() { return gs::primitives_drawn(); }
 void set_pad_buttons(std::uint16_t pressed) { iop::sio2::set_buttons(0, pressed); }
 void set_pad_axis(int axis, std::uint8_t value) { iop::sio2::set_axis(0, axis, value); }
 void set_audio_sink(std::function<void(const std::int16_t *, std::size_t)> sink) { iop::spu2::set_sink(std::move(sink)); }

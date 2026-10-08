@@ -6,6 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(PS2_GENERATED "" CACHE PATH "Folder with the C++ generated for a game")
 
+if(EMSCRIPTEN)
+    add_compile_options(-msimd128 -mtail-call -fwasm-exceptions)
+    add_link_options(-msimd128 -mtail-call -fwasm-exceptions)
+endif()
+
 if(NOT EMSCRIPTEN)
     add_executable(eerecomp
         recomp/main.cpp
@@ -75,6 +80,18 @@ if(PS2_GENERATED)
     target_include_directories(ps2game PRIVATE "${PS2_GENERATED}")
     target_link_libraries(ps2game PUBLIC ps2runtime)
     target_compile_options(ps2game PRIVATE -Wno-unused-label -Wno-unused-variable)
+
+    if(EMSCRIPTEN)
+        set(PS2_WEB_ELF "" CACHE FILEPATH "Game executable preloaded as /game/core.elf")
+        add_executable(ps2web host/web.cpp)
+        target_link_libraries(ps2web PRIVATE ps2game ps2runtime)
+        target_link_options(ps2web PRIVATE --profiling-funcs -sJSPI -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=67108864 -sSTACK_SIZE=16777216 -sENVIRONMENT=web
+            -sEXPORTED_FUNCTIONS=_main,_ps2web_pad,_ps2web_resize,_ps2web_gpu_ms,_ps2web_frames,_ps2web_primitives
+            -sEXPORTED_RUNTIME_METHODS=callMain,addRunDependency,removeRunDependency,HEAPU8,ENV
+            --shell-file ${CMAKE_SOURCE_DIR}/web/shell.html --preload-file ${PS2_WEB_ELF}@/game/core.elf)
+        set_target_properties(ps2web PROPERTIES SUFFIX ".html" LINK_DEPENDS ${CMAKE_SOURCE_DIR}/web/shell.html)
+        return()
+    endif()
 
     add_executable(ps2run host/main.cpp)
     target_link_libraries(ps2run PRIVATE ps2game ps2runtime)

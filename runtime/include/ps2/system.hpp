@@ -84,8 +84,14 @@ struct WindowTarget {
 bool attach_window(const WindowTarget &target);
 void resize_window(std::uint32_t width, std::uint32_t height);
 bool present_frame();
+// Parses "frame:button[+button][:frames]" as used by --press.
+bool parse_press(const std::string &spec, Press &press);
 // GPU time spent on emulation so far, estimated from timestamp queries (0 when unsupported).
 double gpu_busy_ms();
+// Returns to the browser event loop once without the 4 ms clamp of nested timers (Emscripten only).
+void browser_yield();
+std::uint64_t frames_run();
+std::uint64_t primitives_drawn();
 void set_pad_buttons(std::uint16_t pressed);
 void set_pad_axis(int axis, std::uint8_t value);
 void set_audio_sink(std::function<void(const std::int16_t *samples, std::size_t frames)> sink);

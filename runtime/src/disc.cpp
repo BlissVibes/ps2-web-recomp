@@ -11,6 +11,7 @@ namespace ps2::disc {
 namespace {
 
 std::FILE *g_file = nullptr;
+Reader g_reader;
 std::uint64_t g_size = 0;
 std::uint32_t g_layer1 = 0;
 std::map<std::string, Entry> g_index;
@@ -63,8 +64,27 @@ void index_layer(std::uint32_t pvd_sector, std::uint32_t base) {
 bool open(const std::string &path) {
     g_file = std::fopen(path.c_str(), "rb");
     if (!g_file) return false;
-    std::fseek(g_file, 0, SEEK_END);
-    g_size = static_cast<std::uint64_t>(std::ftell(g_file));
+#if defined(_WIN32)
+    _fseeki64(g_file, 0, SEEK_END);
+    const std::uint64_t size = static_cast<std::uint64_t>(_ftelli64(g_file));
+#else
+    fseeko(g_file, 0, SEEK_END);
+    const std::uint64_t size = static_cast<std::uint64_t>(ftello(g_file));
+#endif
+    std::FILE *file = g_file;
+    return open(path, size, [file](std::uint64_t offset, void *out, std::size_t bytes) {
+#if defined(_WIN32)
+        _fseeki64(file, static_cast<long long>(offset), SEEK_SET);
+#else
+        fseeko(file, static_cast<off_t>(offset), SEEK_SET);
+#endif
+        return std::fread(out, 1, bytes, file);
+    });
+}
+
+bool open(const std::string &name, std::uint64_t size, Reader reader) {
+    g_reader = std::move(reader);
+    g_size = size;
     g_index.clear();
     index_layer(16, 0);
     std::uint8_t pvd[kSector];
@@ -78,22 +98,17 @@ bool open(const std::string &path) {
             break;
         }
     }
-    std::fprintf(stderr, "[disc] %s: %zu files, %llu sectors, layer 1 at %u\n", path.c_str(), g_index.size(),
+    std::fprintf(stderr, "[disc] %s: %zu files, %llu sectors, layer 1 at %u\n", name.c_str(), g_index.size(),
                  static_cast<unsigned long long>(g_size / kSector), g_layer1);
     return true;
 }
 
-bool is_open() { return g_file != nullptr; }
+bool is_open() { return static_cast<bool>(g_reader); }
 
 bool read(std::uint32_t sector, std::uint32_t count, void *out) {
-    if (!g_file) return false;
-#if defined(_WIN32)
-    _fseeki64(g_file, static_cast<long long>(sector) * kSector, SEEK_SET);
-#else
-    fseeko(g_file, static_cast<off_t>(sector) * kSector, SEEK_SET);
-#endif
+    if (!g_reader) return false;
     const std::size_t want = static_cast<std::size_t>(count) * kSector;
-    const std::size_t got = std::fread(out, 1, want, g_file);
+    const std::size_t got = g_reader(static_cast<std::uint64_t>(sector) * kSector, out, want);
     if (got < want) std::memset(static_cast<std::uint8_t *>(out) + got, 0, want - got);
     return got > 0 || !count;
 }

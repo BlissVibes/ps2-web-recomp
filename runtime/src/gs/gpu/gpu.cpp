@@ -1,4 +1,5 @@
 #include "gpu.hpp"
+#include "ps2/system.hpp"
 
 #include <webgpu/webgpu.h>
 #ifndef __EMSCRIPTEN__
@@ -380,14 +381,18 @@ void on_error(WGPUDevice const *, WGPUErrorType type, WGPUStringView message, vo
     std::fprintf(stderr, "[gpu] error %d: %.*s\n", static_cast<int>(type), static_cast<int>(message.length == WGPU_STRLEN ? std::strlen(message.data) : message.length), message.data);
 }
 
-void wait_until(const bool &flag) {
-    while (!flag) {
+void pump() {
 #ifdef __EMSCRIPTEN__
-        wgpuInstanceProcessEvents(g_instance);
+    browser_yield();
+    wgpuInstanceProcessEvents(g_instance);
 #else
-        wgpuDevicePoll(g_device, true, nullptr);
+    if (g_device) wgpuDevicePoll(g_device, true, nullptr);
+    else wgpuInstanceProcessEvents(g_instance);
 #endif
-    }
+}
+
+void wait_until(const bool &flag) {
+    while (!flag) pump();
 }
 
 WGPUBuffer make_buffer(std::uint64_t size, WGPUBufferUsage usage) {
@@ -433,11 +438,18 @@ void ensure_capacity() {
     if (changed || !g_group) rebuild_group();
 }
 
+// Browsers copy writes above about 1 MiB through a slower path, so large uploads go in pieces.
+void write_buffer(WGPUBuffer buffer, const void *data, std::uint64_t bytes) {
+    constexpr std::uint64_t kPiece = 1u << 20;
+    for (std::uint64_t at = 0; at < bytes; at += kPiece)
+        wgpuQueueWriteBuffer(g_queue, buffer, at, static_cast<const std::uint8_t *>(data) + at, std::min(kPiece, bytes - at));
+}
+
 void submit(WGPUTextureView present_view = nullptr) {
     if (g_commands.empty() && !present_view) return;
     ensure_capacity();
-    if (!g_arena.empty()) wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
-    wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
+    write_buffer(g_data, g_arena.data(), g_arena.size() * 4);
+    write_buffer(g_params, g_param_records.data(), g_param_records.size() * kParamStride);
     if (g_query_ready) {
         const void *mapped = wgpuBufferGetConstMappedRange(g_query_read, 0, 16);
         if (mapped) {
@@ -633,7 +645,7 @@ bool init(Mode m) {
     acb.userdata1 = &adapter;
     acb.userdata2 = &adapter_done;
     wgpuInstanceRequestAdapter(g_instance, &options, acb);
-    while (!adapter_done) wgpuInstanceProcessEvents(g_instance);
+    while (!adapter_done) pump();
     if (!adapter) {
         std::fprintf(stderr, "[gpu] no adapter\n");
         return false;
@@ -668,7 +680,7 @@ bool init(Mode m) {
     dcb.userdata1 = &g_device;
     dcb.userdata2 = &device_done;
     wgpuAdapterRequestDevice(adapter, &dd, dcb);
-    while (!device_done) wgpuInstanceProcessEvents(g_instance);
+    while (!device_done) pump();
     g_adapter = adapter;
     if (!g_device) return false;
     g_queue = wgpuDeviceGetQueue(g_device);
