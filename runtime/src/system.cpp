@@ -6,6 +6,7 @@
 #include "iop/iop.hpp"
 #include "iop/sif.hpp"
 #include "iop/sio2.hpp"
+#include "iop/spu2.hpp"
 #include "ipu/ipu.hpp"
 #include "ps2/disc.hpp"
 #include "kernel.hpp"
@@ -260,6 +261,7 @@ int run() {
     }
     gs::stats();
     ipu::stats();
+    if (const char *path = std::getenv("PS2_DUMP_AUDIO")) iop::spu2::dump_audio(path);
     dmac::stats();
     gif::stats();
     vif::stats();

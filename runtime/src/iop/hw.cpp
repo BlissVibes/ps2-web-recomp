@@ -104,8 +104,7 @@ void start_dma(unsigned ch) {
     if (kernel::g_trace_modules) std::fprintf(stderr, "[iop-dma] start ch %u madr 0x%08X bcr 0x%08X chcr 0x%08X\n", ch, d.madr, d.bcr, d.chcr);
     const std::uint32_t words = (d.bcr & 0xFFFFu) * ((d.bcr >> 16) ? (d.bcr >> 16) : 1u);
     if (ch == 4 || ch == 7) {
-        spu2::dma(ch == 4 ? 0 : 1, d.madr, words, (d.chcr & 1u) != 0);
-        kernel::schedule(kernel::now() + 64u + words / 4u, [ch]() { dma_done(ch); });
+        spu2::dma(ch == 4 ? 0 : 1, d.madr, words, (d.chcr & 1u) != 0, [ch]() { dma_done(ch); });
         return;
     }
     if (ch == 11 || ch == 12) {
