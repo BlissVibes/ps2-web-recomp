@@ -1,4 +1,3 @@
-# Your game files never go into the repository.
 /games/
 *.iso
 *.chd
@@ -7,10 +6,8 @@
 *.7z
 *.rar
 
-# Generated C++ is a translation of a game's code: keep it local.
 /generated/
 
-# Fetched or built by the scripts.
 /tools/
 /build/
 
@@ -18,5 +15,4 @@
 *.wav
 __pycache__/
 
-# Local editor and assistant settings.
 /.claude/
