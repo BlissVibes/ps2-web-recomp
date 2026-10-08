@@ -2,6 +2,7 @@
 
 #include "gs.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -64,10 +65,14 @@ void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
                 }
             }
             break;
-        default:
-            gs::write_image(reinterpret_cast<const std::uint8_t *>(&q), 1);
-            if (++p.loop >= p.nloop) p.active = false;
+        default: {
+            const std::uint32_t run = std::min(qwc - i, p.nloop - p.loop);
+            gs::write_image(data + static_cast<std::size_t>(i) * 16, run);
+            p.loop += run;
+            i += run - 1;
+            if (p.loop >= p.nloop) p.active = false;
             break;
+        }
         }
     }
 }

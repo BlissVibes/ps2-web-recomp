@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 
 extern const char kGsShader[];
@@ -55,7 +56,29 @@ struct Command {
 
 std::vector<Command> g_commands;
 std::vector<std::array<std::uint32_t, kParamStride / 4>> g_param_records;
-std::vector<std::uint32_t> g_arena;
+struct Arena {
+    std::unique_ptr<std::uint32_t[]> words;
+    std::size_t used = 0, capacity = 0;
+
+    std::uint32_t *grow(std::size_t count) {
+        if (used + count > capacity) {
+            std::size_t next = std::max<std::size_t>(capacity * 2, 1u << 20);
+            while (next < used + count) next *= 2;
+            auto bigger = std::make_unique_for_overwrite<std::uint32_t[]>(next);
+            if (used) std::memcpy(bigger.get(), words.get(), used * 4);
+            words = std::move(bigger);
+            capacity = next;
+        }
+        std::uint32_t *at = words.get() + used;
+        used += count;
+        return at;
+    }
+    std::size_t size() const { return used; }
+    bool empty() const { return !used; }
+    void clear() { used = 0; }
+    std::uint32_t *data() { return words.get(); }
+    std::uint32_t &operator[](std::size_t i) { return words[i]; }
+} g_arena;
 std::uint32_t g_clut_slot = 0, g_clut_loads = 0;
 
 struct Image {
@@ -149,8 +172,11 @@ void dispatch_linear(Pipeline p, std::uint32_t items, std::uint32_t param) {
 
 std::uint32_t arena_append(const void *bytes, std::size_t size) {
     const std::uint32_t offset = static_cast<std::uint32_t>(g_arena.size());
-    g_arena.resize(g_arena.size() + (size + 3) / 4 + 1, 0);
-    std::memcpy(g_arena.data() + offset, bytes, size);
+    const std::size_t words = (size + 3) / 4 + 1;
+    std::uint32_t *to = g_arena.grow(words);
+    to[words - 2] = 0;
+    to[words - 1] = 0;
+    std::memcpy(to, bytes, size);
     return offset;
 }
 
@@ -179,11 +205,12 @@ void flush_batch() {
     const std::uint32_t tiles = static_cast<std::uint32_t>(g_touched.size());
     const std::uint32_t tile_offset = static_cast<std::uint32_t>(g_arena.size());
     const std::uint32_t list_offset = tile_offset + tiles * 4;
-    g_arena.resize(list_offset + total, 0);
+    g_arena.grow(tiles * 4 + total);
     std::uint32_t cursor = list_offset;
     for (std::uint32_t i = 0; i < tiles; ++i) {
         const std::uint32_t t = g_touched[i];
         std::uint32_t *rec = g_arena.data() + tile_offset + i * 4;
+        rec[3] = 0;
         rec[0] = (t % kTilesPerRow) | ((t / kTilesPerRow) << 16);
         rec[1] = cursor;
         rec[2] = g_tile_count[t];
