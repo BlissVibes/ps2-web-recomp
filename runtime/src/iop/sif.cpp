@@ -46,6 +46,7 @@ struct Server {
 struct Request {
     Call call;
     std::uint32_t size;
+    std::vector<std::uint8_t> data;
 };
 
 struct PendingBind {
@@ -153,11 +154,13 @@ void call(const std::uint8_t *packet) {
         return;
     }
     const Server &s = it->second;
+    Request request{c, c.send_size, {}};
     if (s.buf) {
         const std::uint32_t size = (c.send_size + 15u) & ~15u;
-        std::memcpy(iop::ram_ptr(s.buf), g_ram + (g_data_addr & (kRamSize - 1)), std::min(size, kRamSize - (g_data_addr & (kRamSize - 1))));
+        const std::uint32_t from = g_data_addr & (kRamSize - 1);
+        request.data.assign(g_ram + from, g_ram + from + std::min(size, kRamSize - from));
     }
-    g_requests[s.queue].push_back(Request{c, c.send_size});
+    g_requests[s.queue].push_back(std::move(request));
     deliver_request(s.queue);
 }
 
@@ -284,6 +287,7 @@ void rpc_loop(iop::Cpu &c) {
     queue.pop_front();
     const std::uint32_t server = request.call.server_data ^ kServerXor;
     const Server &s = g_servers[server];
+    if (s.buf && !request.data.empty()) std::memcpy(iop::ram_ptr(s.buf), request.data.data(), request.data.size());
     t->rpc_server = server;
     g_held_calls[server] = request.call;
     c.r[4] = request.call.rpc_number;
