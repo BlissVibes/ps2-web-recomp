@@ -181,7 +181,11 @@ void command(std::uint32_t src, std::uint32_t size) {
     if (g_options.trace_iop_modules) {
         std::uint32_t words[14];
         std::memcpy(words, packet, sizeof words);
-        if (h->cid == 0x8000000Au) std::fprintf(stderr, "[sif] call server 0x%08X fn %u send %u recv %u mode %u\n", words[13] ^ kServerXor, words[8], words[9], words[11], words[12]);
+        if (h->cid == 0x8000000Au) {
+            std::fprintf(stderr, "[sif] call server 0x%08X fn %u send %u recv %u mode %u args", words[13] ^ kServerXor, words[8], words[9], words[11], words[12]);
+            for (int i = 0; i < 8; ++i) std::fprintf(stderr, " %08X", ee_read<std::uint32_t>(g_data_addr + i * 4));
+            std::fprintf(stderr, "\n");
+        }
         else if (h->cid == 0x80000009u) std::fprintf(stderr, "[sif] bind 0x%08X\n", words[8]);
         else {
             std::fprintf(stderr, "[sif] command 0x%08X:", h->cid);
@@ -318,6 +322,12 @@ void install_iop_side() {
         const std::uint32_t list = arg(c, 0), count = arg(c, 1);
         for (std::uint32_t i = 0; i < count; ++i) {
             const std::uint32_t src = iop::read32(list + i * 16), dst = iop::read32(list + i * 16 + 4), size = iop::read32(list + i * 16 + 8);
+            if (g_options.trace_iop_hle) {
+                std::uint32_t nonzero = 0;
+                for (std::uint32_t k = 0; k < size; ++k) nonzero += iop::ram_ptr(src)[k] != 0;
+                std::fprintf(stderr, "[sif] iop dma 0x%08X -> ee 0x%08X size 0x%X nonzero %u words %08X %08X %08X %08X\n", src, dst, size, nonzero,
+                             iop::read32(src), iop::read32(src + 4), iop::read32(src + 8), iop::read32(src + 12));
+            }
             std::memcpy(g_ram + (dst & (kRamSize - 1)), iop::ram_ptr(src), std::min(size, kRamSize - (dst & (kRamSize - 1))));
         }
         static std::uint32_t id = 1;

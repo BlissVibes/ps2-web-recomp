@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -20,6 +21,11 @@ std::uint64_t g_pmode, g_smode1, g_smode2, g_srfsh, g_synch1, g_synch2, g_syncv;
 std::uint64_t g_dispfb[2], g_display[2], g_extbuf, g_extdata, g_extwrite, g_bgcolor;
 std::uint64_t g_csr = 0x551B4000ull, g_imr = 0x7F00ull, g_busdir, g_siglblid;
 std::uint64_t g_primitives = 0;
+
+bool trace_display() {
+    static const bool enabled = std::getenv("PS2_TRACE_DISPLAY") != nullptr;
+    return enabled;
+}
 std::uint64_t g_writes[128];
 bool g_odd_field = false;
 
@@ -371,6 +377,11 @@ void vertex(std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint8_t f, b
 void write(std::uint32_t reg, std::uint64_t value) {
     State &s = g_state;
     ++g_writes[reg & 127u];
+    static const char *seq = std::getenv("PS2_TRACE_GSSEQ");
+    if (seq) {
+        static std::uint64_t n = 0, start = std::strtoull(seq, nullptr, 10);
+        if (++n >= start && n < start + 100000) std::fprintf(stderr, "[gs] w %02X %016llX\n", reg, static_cast<unsigned long long>(value));
+    }
     switch (reg) {
     case 0x00:
         s.prim = value;
@@ -425,6 +436,10 @@ void write(std::uint32_t reg, std::uint64_t value) {
     case 0x51: s.trxpos = value; break;
     case 0x52: s.trxreg = value; break;
     case 0x53:
+        if (trace_display()) {
+            std::fprintf(stderr, "[gs] trx dir %llu buf 0x%016llX pos 0x%016llX reg 0x%016llX\n", static_cast<unsigned long long>(value & 3u),
+                         static_cast<unsigned long long>(s.bitbltbuf), static_cast<unsigned long long>(s.trxpos), static_cast<unsigned long long>(s.trxreg));
+        }
         s.trxdir = value;
         g_transfer = Transfer{};
         g_carried = 0;
@@ -510,16 +525,25 @@ std::uint64_t read_privileged(std::uint32_t address) {
 
 void write_privileged(std::uint32_t address, std::uint64_t value) {
     switch (address & 0x1FF0u) {
-    case 0x0000: g_pmode = value; break;
+    case 0x0000:
+        if (trace_display() && value != g_pmode) std::fprintf(stderr, "[gs] pmode 0x%llX\n", static_cast<unsigned long long>(value));
+        g_pmode = value;
+        break;
     case 0x0010: g_smode1 = value; break;
     case 0x0020: g_smode2 = value; break;
     case 0x0030: g_srfsh = value; break;
     case 0x0040: g_synch1 = value; break;
     case 0x0050: g_synch2 = value; break;
     case 0x0060: g_syncv = value; break;
-    case 0x0070: g_dispfb[0] = value; break;
+    case 0x0070:
+        if (trace_display() && value != g_dispfb[0]) std::fprintf(stderr, "[gs] dispfb1 0x%llX\n", static_cast<unsigned long long>(value));
+        g_dispfb[0] = value;
+        break;
     case 0x0080: g_display[0] = value; break;
-    case 0x0090: g_dispfb[1] = value; break;
+    case 0x0090:
+        if (trace_display() && value != g_dispfb[1]) std::fprintf(stderr, "[gs] dispfb2 0x%llX\n", static_cast<unsigned long long>(value));
+        g_dispfb[1] = value;
+        break;
     case 0x00A0: g_display[1] = value; break;
     case 0x00B0: g_extbuf = value; break;
     case 0x00C0: g_extdata = value; break;
@@ -574,7 +598,24 @@ bool display(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32
 
 std::uint64_t primitives_drawn() { return g_primitives; }
 
+void dump_region(const char *spec) {
+    unsigned bp = 0, bw = 0, psm = 0, w = 0, h = 0;
+    char path[256] = {};
+    if (std::sscanf(spec, "%x,%u,%u,%u,%u,%255s", &bp, &bw, &psm, &w, &h, path) != 6) return;
+    std::FILE *f = std::fopen(path, "wb");
+    if (!f) return;
+    std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+    for (unsigned y = 0; y < h; ++y)
+        for (unsigned x = 0; x < w; ++x) {
+            const std::uint32_t c = read_pixel(psm, bp, bw, x, y);
+            const std::uint8_t px[3] = {static_cast<std::uint8_t>(c), static_cast<std::uint8_t>(c >> 8), static_cast<std::uint8_t>(c >> 16)};
+            std::fwrite(px, 1, 3, f);
+        }
+    std::fclose(f);
+}
+
 void stats() {
+    if (const char *spec = std::getenv("PS2_DUMP_VRAM")) dump_region(spec);
     std::fprintf(stderr, "[gs] %llu primitives drawn, register writes:", static_cast<unsigned long long>(g_primitives));
     for (int r = 0; r < 128; ++r)
         if (g_writes[r]) std::fprintf(stderr, " %02X:%llu", r, static_cast<unsigned long long>(g_writes[r]));
