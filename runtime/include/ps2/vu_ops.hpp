@@ -134,19 +134,26 @@ PS2_VU_INLINE v4u vload(const Reg128 &r) {
 PS2_VU_INLINE void vstore(Reg128 &r, v4u v) { std::memcpy(&r, &v, 16); }
 PS2_VU_INLINE v4u vsplat(std::uint32_t x) { return v4u{x, x, x, x}; }
 PS2_VU_INLINE v4u vsel(v4u old, v4u now, v4u mask) { return (now & mask) | (old & ~mask); }
+// Denormals become signed zero and exponent 255 becomes the largest finite value.
 PS2_VU_INLINE v4u vfix(v4u x) {
-    const v4u e = x & 0x7F800000u, s = x & 0x80000000u;
-    const v4u zero = (v4u)(e == 0u), big = (v4u)(e == 0x7F800000u);
-    return (x & ~(zero | big)) | (s & zero) | ((s | 0x7F7FFFFFu) & big);
+    const v4i clamped = __builtin_elementwise_min((v4i)(x & 0x7FFFFFFFu), (v4i){0x7F7FFFFF, 0x7F7FFFFF, 0x7F7FFFFF, 0x7F7FFFFF});
+    const v4i normal = (v4f)clamped >= (v4f)(v4i){0x00800000, 0x00800000, 0x00800000, 0x00800000};
+    return (x & 0x80000000u) | (v4u)(clamped & normal);
 }
 PS2_VU_INLINE v4f vin(v4u x) { return (v4f)vfix(x); }
 PS2_VU_INLINE v4u vout(v4f f) { return vfix((v4u)f); }
 PS2_VU_INLINE v4f vnorm(v4f f) { return (v4f)vfix((v4u)f); }
-PS2_VU_INLINE v4u vadd(v4u a, v4u b) { return vout(vin(a) + vin(b)); }
-PS2_VU_INLINE v4u vsub(v4u a, v4u b) { return vout(vin(a) - vin(b)); }
-PS2_VU_INLINE v4u vmul(v4u a, v4u b) { return vout(vin(a) * vin(b)); }
-PS2_VU_INLINE v4u vmadd(v4u acc, v4u a, v4u b) { return vout(vin(acc) + vnorm(vin(a) * vin(b))); }
-PS2_VU_INLINE v4u vmsub(v4u acc, v4u a, v4u b) { return vout(vin(acc) - vnorm(vin(a) * vin(b))); }
+// The n variants take operands that already went through vfix.
+PS2_VU_INLINE v4u vaddn(v4u a, v4u b) { return vout((v4f)a + (v4f)b); }
+PS2_VU_INLINE v4u vsubn(v4u a, v4u b) { return vout((v4f)a - (v4f)b); }
+PS2_VU_INLINE v4u vmuln(v4u a, v4u b) { return vout((v4f)a * (v4f)b); }
+PS2_VU_INLINE v4u vmaddn(v4u acc, v4u a, v4u b) { return vout((v4f)acc + vnorm((v4f)a * (v4f)b)); }
+PS2_VU_INLINE v4u vmsubn(v4u acc, v4u a, v4u b) { return vout((v4f)acc - vnorm((v4f)a * (v4f)b)); }
+PS2_VU_INLINE v4u vadd(v4u a, v4u b) { return vaddn(vfix(a), vfix(b)); }
+PS2_VU_INLINE v4u vsub(v4u a, v4u b) { return vsubn(vfix(a), vfix(b)); }
+PS2_VU_INLINE v4u vmul(v4u a, v4u b) { return vmuln(vfix(a), vfix(b)); }
+PS2_VU_INLINE v4u vmadd(v4u acc, v4u a, v4u b) { return vmaddn(vfix(acc), vfix(a), vfix(b)); }
+PS2_VU_INLINE v4u vmsub(v4u acc, v4u a, v4u b) { return vmsubn(vfix(acc), vfix(a), vfix(b)); }
 PS2_VU_INLINE v4i vkey(v4u x) {
     const v4u zero = (v4u)((x & 0x7F800000u) == 0u);
     const v4u f = (x & ~zero) | (x & 0x80000000u & zero);
