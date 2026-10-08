@@ -3,6 +3,9 @@
 #ifdef PS2_WINDOW
 #include "window.hpp"
 #endif
+#ifdef PS2_PROFILE
+#include "profile.hpp"
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -93,5 +96,14 @@ int main(int argc, char **argv) {
         return 1;
     }
     ps2::boot(entry, args);
+#ifdef PS2_PROFILE
+    const char *profile = std::getenv("PS2_PROFILE");
+    const char *profile_from = std::getenv("PS2_PROFILE_FROM");
+    if (profile) start_profile(profile_from ? std::strtoull(profile_from, nullptr, 10) : 0);
+    const int result = ps2::run();
+    if (profile) write_profile(profile);
+    return result;
+#else
     return ps2::run();
+#endif
 }
