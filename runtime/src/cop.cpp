@@ -54,11 +54,6 @@ void ctc2(Cpu &c, std::uint32_t reg, std::uint32_t value) {
     }
 }
 
-void vcallms(Cpu &, std::uint32_t address) {
-    static int reported = 0;
-    if (reported++ < 8) std::fprintf(stderr, "[vu0] microprogram at 0x%04X (not implemented)\n", address);
-}
-
 bool vu0_busy(Cpu &) { return false; }
 void vu0_wait(Cpu &) {}
 std::uint8_t *vu0_data() { return g_vu0_mem; }

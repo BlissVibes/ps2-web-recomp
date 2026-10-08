@@ -1,3 +1,7 @@
+#include "dmac.hpp"
+#include "gs/gif.hpp"
+#include "vif.hpp"
+#include "gs/gs.hpp"
 #include "hw.hpp"
 #include "iop/iop.hpp"
 #include "iop/sif.hpp"
@@ -11,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <cstdlib>
 #include <iterator>
 
 namespace ps2 {
@@ -63,8 +68,25 @@ void refill(Cpu &c) {
 
 std::uint64_t frame_cycles() { return kEeClock / (g_options.pal ? 50u : 60u); }
 
+void dump_frame() {
+    std::vector<std::uint32_t> rgba;
+    std::uint32_t w = 0, h = 0;
+    if (!gs::display(rgba, w, h)) return;
+    char name[512];
+    std::snprintf(name, sizeof name, "%s/frame_%05llu.ppm", g_options.frames_dir.c_str(), static_cast<unsigned long long>(g_frames));
+    std::FILE *f = std::fopen(name, "wb");
+    if (!f) return;
+    std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+    for (std::uint32_t p : rgba) {
+        const std::uint8_t px[3] = {static_cast<std::uint8_t>(p), static_cast<std::uint8_t>(p >> 8), static_cast<std::uint8_t>(p >> 16)};
+        std::fwrite(px, 1, 3, f);
+    }
+    std::fclose(f);
+}
+
 void vblank() {
     ++g_frames;
+    if (!g_options.frames_dir.empty() && g_options.frame_every && g_frames % g_options.frame_every == 0) dump_frame();
     hw::vblank_start();
     iop::vblank(true);
     schedule(hw::kEventVblankEnd + 100, now() + 18874u * 22u, [] { iop::vblank(false); });
@@ -207,6 +229,20 @@ int run() {
     }
     kernel::dump();
     iop::dump();
+    sif::dump();
+    if (const char *peek = std::getenv("PS2_PEEK")) {
+        std::uint32_t at = 0, len = 0;
+        if (std::sscanf(peek, "%x,%x", &at, &len) == 2)
+            for (std::uint32_t i = 0; i < len; i += 16) {
+                std::fprintf(stderr, "[peek] %08X:", at + i);
+                for (std::uint32_t j = 0; j < 16 && i + j < len; j += 4) std::fprintf(stderr, " %08X", ld32(at + i + j));
+                std::fprintf(stderr, "\n");
+            }
+    }
+    std::fprintf(stderr, "[gs] %llu primitives drawn\n", static_cast<unsigned long long>(gs::primitives_drawn()));
+    dmac::stats();
+    gif::stats();
+    vif::stats();
     std::fprintf(stderr, "[ee] stopped after %llu frames, %llu cycles: %s\n",
                  static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(now()), g_halt_reason.c_str());
     return 0;

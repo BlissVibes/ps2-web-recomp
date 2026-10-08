@@ -25,6 +25,8 @@ struct Options {
     std::string disc_path;
     bool trace_iop_modules = false;
     bool trace_iop_hle = false;
+    std::string frames_dir;
+    std::uint32_t frame_every = 60;
 };
 
 extern Options g_options;

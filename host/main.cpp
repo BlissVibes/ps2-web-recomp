@@ -14,7 +14,7 @@ int usage() {
     std::fprintf(stderr,
                  "usage: ps2run <elf> [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
                  "              [--disc image.iso] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
-                 "              [--trace-iop] [--trace-iop-hle]\n");
+                 "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n]\n");
     return 2;
 }
 
@@ -35,6 +35,8 @@ int main(int argc, char **argv) {
         else if (a == "--disc" && i + 1 < argc) ps2::g_options.disc_path = argv[++i];
         else if (a == "--trace-iop") ps2::g_options.trace_iop_modules = true;
         else if (a == "--trace-iop-hle") ps2::g_options.trace_iop_hle = true;
+        else if (a == "--frames-dir" && i + 1 < argc) ps2::g_options.frames_dir = argv[++i];
+        else if (a == "--frame-every" && i + 1 < argc) ps2::g_options.frame_every = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         else return usage();
     }
 

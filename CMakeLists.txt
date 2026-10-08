@@ -24,11 +24,18 @@ add_library(ps2runtime STATIC
     runtime/src/hw.cpp
     runtime/src/cop.cpp
     runtime/src/disc.cpp
+    runtime/src/dmac.cpp
+    runtime/src/vif.cpp
+    runtime/src/vu_micro.cpp
+    runtime/src/gs/gs.cpp
+    runtime/src/gs/gif.cpp
+    runtime/src/gs/raster.cpp
     runtime/src/iop/cpu.cpp
     runtime/src/iop/kernel.cpp
     runtime/src/iop/libs.cpp
     runtime/src/iop/hw.cpp
     runtime/src/iop/spu2.cpp
+    runtime/src/iop/sio2.cpp
     runtime/src/iop/io.cpp
     runtime/src/iop/cdvd.cpp
     runtime/src/iop/sif.cpp

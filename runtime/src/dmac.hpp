@@ -1,0 +1,13 @@
+#pragma once
+
+#include <cstdint>
+
+namespace ps2::dmac {
+
+void reset();
+void stats();
+bool owns(std::uint32_t a);
+std::uint32_t read(std::uint32_t a);
+void write(std::uint32_t a, std::uint32_t v);
+
+}

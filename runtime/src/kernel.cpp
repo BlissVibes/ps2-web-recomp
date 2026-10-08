@@ -418,9 +418,17 @@ void on_vblank_start() {
 void wake_idle() { g_reschedule = true; }
 
 void dump() {
-    for (const auto &[id, t] : g_threads)
+    for (const auto &[id, t] : g_threads) {
         std::fprintf(stderr, "[thread] %d status %d prio %d wait %d/%d pc 0x%08X ra 0x%08X\n", id, t.status, t.priority, t.wait, t.wait_id,
                      id == g_current ? g_cpu.pc : t.context.pc, id == g_current ? g_cpu.r[31].w[0] : t.context.r[31].w[0]);
+        const std::uint32_t sp = id == g_current ? g_cpu.r[29].w[0] : t.context.r[29].w[0];
+        std::fprintf(stderr, "[thread]   stack:");
+        for (std::uint32_t i = 0; i < 512 && sp + i * 4 < kRamSize; ++i) {
+            const std::uint32_t v = load<std::uint32_t>(g_ram + sp + i * 4);
+            if (v >= 0x00100000u && v < 0x00617A14u && has_code(v) && (v & 3u) == 0) std::fprintf(stderr, " %08X", v);
+        }
+        std::fprintf(stderr, "\n");
+    }
     for (const auto &[id, s] : g_semas)
         if (!s.waiters.empty()) std::fprintf(stderr, "[sema] %d count %d waiters %zu\n", id, s.count, s.waiters.size());
 }
