@@ -104,7 +104,7 @@ std::size_t g_out_pos = 0;
 
 std::uint32_t g_ctrl = 0, g_result = 0, g_command = 0;
 int g_last = -1;
-bool g_busy = false, g_decoding = false, g_interrupt = true;
+bool g_busy = false, g_decoding = false, g_interrupt = true, g_starved = false;
 int g_phase = 0;
 std::uint32_t g_qsc = 0, g_count = 0;
 bool g_first = true;
@@ -547,7 +547,8 @@ void drain() {
 void step() {
     if (g_busy && g_decoding) {
         try {
-            if (run_command()) g_decoding = false;
+            g_starved = !run_command();
+            if (!g_starved) g_decoding = false;
         } catch (const BadCode &) {
             std::fprintf(stderr, "[ipu] bad code in command 0x%08X\n", g_command);
             g_ctrl |= kEcd;
@@ -586,11 +587,12 @@ std::uint32_t read32(std::uint32_t a) {
     case 0x10002004u:
         return g_busy ? 0x80000000u : 0u;
     case 0x10002010u: {
-        const std::uint32_t ifc = static_cast<std::uint32_t>(std::min<std::size_t>(8, g_in.size() / 16));
+        const std::uint32_t ifc = g_starved ? 0u : static_cast<std::uint32_t>(std::min<std::size_t>(8, g_in.size() / 16));
         const std::uint32_t ofc = static_cast<std::uint32_t>(std::min<std::size_t>(8, (g_out.size() - g_out_pos) / 16));
         return (g_ctrl & ~0x800000FFu) | (g_busy ? 0x80000000u : 0u) | ifc | (ofc << 4);
     }
     case 0x10002020u: {
+        if (g_starved) return 0;
         const std::uint32_t bp = static_cast<std::uint32_t>(g_bit & 127u);
         std::uint32_t ifc = static_cast<std::uint32_t>(g_in.size() / 16 - std::min(g_in.size() / 16, g_bit / 128));
         std::uint32_t fp = 0;
@@ -614,6 +616,7 @@ void write32(std::uint32_t a, std::uint32_t v) {
     case 0x10002000u: {
     }
         g_ctrl &= ~(kEcd | kScd);
+        g_starved = false;
         ++g_commands[v >> 28];
         g_command = v;
         g_last = static_cast<int>(v >> 28);
@@ -633,6 +636,7 @@ void write32(std::uint32_t a, std::uint32_t v) {
         break;
     case 0x10002010u:
         if (v & kReset) {
+            g_starved = false;
             g_in.clear();
             g_out.clear();
             g_bit = g_out_pos = 0;

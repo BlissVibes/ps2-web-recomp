@@ -95,14 +95,24 @@ void run_normal(int ch) {
     finish(ch);
 }
 
+bool chain_ends_after_current(const Channel &c) {
+    const std::uint32_t id = (c.chcr >> 28) & 7u;
+    return id == 0 || id == 7 || ((c.chcr & 0x80u) && (c.chcr & 0x80000000u));
+}
+
 void run_chain(int ch) {
     Channel &c = g_ch[ch];
     if (c.qwc) {
+        const bool end = chain_ends_after_current(c);
         deliver(ch, c.madr, c.qwc);
         c.madr += c.qwc * 16;
         c.qwc = 0;
         if (vif_stalled(ch)) {
-            pause(ch, false);
+            pause(ch, end);
+            return;
+        }
+        if (end) {
+            finish(ch);
             return;
         }
     }
@@ -166,7 +176,7 @@ void run_chain(int ch) {
 void start(int ch) {
     Channel &c = g_ch[ch];
     c.paused = false;
-    c.tag_end = false;
+    c.tag_end = c.qwc && chain_ends_after_current(c);
     ++g_starts[ch];
     static const bool trace = std::getenv("PS2_TRACE_DMA") != nullptr;
     if (trace) std::fprintf(stderr, "[dma] ch%d chcr 0x%08X madr 0x%08X qwc %u tadr 0x%08X thread %d%s\n", ch, c.chcr, c.madr, c.qwc, c.tadr,
@@ -274,6 +284,9 @@ std::uint32_t read(std::uint32_t a) {
     for (int ch = 0; ch < 10; ++ch) {
         if (a < kBase[ch] || a >= kBase[ch] + 0x100u) continue;
         const Channel &c = g_ch[ch];
+        static const bool trace = std::getenv("PS2_TRACE_DMA") != nullptr;
+        if (trace && ch == 4)
+            std::fprintf(stderr, "[dma] ch4 read 0x%02X chcr 0x%08X madr 0x%08X qwc %u tadr 0x%08X\n", a - kBase[ch], c.chcr, c.madr, c.qwc, c.tadr);
         switch (a - kBase[ch]) {
         case 0x00: return c.chcr;
         case 0x10: return c.madr;
