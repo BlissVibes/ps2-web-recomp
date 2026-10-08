@@ -193,6 +193,10 @@ private:
                 simple(i);
                 ++pending_;
                 falls = true;
+            } else if (i.op == Eret) {
+                flush();
+                line("{ const std::uint32_t t = eret(c); c.pc = t; [[clang::musttail]] return dispatch(c, 0u, depth); }");
+                falls = false;
             } else if (fl == Flow::Stop) {
                 flush();
                 line(std::format("stop(c, {}, \"{}\"); return;", hex(a), name(i.op)));
@@ -235,7 +239,7 @@ private:
     }
 
     std::string jump(std::uint32_t t, std::uint32_t from) {
-        std::string check = t <= from ? std::format("if (c.budget < 0) {{ c.pc = {} | kUnwind; return; }} ", hex(t)) : "";
+        std::string check = t <= from ? std::format("if (c.budget < 0 && preempt(c)) {{ c.pc = {} | kUnwind; return; }} ", hex(t)) : "";
         if (in_unit(t) && p_.is_code(t)) return check + "goto " + label(t) + ";";
         if (p_.is_code(t))
             return check + std::format("[[clang::musttail]] return {}(c, {}u, depth);", unit_name(layout_.unit_of(t)), id_of(t));

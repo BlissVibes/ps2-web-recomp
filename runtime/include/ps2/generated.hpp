@@ -26,6 +26,7 @@ void register_units(const UnitInfo *units, std::uint32_t count);
 void dispatch(Cpu &c, std::uint32_t entry, std::uint32_t depth);
 void call(Cpu &c, std::uint32_t target, std::uint32_t depth);
 void bad_entry(Cpu &c, std::uint32_t unit_base);
+bool preempt(Cpu &c);
 
 void syscall(Cpu &c, std::uint32_t pc);
 void breakpoint(Cpu &c, std::uint32_t pc);
@@ -35,6 +36,7 @@ void stop(Cpu &c, std::uint32_t pc, const char *what);
 std::uint32_t mfc0(Cpu &c, std::uint32_t reg, std::uint32_t sel);
 void mtc0(Cpu &c, std::uint32_t reg, std::uint32_t value);
 void set_interrupts(Cpu &c, bool enabled);
+std::uint32_t eret(Cpu &c);
 bool cpcond0(Cpu &c);
 
 std::uint32_t cfc1(Cpu &c, std::uint32_t reg);
