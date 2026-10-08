@@ -27,6 +27,7 @@ add_library(ps2runtime STATIC
     runtime/src/dmac.cpp
     runtime/src/vif.cpp
     runtime/src/vu_micro.cpp
+    runtime/src/ipu/ipu.cpp
     runtime/src/gs/gs.cpp
     runtime/src/gs/gif.cpp
     runtime/src/gs/raster.cpp

@@ -4,6 +4,7 @@
 #include "gs/gif.hpp"
 #include "gs/gs.hpp"
 #include "iop/sif.hpp"
+#include "ipu/ipu.hpp"
 #include "vif.hpp"
 #include "vu_micro.hpp"
 #include "kernel.hpp"
@@ -111,6 +112,7 @@ void reset() {
     vif::reset();
     vu::reset();
     dmac::reset();
+    ipu::reset();
     g_regs.clear();
     for (Timer &t : g_timers) t = Timer{};
     g_timers[3].mode = 0x183u;
@@ -178,6 +180,7 @@ std::uint32_t read32(std::uint32_t a) {
     if (a >= 0x10003000u && a < 0x10003800u) return gif::read(a);
     if (a >= 0x10003800u && a < 0x10003C00u) return vif::read(0, a & 0x3FFu);
     if (a >= 0x10003C00u && a < 0x10004000u) return vif::read(1, a & 0x3FFu);
+    if (a >= 0x10002000u && a < 0x10002040u) return ipu::read32(a);
     if (is_timer(a)) {
         const int n = timer_index(a);
         switch (a & 0x30u) {
@@ -212,6 +215,7 @@ void write32(std::uint32_t a, std::uint32_t v) {
     if (a >= 0x10003000u && a < 0x10003800u) { gif::write(a, v); return; }
     if (a >= 0x10003800u && a < 0x10003C00u) { vif::write(0, a & 0x3FFu, v); return; }
     if (a >= 0x10003C00u && a < 0x10004000u) { vif::write(1, a & 0x3FFu, v); return; }
+    if ((a >= 0x10002000u && a < 0x10002040u) || (a >= 0x10007010u && a < 0x10007020u)) { ipu::write32(a, v); return; }
     if (is_timer(a)) {
         const int n = timer_index(a);
         Timer &t = g_timers[n];
@@ -254,6 +258,10 @@ void read128(std::uint32_t a, Reg128 &out) {
         gs::read_image(reinterpret_cast<std::uint8_t *>(&out), 1);
         return;
     }
+    if (a >= 0x10007000u && a < 0x10007010u) {
+        ipu::read_fifo(reinterpret_cast<std::uint8_t *>(&out));
+        return;
+    }
     report("read128", a, 0);
 }
 
@@ -262,6 +270,7 @@ void write128(std::uint32_t a, const Reg128 &v) {
     if (a >= 0x10004000u && a < 0x10005000u) { vif::transfer(0, bytes, 1); return; }
     if (a >= 0x10005000u && a < 0x10006000u) { vif::transfer(1, bytes, 1); return; }
     if (a >= 0x10006000u && a < 0x10007000u) { gif::transfer(3, bytes, 1); return; }
+    if (a >= 0x10007010u && a < 0x10007020u) { ipu::write_fifo(bytes); return; }
     report("write128", a, v.d[0]);
 }
 

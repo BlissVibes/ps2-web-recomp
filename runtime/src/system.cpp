@@ -6,6 +6,7 @@
 #include "iop/iop.hpp"
 #include "iop/sif.hpp"
 #include "iop/sio2.hpp"
+#include "ipu/ipu.hpp"
 #include "ps2/disc.hpp"
 #include "kernel.hpp"
 #include "ps2/generated.hpp"
@@ -258,6 +259,7 @@ int run() {
         }
     }
     gs::stats();
+    ipu::stats();
     dmac::stats();
     gif::stats();
     vif::stats();
