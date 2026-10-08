@@ -86,6 +86,7 @@ void dump_frame() {
 
 void vblank() {
     ++g_frames;
+    if (g_options.trace_iop_modules && g_frames % 25 == 0) std::fprintf(stderr, "[frame] %llu prims %llu\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(gs::primitives_drawn()));
     if (!g_options.frames_dir.empty() && g_options.frame_every && g_frames % g_options.frame_every == 0) dump_frame();
     hw::vblank_start();
     iop::vblank(true);
@@ -239,7 +240,14 @@ int run() {
                 std::fprintf(stderr, "\n");
             }
     }
-    std::fprintf(stderr, "[gs] %llu primitives drawn\n", static_cast<unsigned long long>(gs::primitives_drawn()));
+    if (const char *path = std::getenv("PS2_DUMP")) {
+        if (std::FILE *f = std::fopen(path, "wb")) {
+            std::fwrite(g_ram, 1, kRamSize, f);
+            std::fwrite(iop::ram_ptr(0), 1, iop::kRamSize, f);
+            std::fclose(f);
+        }
+    }
+    gs::stats();
     dmac::stats();
     gif::stats();
     vif::stats();

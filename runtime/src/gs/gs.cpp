@@ -560,25 +560,25 @@ bool display(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32
     width = dw / magh;
     height = dh / magv;
     if (!width || !height || width > 2048 || height > 2048) return false;
-    const bool frame_mode = (g_smode2 & 2u) && (g_smode2 & 1u);
+    const bool halved = (g_smode2 & 3u) == 3u;
     rgba.resize(static_cast<std::size_t>(width) * height);
     for (std::uint32_t y = 0; y < height; ++y)
         for (std::uint32_t x = 0; x < width; ++x) {
-            std::uint32_t c = read_pixel(psm, fbp * 32, fbw, dbx + x, dby + y);
+            std::uint32_t c = read_pixel(psm, fbp * 32, fbw, dbx + x, dby + (halved ? y / 2 : y));
             if (psm == PSMCT16 || psm == PSMCT16S)
                 c = ((c & 0x1Fu) << 3) | ((c & 0x3E0u) << 6) | ((c & 0x7C00u) << 9) | 0xFF000000u;
             rgba[static_cast<std::size_t>(y) * width + x] = c | 0xFF000000u;
         }
-    (void)frame_mode;
     return true;
 }
 
-std::uint64_t primitives_drawn() {
-    std::fprintf(stderr, "[gs] writes:");
+std::uint64_t primitives_drawn() { return g_primitives; }
+
+void stats() {
+    std::fprintf(stderr, "[gs] %llu primitives drawn, register writes:", static_cast<unsigned long long>(g_primitives));
     for (int r = 0; r < 128; ++r)
         if (g_writes[r]) std::fprintf(stderr, " %02X:%llu", r, static_cast<unsigned long long>(g_writes[r]));
     std::fprintf(stderr, "\n");
-    return g_primitives;
 }
 
 }

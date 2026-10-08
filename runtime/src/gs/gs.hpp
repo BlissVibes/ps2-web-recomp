@@ -57,5 +57,6 @@ void write_pixel(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uin
 
 bool display(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 std::uint64_t primitives_drawn();
+void stats();
 
 }
