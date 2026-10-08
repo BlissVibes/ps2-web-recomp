@@ -183,9 +183,20 @@ void command(std::uint32_t src, std::uint32_t size) {
         std::memcpy(words, packet, sizeof words);
         if (h->cid == 0x8000000Au) std::fprintf(stderr, "[sif] call server 0x%08X fn %u send %u recv %u mode %u\n", words[13] ^ kServerXor, words[8], words[9], words[11], words[12]);
         else if (h->cid == 0x80000009u) std::fprintf(stderr, "[sif] bind 0x%08X\n", words[8]);
-        else std::fprintf(stderr, "[sif] command 0x%08X\n", h->cid);
+        else {
+            std::fprintf(stderr, "[sif] command 0x%08X:", h->cid);
+            for (int i = 0; i < 14; ++i) std::fprintf(stderr, " %08X", words[i]);
+            std::fprintf(stderr, "\n");
+        }
     }
     switch (h->cid) {
+    case 0x80000001u: {
+        std::uint32_t index, value;
+        std::memcpy(&index, packet + 16, 4);
+        std::memcpy(&value, packet + 20, 4);
+        g_sreg[index & 31u] = value;
+        break;
+    }
     case 0x80000002u: {
         std::uint32_t address;
         std::memcpy(&address, packet + 16, 4);
@@ -650,7 +661,13 @@ void pump() {
     if (g_options.trace_iop_modules) {
         std::uint32_t cid;
         std::memcpy(&cid, g_outgoing.front().data() + 8, 4);
-        std::fprintf(stderr, "[sif] to EE: command 0x%08X\n", cid);
+        std::fprintf(stderr, "[sif] to EE: command 0x%08X:", cid);
+        for (std::size_t i = 0; i < g_outgoing.front().size() / 4 && i < 16; ++i) {
+            std::uint32_t w;
+            std::memcpy(&w, g_outgoing.front().data() + i * 4, 4);
+            std::fprintf(stderr, " %08X", w);
+        }
+        std::fprintf(stderr, "\n");
     }
     const std::vector<std::uint8_t> packet = std::move(g_outgoing.front());
     g_outgoing.pop_front();
