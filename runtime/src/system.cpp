@@ -98,6 +98,7 @@ void apply_presses() {
 void vblank() {
     ++g_frames;
     apply_presses();
+    if (g_options.on_vblank) g_options.on_vblank();
     if (g_options.trace_iop_modules && g_frames % 25 == 0) std::fprintf(stderr, "[frame] %llu prims %llu\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(gs::primitives_drawn()));
     if (!g_options.frames_dir.empty() && g_options.frame_every && g_frames % g_options.frame_every == 0) dump_frame();
     hw::vblank_start();
@@ -270,5 +271,10 @@ int run() {
                  static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(now()), g_halt_reason.c_str());
     return 0;
 }
+
+bool display_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) { return gs::display(rgba, width, height); }
+void set_pad_buttons(std::uint16_t pressed) { iop::sio2::set_buttons(0, pressed); }
+void set_pad_axis(int axis, std::uint8_t value) { iop::sio2::set_axis(0, axis, value); }
+void set_audio_sink(std::function<void(const std::int16_t *, std::size_t)> sink) { iop::spu2::set_sink(std::move(sink)); }
 
 }

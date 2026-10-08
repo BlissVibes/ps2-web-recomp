@@ -75,6 +75,7 @@ Core g_cores[2];
 std::uint16_t g_spdif_out = 0, g_spdif_mode = 0, g_spdif_media = 0;
 std::vector<std::int16_t> g_audio;
 bool g_record = false;
+std::function<void(const std::int16_t *, std::size_t)> g_sink;
 std::uint64_t g_next_tick = 0;
 
 void check_irq(std::uint32_t address, std::uint32_t words) {
@@ -219,6 +220,7 @@ void render_input(int core, std::int32_t &left, std::int32_t &right) {
 std::int32_t master(std::uint16_t reg) { return reg & 0x8000u ? 0x7FFF : static_cast<std::int16_t>(reg << 1); }
 
 void tick() {
+    std::int16_t out[kBatch * 2];
     for (unsigned n = 0; n < kBatch; ++n) {
         std::int32_t mix[2] = {};
         for (int c = 0; c < 2; ++c) {
@@ -229,11 +231,11 @@ void tick() {
             mix[0] += left * master(k.mvol[0]) >> 15;
             mix[1] += right * master(k.mvol[1]) >> 15;
         }
-        if (g_record) {
-            g_audio.push_back(static_cast<std::int16_t>(std::clamp(mix[0], -32768, 32767)));
-            g_audio.push_back(static_cast<std::int16_t>(std::clamp(mix[1], -32768, 32767)));
-        }
+        out[n * 2] = static_cast<std::int16_t>(std::clamp(mix[0], -32768, 32767));
+        out[n * 2 + 1] = static_cast<std::int16_t>(std::clamp(mix[1], -32768, 32767));
     }
+    if (g_record) g_audio.insert(g_audio.end(), out, out + kBatch * 2);
+    if (g_sink) g_sink(out, kBatch);
     feed_input(0);
     feed_input(1);
     g_next_tick = kernel::now() + kBatch * kCyclesPerSample;
@@ -471,6 +473,8 @@ void dma(int core, std::uint32_t madr, std::uint32_t words, bool to_spu, std::fu
     k.tsa = (k.tsa + halfwords) & kRamMask;
     kernel::schedule(kernel::now() + 64 + words / 4, std::move(done));
 }
+
+void set_sink(std::function<void(const std::int16_t *, std::size_t)> sink) { g_sink = std::move(sink); }
 
 void dump_audio(const char *path) {
     std::FILE *f = std::fopen(path, "wb");

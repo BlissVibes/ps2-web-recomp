@@ -34,6 +34,7 @@ struct Options {
     std::string frames_dir;
     std::uint32_t frame_every = 60;
     std::vector<Press> presses;
+    std::function<void()> on_vblank;
 };
 
 extern Options g_options;
@@ -66,5 +67,10 @@ int run();
 void halt(const std::string &reason);
 bool halted();
 std::uint64_t frame_count();
+
+bool display_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
+void set_pad_buttons(std::uint16_t pressed);
+void set_pad_axis(int axis, std::uint8_t value);
+void set_audio_sink(std::function<void(const std::int16_t *samples, std::size_t frames)> sink);
 
 }

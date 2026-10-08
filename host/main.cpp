@@ -1,5 +1,9 @@
 #include "ps2/system.hpp"
 
+#ifdef PS2_WINDOW
+#include "window.hpp"
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -44,7 +48,7 @@ int usage() {
                  "usage: ps2run <elf> [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
                  "              [--disc image.iso] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
                  "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n]\n"
-                 "              [--press frame:button[+button][:frames]]...\n");
+                 "              [--press frame:button[+button][:frames]]... [--window]\n");
     return 2;
 }
 
@@ -53,6 +57,7 @@ int usage() {
 int main(int argc, char **argv) {
     if (argc < 2) return usage();
     std::vector<std::string> args{argv[1]};
+    [[maybe_unused]] bool window = false;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--arg" && i + 1 < argc) args.push_back(argv[++i]);
@@ -71,10 +76,16 @@ int main(int argc, char **argv) {
             if (!parse_press(argv[++i], press)) return usage();
             ps2::g_options.presses.push_back(press);
         }
+#ifdef PS2_WINDOW
+        else if (a == "--window") window = true;
+#endif
         else if (a == "--frame-every" && i + 1 < argc) ps2::g_options.frame_every = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         else return usage();
     }
 
+#ifdef PS2_WINDOW
+    if (window && !open_window()) return 1;
+#endif
     register_generated_code();
     std::uint32_t entry = 0;
     if (!ps2::load_elf(argv[1], entry)) {
