@@ -222,7 +222,7 @@ std::uint32_t read(std::uint32_t a, unsigned size) {
     const int ch = dma_channel(a, reg);
     if (ch >= 0) {
         const Dma &d = g_dma[ch];
-        return reg == 0 ? d.madr : reg == 1 ? d.bcr : reg == 2 ? d.chcr : d.tadr;
+        return (reg == 0 ? d.madr : reg == 1 ? d.bcr : reg == 2 ? d.chcr : d.tadr) >> ((a & 3u) * 8);
     }
     if ((a >= 0x1F801100u && a < 0x1F801130u) || (a >= 0x1F801480u && a < 0x1F8014B0u)) {
         if ((a & 0xFu) == 0) return static_cast<std::uint32_t>(kernel::now());
@@ -252,13 +252,11 @@ void write(std::uint32_t a, std::uint32_t v, unsigned size) {
     const int ch = dma_channel(a, reg);
     if (ch >= 0) {
         Dma &d = g_dma[ch];
-        if (reg == 0) d.madr = v;
-        else if (reg == 1) d.bcr = v;
-        else if (reg == 3) d.tadr = v;
-        else {
-            d.chcr = v;
-            if (v & 0x01000000u) start_dma(static_cast<unsigned>(ch));
-        }
+        std::uint32_t &target = reg == 0 ? d.madr : reg == 1 ? d.bcr : reg == 2 ? d.chcr : d.tadr;
+        const unsigned shift = (a & 3u) * 8;
+        const std::uint32_t mask = size >= 4 ? 0xFFFFFFFFu : ((1u << (size * 8)) - 1u) << shift;
+        target = (target & ~mask) | ((v << shift) & mask);
+        if (reg == 2 && (d.chcr & 0x01000000u) && (mask & 0x01000000u)) start_dma(static_cast<unsigned>(ch));
         return;
     }
     report("write", a, v);

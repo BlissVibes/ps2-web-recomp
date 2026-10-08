@@ -68,10 +68,12 @@ bool start_read(std::uint32_t lsn, std::uint32_t sectors, std::uint32_t buffer, 
     if (g_cd.busy) return false;
     g_cd.busy = true;
     g_cd.error = 0;
-    std::vector<std::uint8_t> data(static_cast<std::size_t>(sectors) * disc::kSector);
-    disc::read(lsn, sectors, data.data());
-    for (std::size_t i = 0; i < data.size(); ++i) write8(buffer + static_cast<std::uint32_t>(i), data[i]);
-    schedule(now() + read_cycles(sectors), finish_read);
+    schedule(now() + read_cycles(sectors), [lsn, sectors, buffer]() {
+        std::vector<std::uint8_t> data(static_cast<std::size_t>(sectors) * disc::kSector);
+        disc::read(lsn, sectors, data.data());
+        for (std::size_t i = 0; i < data.size(); ++i) write8(buffer + static_cast<std::uint32_t>(i), data[i]);
+        finish_read();
+    });
     return true;
 }
 
