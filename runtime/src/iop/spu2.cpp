@@ -223,15 +223,19 @@ std::int32_t master(std::uint16_t reg) { return reg & 0x8000u ? 0x7FFF : static_
 
 void tick() {
     std::int16_t out[kBatch * 2];
+    std::int32_t sum[2][kBatch][2] = {};
+    for (int c = 0; c < 2; ++c) {
+        for (Voice &v : g_cores[c].voices) {
+            if (!v.key_on && v.phase == kOff) continue;
+            for (unsigned n = 0; n < kBatch; ++n) render_voice(v, sum[c][n][0], sum[c][n][1]);
+        }
+        for (unsigned n = 0; n < kBatch; ++n) render_input(c, sum[c][n][0], sum[c][n][1]);
+    }
     for (unsigned n = 0; n < kBatch; ++n) {
         std::int32_t mix[2] = {};
         for (int c = 0; c < 2; ++c) {
-            Core &k = g_cores[c];
-            std::int32_t left = 0, right = 0;
-            for (Voice &v : k.voices) render_voice(v, left, right);
-            render_input(c, left, right);
-            mix[0] += left * master(k.mvol[0]) >> 15;
-            mix[1] += right * master(k.mvol[1]) >> 15;
+            mix[0] += sum[c][n][0] * master(g_cores[c].mvol[0]) >> 15;
+            mix[1] += sum[c][n][1] * master(g_cores[c].mvol[1]) >> 15;
         }
         out[n * 2] = static_cast<std::int16_t>(std::clamp(mix[0], -32768, 32767));
         out[n * 2 + 1] = static_cast<std::int16_t>(std::clamp(mix[1], -32768, 32767));
