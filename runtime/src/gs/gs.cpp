@@ -510,7 +510,41 @@ void write_packed(std::uint32_t reg, const Reg128 &q) {
 void write_image(const std::uint8_t *data, std::uint32_t qwords) { feed_image(data, static_cast<std::size_t>(qwords) * 16); }
 
 void read_image(std::uint8_t *data, std::uint32_t qwords) {
-    std::memset(data, 0, static_cast<std::size_t>(qwords) * 16);
+    const std::size_t bytes = static_cast<std::size_t>(qwords) * 16;
+    std::memset(data, 0, bytes);
+    if (!g_transfer.active || (g_state.trxdir & 3u) != 1) return;
+    const std::uint64_t buf = g_state.bitbltbuf, pos = g_state.trxpos, reg = g_state.trxreg;
+    const std::uint32_t sbp = static_cast<std::uint32_t>(buf) & 0x3FFFu, sbw = static_cast<std::uint32_t>(buf >> 16) & 0x3Fu;
+    const std::uint32_t spsm = static_cast<std::uint32_t>(buf >> 24) & 0x3Fu;
+    const std::uint32_t ssax = static_cast<std::uint32_t>(pos) & 0x7FFu, ssay = static_cast<std::uint32_t>(pos >> 16) & 0x7FFu;
+    const std::uint32_t rrw = static_cast<std::uint32_t>(reg) & 0xFFFu, rrh = static_cast<std::uint32_t>(reg >> 32) & 0xFFFu;
+    const std::uint32_t bits = bits_per_pixel(spsm);
+    auto next = [&]() {
+        const std::uint32_t v = read_pixel(spsm, sbp, sbw, (ssax + g_transfer.x) & 0x7FFu, (ssay + g_transfer.y) & 0x7FFu);
+        if (++g_transfer.x >= rrw) {
+            g_transfer.x = 0;
+            if (++g_transfer.y >= rrh) g_transfer.active = false;
+        }
+        return v;
+    };
+    if (bits == 24) {
+        for (std::size_t i = 0; i < bytes && (g_transfer.active || g_carried); ++i) {
+            if (!g_carried) {
+                const std::uint32_t v = next();
+                g_carry[0] = static_cast<std::uint8_t>(v);
+                g_carry[1] = static_cast<std::uint8_t>(v >> 8);
+                g_carry[2] = static_cast<std::uint8_t>(v >> 16);
+                g_carried = 3;
+            }
+            data[i] = g_carry[3 - g_carried--];
+        }
+        return;
+    }
+    for (std::size_t bit = 0; bit + bits <= bytes * 8 && g_transfer.active; bit += bits) {
+        const std::uint32_t v = next();
+        if (bits == 4) data[bit / 8] |= static_cast<std::uint8_t>((v & 15u) << (bit & 4));
+        else std::memcpy(data + bit / 8, &v, bits / 8);
+    }
 }
 
 std::uint64_t read_privileged(std::uint32_t address) {

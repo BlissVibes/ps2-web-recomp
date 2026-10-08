@@ -3,6 +3,7 @@
 #include "kernel.hpp"
 
 #include "gs/gif.hpp"
+#include "gs/gs.hpp"
 #include "ipu/ipu.hpp"
 #include "hw.hpp"
 #include "ps2/memory.hpp"
@@ -83,6 +84,8 @@ void run_normal(int ch) {
         c.sadr = (c.sadr + c.qwc * 16) & (kScratchpadSize - 1);
     } else if ((c.chcr & 1u) || ch == 2 || ch == 0 || ch == 9) {
         deliver(ch, c.madr, c.qwc);
+    } else if (ch == 1) {
+        for (std::uint32_t i = 0; i < c.qwc; ++i) gs::read_image(target(c.madr + i * 16), 1);
     } else {
         std::fprintf(stderr, "[dma] channel %d reads from a device (not emulated)\n", ch);
     }
