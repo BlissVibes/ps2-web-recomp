@@ -28,6 +28,7 @@ struct Thread {
     std::uint32_t rpc_server{};
     std::uint32_t event_bits{}, event_mode{}, event_result{};
     std::uint32_t message_out{};
+    bool suspended{};
     std::function<void()> on_exit;
 };
 

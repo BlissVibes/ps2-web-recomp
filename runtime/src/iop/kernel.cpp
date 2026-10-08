@@ -93,14 +93,17 @@ void do_switch() {
     if (next == cur && cur && cur->status == kRun) return;
     if (cur && cur->status != kDormant) {
         cur->context = g_cpu;
+        cur->suspended = g_suspended;
         if (cur->status == kRun) cur->status = kReady;
     }
     if (next) {
         next->status = kRun;
         g_current = next->id;
         g_cpu = next->context;
+        g_suspended = next->suspended;
     } else {
         g_current = 0;
+        g_suspended = false;
     }
 }
 
@@ -547,13 +550,17 @@ void run(std::uint64_t ee_cycles) {
     g_target += g_ee_remainder / kClockDivider;
     g_ee_remainder %= kClockDivider;
     while (g_now < g_target) {
-        while (!g_events.empty() && g_events.top().at <= g_now) {
-            auto action = g_events.top().action;
-            g_events.pop();
-            action();
+        const Thread *running = current();
+        // A thread inside CpuSuspendIntr cannot be preempted: interrupt-side events wait for CpuResumeIntr.
+        if (!g_suspended || !running || running->status != kRun) {
+            while (!g_events.empty() && g_events.top().at <= g_now) {
+                auto action = g_events.top().action;
+                g_events.pop();
+                action();
+            }
+            deliver_interrupts();
+            if (g_switch) do_switch();
         }
-        deliver_interrupts();
-        if (g_switch) do_switch();
         if (!current()) {
             const std::uint64_t next = g_events.empty() ? g_target : std::min(g_target, g_events.top().at);
             g_now = std::max(g_now, next);
