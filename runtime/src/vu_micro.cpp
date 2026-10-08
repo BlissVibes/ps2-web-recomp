@@ -27,6 +27,7 @@ struct Unit {
     std::uint32_t code_mask;
     std::uint32_t data_qwords;
     std::uint32_t tpc;
+    vuops::FlagPipe *pipe = nullptr;
 };
 
 Vu0Regs g_vu1;
@@ -43,6 +44,8 @@ struct UpperOut {
     Reg128 value{};
     unsigned dest = 0;
     bool flags = false;
+    bool has_clip = false;
+    std::uint32_t clip = 0;
 };
 
 constexpr int kAcc = 32;
@@ -148,15 +151,10 @@ UpperOut upper(Vu0Regs &r, std::uint32_t w) {
     case 0x1D: return lanes(ft, dest, false, [&](int i) { return s.w[i] & fp::kAbs; });
     case 0x1E: return lanes(kAcc, dest, true, [&](int i) { return fp::mul(s.w[i], r.i); });
     case 0x1F: {
-        const std::int32_t lim = fp::key(t.w[3] & fp::kAbs);
-        std::uint32_t flags = 0;
-        for (int i = 0; i < 3; ++i) {
-            const std::int32_t x = fp::key(s.w[i]);
-            if (x > lim) flags |= 1u << (i * 2);
-            if (x < -lim) flags |= 2u << (i * 2);
-        }
-        r.clip = ((r.clip << 6) | flags) & 0xFFFFFFu;
-        return UpperOut{};
+        UpperOut o;
+        o.has_clip = true;
+        o.clip = vuops::clip_value(r, s, t.w[3]);
+        return o;
     }
     case 0x20: return lanes(kAcc, dest, true, [&](int i) { return fp::add(s.w[i], r.q); });
     case 0x21: return lanes(kAcc, dest, true, [&](int i) { return fp::add(acc.w[i], fp::mul(s.w[i], r.q)); });
@@ -306,17 +304,12 @@ float norm(float f) { return fin(fout(f)); }
 
 void fast_upper(Vu0Regs &r, const Decoded &d, UpperOut &o) {
     o.target = -1;
+    o.has_clip = false;
     if (d.kind == kNop) return;
     const Reg128 &s = r.vf[d.fs], &t = r.vf[d.ft];
     if (d.kind == kClip) {
-        const std::int32_t lim = fp::key(t.w[3] & fp::kAbs);
-        std::uint32_t flags = 0;
-        for (int i = 0; i < 3; ++i) {
-            const std::int32_t x = fp::key(s.w[i]);
-            if (x > lim) flags |= 1u << (i * 2);
-            if (x < -lim) flags |= 2u << (i * 2);
-        }
-        r.clip = ((r.clip << 6) | flags) & 0xFFFFFFu;
+        o.has_clip = true;
+        o.clip = vuops::clip_value(r, s, t.w[3]);
         return;
     }
     o.target = d.target;
@@ -435,9 +428,12 @@ void xgkick(Unit &u, std::uint32_t address) {
 
 void lower(Unit &u, std::uint32_t w, std::uint32_t pc, std::uint32_t &npc, bool &branch) {
     Vu0Regs &r = *u.regs;
-    const unsigned dest = (w >> 21) & 15u, it = (w >> 16) & 31u, is = (w >> 11) & 31u, id = (w >> 6) & 31u;
-    const std::uint32_t ft = it, fs = is;
+    const unsigned dest = (w >> 21) & 15u, it = (w >> 16) & 15u, is = (w >> 11) & 15u, id = (w >> 6) & 15u;
+    const std::uint32_t ft = (w >> 16) & 31u, fs = (w >> 11) & 31u;
     const std::int32_t imm11 = static_cast<std::int32_t>(w << 21) >> 21;
+    const auto clip_flags = [&]() { return u.pipe ? u.pipe->clip() : r.clip; };
+    const auto status_flags = [&]() { return u.pipe ? u.pipe->status() : r.status; };
+    const auto mac_flags_now = [&]() { return u.pipe ? u.pipe->mac() : r.mac; };
     const auto branch_to = [&](std::uint32_t target) {
         npc = target & u.code_mask;
         branch = true;
@@ -448,7 +444,7 @@ void lower(Unit &u, std::uint32_t w, std::uint32_t pc, std::uint32_t &npc, bool 
             switch (funct) {
             case 0x30: store_vi(r, id, r.vi[is] + r.vi[it]); break;
             case 0x31: store_vi(r, id, r.vi[is] - r.vi[it]); break;
-            case 0x32: store_vi(r, it, r.vi[is] + static_cast<std::uint32_t>(static_cast<std::int32_t>(id << 27) >> 27)); break;
+            case 0x32: store_vi(r, it, r.vi[is] + static_cast<std::uint32_t>(static_cast<std::int32_t>(((w >> 6) & 31u) << 27) >> 27)); break;
             case 0x34: store_vi(r, id, r.vi[is] & r.vi[it]); break;
             case 0x35: store_vi(r, id, r.vi[is] | r.vi[it]); break;
             default:
@@ -577,18 +573,24 @@ void lower(Unit &u, std::uint32_t w, std::uint32_t pc, std::uint32_t &npc, bool 
     }
     case 0x08: store_vi(r, it, r.vi[is] + (((w >> 10) & 0x7800u) | (w & 0x7FFu))); break;
     case 0x09: store_vi(r, it, r.vi[is] - (((w >> 10) & 0x7800u) | (w & 0x7FFu))); break;
-    case 0x10: store_vi(r, 1, (r.clip & 0xFFFFFFu) == (w & 0xFFFFFFu) ? 1u : 0u); break;
-    case 0x11: r.clip = w & 0xFFFFFFu; break;
-    case 0x12: store_vi(r, 1, (r.clip & w & 0xFFFFFFu) ? 1u : 0u); break;
-    case 0x13: store_vi(r, 1, ((r.clip | w) & 0xFFFFFFu) == 0xFFFFFFu ? 1u : 0u); break;
-    case 0x14: store_vi(r, it, (r.status & 0xFFFu) == ((((w >> 10) & 0x800u) | (w & 0x7FFu))) ? 1u : 0u); break;
-    case 0x15: r.status = (r.status & 0x3Fu) | ((((w >> 10) & 0x800u) | (w & 0x7FFu)) & 0xFC0u); break;
-    case 0x16: store_vi(r, it, r.status & (((w >> 10) & 0x800u) | (w & 0x7FFu))); break;
-    case 0x17: store_vi(r, it, ((r.status | (((w >> 10) & 0x800u) | (w & 0x7FFu))) & 0xFFFu) == 0xFFFu ? 1u : 0u); break;
-    case 0x18: store_vi(r, it, (r.mac & 0xFFFFu) == r.vi[is] ? 1u : 0u); break;
-    case 0x1A: store_vi(r, it, r.mac & r.vi[is]); break;
-    case 0x1B: store_vi(r, it, ((r.mac | r.vi[is]) & 0xFFFFu) == 0xFFFFu ? 1u : 0u); break;
-    case 0x1C: store_vi(r, it, r.clip & 0xFFFu); break;
+    case 0x10: store_vi(r, 1, (clip_flags() & 0xFFFFFFu) == (w & 0xFFFFFFu) ? 1u : 0u); break;
+    case 0x11:
+        r.clip = w & 0xFFFFFFu;
+        if (u.pipe) u.pipe->set_clip(r.clip, u.pipe->t - 4u);
+        break;
+    case 0x12: store_vi(r, 1, (clip_flags() & w & 0xFFFFFFu) ? 1u : 0u); break;
+    case 0x13: store_vi(r, 1, ((clip_flags() | w) & 0xFFFFFFu) == 0xFFFFFFu ? 1u : 0u); break;
+    case 0x14: store_vi(r, it, (status_flags() & 0xFFFu) == ((((w >> 10) & 0x800u) | (w & 0x7FFu))) ? 1u : 0u); break;
+    case 0x15:
+        r.status = (status_flags() & 0x3Fu) | ((((w >> 10) & 0x800u) | (w & 0x7FFu)) & 0xFC0u);
+        if (u.pipe) u.pipe->force_mac(r.mac, r.status);
+        break;
+    case 0x16: store_vi(r, it, status_flags() & (((w >> 10) & 0x800u) | (w & 0x7FFu))); break;
+    case 0x17: store_vi(r, it, ((status_flags() | (((w >> 10) & 0x800u) | (w & 0x7FFu))) & 0xFFFu) == 0xFFFu ? 1u : 0u); break;
+    case 0x18: store_vi(r, it, (mac_flags_now() & 0xFFFFu) == r.vi[is] ? 1u : 0u); break;
+    case 0x1A: store_vi(r, it, mac_flags_now() & r.vi[is]); break;
+    case 0x1B: store_vi(r, it, ((mac_flags_now() | r.vi[is]) & 0xFFFFu) == 0xFFFFu ? 1u : 0u); break;
+    case 0x1C: store_vi(r, it, clip_flags() & 0xFFFu); break;
     case 0x20: branch_to(target); break;
     case 0x21: store_vi(r, it, (pc + 16u) / 8u); branch_to(target); break;
     case 0x24: branch_to(static_cast<std::uint32_t>(r.vi[is]) * 8u); break;
@@ -703,6 +705,9 @@ void run_fast(int n, std::uint32_t address) {
     if (g_scan[n]) scan_flags(n, u.code, u.code_mask + 1);
     const bool flags = g_flags_used[n];
     Decoded *cache = g_decoded[n];
+    vuops::FlagPipe pipe;
+    pipe.start(r);
+    u.pipe = &pipe;
     std::uint32_t pc = address & u.code_mask, npc = (pc + 8u) & u.code_mask;
     bool ending = false;
     UpperOut out;
@@ -721,6 +726,7 @@ void run_fast(int n, std::uint32_t address) {
         const std::uint32_t current = pc;
         pc = npc;
         npc = (npc + 8u) & u.code_mask;
+        ++pipe.t;
         fast_upper(r, d, out);
         if (hi & 0x80000000u) {
             r.i = lo;
@@ -734,7 +740,14 @@ void run_fast(int n, std::uint32_t address) {
             Reg128 &dst = out.target == kAcc ? r.acc : r.vf[out.target];
             for (int i = 0; i < 4; ++i)
                 if (out.dest & (8u >> i)) dst.w[i] = out.value.w[i];
-            if (out.flags && flags) set_flags(r, out.value, out.dest);
+            if (out.flags && flags) {
+                set_flags(r, out.value, out.dest);
+                pipe.set_mac(r.mac, r.status);
+            }
+        }
+        if (out.has_clip) {
+            r.clip = out.clip;
+            pipe.set_clip(out.clip, pipe.t);
         }
         r.vf[0].d[0] = 0;
         r.vf[0].w[2] = 0;
@@ -757,6 +770,9 @@ void run(int n, std::uint32_t address) {
     }
     Unit u = unit_of(n);
     Vu0Regs &r = *u.regs;
+    vuops::FlagPipe pipe;
+    pipe.start(r);
+    u.pipe = &pipe;
     std::uint32_t pc = address & u.code_mask, npc = (pc + 8u) & u.code_mask;
     bool ending = false;
     for (std::uint32_t steps = 0; steps < 1'000'000; ++steps) {
@@ -766,6 +782,7 @@ void run(int n, std::uint32_t address) {
         const std::uint32_t current = pc;
         pc = npc;
         npc = (npc + 8u) & u.code_mask;
+        ++pipe.t;
         UpperOut out = upper(r, hi);
         bool branch = false;
         if (hi & 0x80000000u) {
@@ -776,6 +793,11 @@ void run(int n, std::uint32_t address) {
             if (branch) npc = target;
         }
         commit(r, out);
+        if (out.target > 0 && out.flags) pipe.set_mac(r.mac, r.status);
+        if (out.has_clip) {
+            r.clip = out.clip;
+            pipe.set_clip(out.clip, pipe.t);
+        }
         r.vf[0].d[0] = 0;
         r.vf[0].w[2] = 0;
         r.vf[0].w[3] = fp::kOne;

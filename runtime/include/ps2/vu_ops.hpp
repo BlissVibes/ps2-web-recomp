@@ -142,6 +142,17 @@ PS2_VU_INLINE void flags(Vu0Regs &r, const Reg128 &v, unsigned dest) {
     r.status = (status & ~0x30u) | (r.status & 0x30u);
 }
 
+PS2_VU_INLINE std::uint32_t clip_value(const Vu0Regs &r, const Reg128 &s, std::uint32_t w) {
+    const std::int32_t lim = fp::key(w & fp::kAbs);
+    std::uint32_t f = 0;
+    for (int i = 0; i < 3; ++i) {
+        const std::int32_t x = fp::key(s.w[i]);
+        if (x > lim) f |= 1u << (i * 2);
+        if (x < -lim) f |= 2u << (i * 2);
+    }
+    return ((r.clip << 6) | f) & 0xFFFFFFu;
+}
+
 PS2_VU_INLINE void clip(Vu0Regs &r, const Reg128 &s, std::uint32_t w) {
     const std::int32_t lim = fp::key(w & fp::kAbs);
     std::uint32_t f = 0;
@@ -152,6 +163,53 @@ PS2_VU_INLINE void clip(Vu0Regs &r, const Reg128 &s, std::uint32_t w) {
     }
     r.clip = ((r.clip << 6) | f) & 0xFFFFFFu;
 }
+
+// MAC, status and clip flags reach the lower pipeline four instructions after the upper op that set them.
+struct FlagPipe {
+    std::uint32_t t = 16;
+    std::uint32_t mac_ts[8] = {}, mac_v[8] = {}, status_v[8] = {}, clip_ts[8] = {}, clip_v[8] = {};
+    unsigned mh = 0, ch = 0;
+
+    void start(const Vu0Regs &r) {
+        for (int i = 0; i < 8; ++i) {
+            mac_ts[i] = clip_ts[i] = 0;
+            mac_v[i] = r.mac;
+            status_v[i] = r.status;
+            clip_v[i] = r.clip;
+        }
+    }
+    PS2_VU_INLINE void set_mac(std::uint32_t mac, std::uint32_t status) {
+        const unsigned i = mh++ & 7u;
+        mac_ts[i] = t;
+        mac_v[i] = mac;
+        status_v[i] = status;
+    }
+    PS2_VU_INLINE void set_clip(std::uint32_t clip, std::uint32_t at) {
+        const unsigned i = ch++ & 7u;
+        clip_ts[i] = at;
+        clip_v[i] = clip;
+    }
+    PS2_VU_INLINE void force_mac(std::uint32_t mac, std::uint32_t status) {
+        set_mac(mac, status);
+        mac_ts[(mh - 1) & 7u] = t - 4u;
+    }
+    PS2_VU_INLINE unsigned mac_slot() const {
+        for (unsigned k = 1; k <= 8; ++k) {
+            const unsigned i = (mh - k) & 7u;
+            if (mac_ts[i] + 4u <= t) return i;
+        }
+        return (mh - 8) & 7u;
+    }
+    PS2_VU_INLINE std::uint32_t mac() const { return mac_v[mac_slot()]; }
+    PS2_VU_INLINE std::uint32_t status() const { return status_v[mac_slot()]; }
+    PS2_VU_INLINE std::uint32_t clip() const {
+        for (unsigned k = 1; k <= 8; ++k) {
+            const unsigned i = (ch - k) & 7u;
+            if (clip_ts[i] + 4u <= t) return clip_v[i];
+        }
+        return clip_v[(ch - 8) & 7u];
+    }
+};
 
 PS2_VU_INLINE std::uint8_t *qword(std::uint8_t *mem, std::uint32_t index) { return mem + (index & 1023u) * 16u; }
 PS2_VU_INLINE void set_vi(Vu0Regs &r, unsigned i, std::uint32_t v) {

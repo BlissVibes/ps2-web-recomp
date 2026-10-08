@@ -122,7 +122,8 @@ Upper upper(std::uint32_t hi, bool flags_live) {
     }
     if (kind == Nop) return u;
     if (kind == Clip) {
-        u.pre = std::format("clip(r, r.vf[{}], r.vf[{}].w[3]); ", fs, ft);
+        u.pre = std::format("const std::uint32_t uclip = clip_value(r, r.vf[{}], r.vf[{}].w[3]); ", fs, ft);
+        u.post = "r.clip = uclip; fl.set_clip(uclip, fl.t); ";
         return u;
     }
     unsigned d = dest;
@@ -168,7 +169,7 @@ Upper upper(std::uint32_t hi, bool flags_live) {
     for (int i = 0; i < 4; ++i)
         if (lane(d, i)) u.post += std::format("{}.w[{}] = u{}; ", dst, i, kLane[i]);
     u.sets_flags = flags;
-    if (flags && flags_live) u.post += std::format("flags(r, {}, {}u); ", dst, d);
+    if (flags && flags_live) u.post += std::format("flags(r, {}, {}u); fl.set_mac(r.mac, r.status); ", dst, d);
     return u;
 }
 
@@ -315,18 +316,18 @@ Lower lower(std::uint32_t w, std::uint32_t pc) {
         break;
     case 0x08: c = std::format("set_vi(r, {}, r.vi[{}] + {}u); ", it, is, imm15); break;
     case 0x09: c = std::format("set_vi(r, {}, r.vi[{}] - {}u); ", it, is, imm15); break;
-    case 0x10: c = std::format("set_vi(r, 1, (r.clip & 0xFFFFFFu) == {}u ? 1u : 0u); ", w & 0xFFFFFFu); break;
-    case 0x11: c = std::format("r.clip = {}u; ", w & 0xFFFFFFu); break;
-    case 0x12: c = std::format("set_vi(r, 1, (r.clip & {}u) ? 1u : 0u); ", w & 0xFFFFFFu); break;
-    case 0x13: c = std::format("set_vi(r, 1, ((r.clip | {}u) & 0xFFFFFFu) == 0xFFFFFFu ? 1u : 0u); ", w & 0xFFFFFFu); break;
-    case 0x14: c = std::format("set_vi(r, {}, (r.status & 0xFFFu) == {}u ? 1u : 0u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
-    case 0x15: c = std::format("r.status = (r.status & 0x3Fu) | ({}u & 0xFC0u); ", imm12); l.reads_flags = l.reads_status = true; break;
-    case 0x16: c = std::format("set_vi(r, {}, r.status & {}u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
-    case 0x17: c = std::format("set_vi(r, {}, ((r.status | {}u) & 0xFFFu) == 0xFFFu ? 1u : 0u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
-    case 0x18: c = std::format("set_vi(r, {}, (r.mac & 0xFFFFu) == r.vi[{}] ? 1u : 0u); ", it, is); l.reads_flags = true; break;
-    case 0x1A: c = std::format("set_vi(r, {}, r.mac & r.vi[{}]); ", it, is); l.reads_flags = true; break;
-    case 0x1B: c = std::format("set_vi(r, {}, ((r.mac | r.vi[{}]) & 0xFFFFu) == 0xFFFFu ? 1u : 0u); ", it, is); l.reads_flags = true; break;
-    case 0x1C: c = std::format("set_vi(r, {}, r.clip & 0xFFFu); ", it); break;
+    case 0x10: c = std::format("set_vi(r, 1, (fl.clip() & 0xFFFFFFu) == {}u ? 1u : 0u); ", w & 0xFFFFFFu); break;
+    case 0x11: c = std::format("r.clip = {}u; fl.set_clip(r.clip, fl.t - 4u); ", w & 0xFFFFFFu); break;
+    case 0x12: c = std::format("set_vi(r, 1, (fl.clip() & {}u) ? 1u : 0u); ", w & 0xFFFFFFu); break;
+    case 0x13: c = std::format("set_vi(r, 1, ((fl.clip() | {}u) & 0xFFFFFFu) == 0xFFFFFFu ? 1u : 0u); ", w & 0xFFFFFFu); break;
+    case 0x14: c = std::format("set_vi(r, {}, (fl.status() & 0xFFFu) == {}u ? 1u : 0u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
+    case 0x15: c = std::format("r.status = (fl.status() & 0x3Fu) | ({}u & 0xFC0u); fl.force_mac(r.mac, r.status); ", imm12); l.reads_flags = l.reads_status = true; break;
+    case 0x16: c = std::format("set_vi(r, {}, fl.status() & {}u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
+    case 0x17: c = std::format("set_vi(r, {}, ((fl.status() | {}u) & 0xFFFu) == 0xFFFu ? 1u : 0u); ", it, imm12); l.reads_flags = l.reads_status = true; break;
+    case 0x18: c = std::format("set_vi(r, {}, (fl.mac() & 0xFFFFu) == r.vi[{}] ? 1u : 0u); ", it, is); l.reads_flags = true; break;
+    case 0x1A: c = std::format("set_vi(r, {}, fl.mac() & r.vi[{}]); ", it, is); l.reads_flags = true; break;
+    case 0x1B: c = std::format("set_vi(r, {}, ((fl.mac() | r.vi[{}]) & 0xFFFFu) == 0xFFFFu ? 1u : 0u); ", it, is); l.reads_flags = true; break;
+    case 0x1C: c = std::format("set_vi(r, {}, fl.clip() & 0xFFFu); ", it); break;
     case 0x20: c = "pend = true; "; l.branch = true; l.target = target; break;
     case 0x21: c = std::format("set_vi(r, {}, {}u); pend = true; ", it, (pc + 16u) / 8u); l.branch = true; l.target = target; break;
     case 0x24: c = std::format("jpc = (static_cast<std::uint32_t>(r.vi[{}]) * 8u) & {}u; pendj = true; ", is, kMask); l.jump = true; break;
@@ -377,7 +378,13 @@ std::string generate(const Program &p, std::string &name) {
             bool out = false;
             for (std::int64_t s : successors(pc)) out = out || s < 0 || !in.count(static_cast<std::uint32_t>(s)) || live_in[static_cast<std::uint32_t>(s)];
             const std::uint32_t hi = word(p.code, pc + 4);
-            const bool v = lowers[pc].reads_flags || (!upper_sets_flags(hi) && out);
+            bool reader_near = false;
+            for (std::uint32_t k = 1; k <= 3; ++k) {
+                const std::uint32_t q = (pc + 8u * k) & kMask;
+                if (in.count(q) && (lowers[q].reads_flags || lowers[q].branch || lowers[q].jump)) reader_near = true;
+            }
+            const bool kills = upper_sets_flags(hi) && !reader_near;
+            const bool v = lowers[pc].reads_flags || (!kills && out);
             if (v != live_in[pc]) {
                 live_in[pc] = v;
                 changed = true;
@@ -385,7 +392,7 @@ std::string generate(const Program &p, std::string &name) {
         }
     }
     name = std::format("vu1_{:016X}", p.key);
-    std::string o = std::format("void {}(Vu0Regs &r, std::uint8_t *mem) {{\n    bool pend = false, pendj = false, ending = false;\n    std::uint32_t jpc = 0;\n    (void)pend;\n    (void)pendj;\n    (void)ending;\n    (void)jpc;\n    goto {};\n",
+    std::string o = std::format("void {}(Vu0Regs &r, std::uint8_t *mem) {{\n    FlagPipe fl;\n    fl.start(r);\n    bool pend = false, pendj = false, ending = false;\n    std::uint32_t jpc = 0;\n    (void)pend;\n    (void)pendj;\n    (void)ending;\n    (void)jpc;\n    goto {};\n",
                                 name, label(p.entry & kMask));
     for (std::uint32_t pc : pcs) {
         const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
@@ -393,7 +400,7 @@ std::string generate(const Program &p, std::string &name) {
         for (std::int64_t s : successors(pc)) out_live = out_live || s < 0 || !in.count(static_cast<std::uint32_t>(s)) || live_in[static_cast<std::uint32_t>(s)];
         const Upper u = upper(hi, any_status ? true : (any_flags && out_live));
         const Lower &l = lowers[pc];
-        o += std::format("{}: {{ ", label(pc));
+        o += std::format("{}: {{ ++fl.t; ", label(pc));
         o += u.pre;
         if (hi & 0x80000000u) o += std::format("r.i = {}u; ", lo);
         else if (!l.supported) o += std::format("vu::interpret(1, {}u); return; ", pc);
