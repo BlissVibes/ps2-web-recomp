@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <set>
 #include <sstream>
@@ -55,6 +56,15 @@ private:
 };
 
 std::string unit_name(std::uint32_t u) { return std::format("unit_{:04X}", u); }
+
+void write_if_changed(const fs::path &path, const std::string &text) {
+    std::ifstream in(path, std::ios::binary);
+    if (in) {
+        std::string old((std::istreambuf_iterator<char>(in)), {});
+        if (old == text) return;
+    }
+    std::ofstream(path, std::ios::binary) << text;
+}
 std::string table_name(std::uint32_t u) { return std::format("entries_{:04X}", u); }
 
 class Generator {
@@ -119,7 +129,7 @@ private:
     bool in_unit(std::uint32_t a) const { return a >= base_ && a < base_ + layout_.size(); }
 
     void write_header() {
-        std::ofstream out(fs::path(options_.output) / "units.hpp");
+        std::ostringstream out;
         out << "#pragma once\n\n#include \"ps2/generated.hpp\"\n\nnamespace gen {\n";
         for (std::uint32_t u = 0; u < layout_.count(); ++u) {
             if (!has_code_[u]) continue;
@@ -127,10 +137,11 @@ private:
             out << "extern const std::uint16_t " << table_name(u) << "[];\n";
         }
         out << "}\n";
+        write_if_changed(fs::path(options_.output) / "units.hpp", out.str());
     }
 
     void write_table() {
-        std::ofstream out(fs::path(options_.output) / "table.cpp");
+        std::ostringstream out;
         out << "#include \"units.hpp\"\n\nnamespace gen {\n\nconst ps2::UnitInfo kUnits[] = {\n";
         std::size_t n = 0;
         for (std::uint32_t u = 0; u < layout_.count(); ++u) {
@@ -139,6 +150,7 @@ private:
             ++n;
         }
         out << "};\n\n}\n\nvoid register_generated_code() { ps2::register_units(gen::kUnits, " << n << "u); }\n";
+        write_if_changed(fs::path(options_.output) / "table.cpp", out.str());
     }
 
     void write_unit(std::uint32_t u) {
@@ -187,6 +199,7 @@ private:
                 flush();
                 out_ << label(a) << ":\n";
             }
+            if (options_.probes.count(a)) line(std::format("probe(c, {});", hex(a)));
             const Insn i = at(a);
             const Flow fl = flow(i.op);
             if (fl == Flow::None) {
@@ -215,8 +228,7 @@ private:
         }
         if (falls) exit_to(end);
         out_ << "}\n\n}\n";
-        std::ofstream file(fs::path(options_.output) / std::format("{}.cpp", unit_name(u)));
-        file << out_.str();
+        write_if_changed(fs::path(options_.output) / std::format("{}.cpp", unit_name(u)), out_.str());
     }
 
     void line(const std::string &text) {

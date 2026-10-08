@@ -25,7 +25,7 @@ std::vector<std::uint32_t> read_entries(const std::string &path) {
 }
 
 int usage() {
-    std::fprintf(stderr, "usage: eerecomp <elf> [--entries file] [--out dir] [--stats]\n");
+    std::fprintf(stderr, "usage: eerecomp <elf> [--entries file] [--probes file] [--out dir] [--stats]\n");
     return 2;
 }
 
@@ -33,13 +33,14 @@ int usage() {
 
 int main(int argc, char **argv) {
     if (argc < 2) return usage();
-    std::string elf_path = argv[1], entries_path, out;
+    std::string elf_path = argv[1], entries_path, out, probes_path;
     bool stats = false;
     for (int i = 2; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--entries" && i + 1 < argc) entries_path = argv[++i];
         else if (arg == "--stats") stats = true;
         else if (arg == "--out" && i + 1 < argc) out = argv[++i];
+        else if (arg == "--probes" && i + 1 < argc) probes_path = argv[++i];
         else return usage();
     }
 
@@ -57,7 +58,13 @@ int main(int argc, char **argv) {
                     code, code * 4 / 1024, program.functions.size(), program.entries.size(), program.rejected.size());
         if (stats)
             for (const auto &[op, count] : histogram) std::printf("%10zu %s\n", count, name(op));
-        if (!out.empty()) generate(image, program, CodegenOptions{out});
+        if (!out.empty()) {
+            CodegenOptions options;
+            options.output = out;
+            if (!probes_path.empty())
+                for (std::uint32_t a : read_entries(probes_path)) options.probes.insert(a);
+            generate(image, program, options);
+        }
     } catch (const std::exception &error) {
         std::fprintf(stderr, "eerecomp: %s\n", error.what());
         return 1;
