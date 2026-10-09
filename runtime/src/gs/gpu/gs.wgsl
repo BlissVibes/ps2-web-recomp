@@ -10,8 +10,6 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> scratch: array<u32>;
 
 override SCALE: u32 = 1u;
-override TILE: u32 = 16u / SCALE;
-override WG: u32 = TILE * SCALE;
 
 const PSMCT32: u32 = 0x00u;
 const PSMCT24: u32 = 0x01u;
@@ -120,6 +118,104 @@ fn locate(psm: u32, bp: u32, bw: u32, x: u32, y: u32) -> Loc {
         }
     }
     return Loc((a & 0x3FFFFFu) >> 2u, shift, mask);
+}
+
+struct Fmt {
+    base: u32,
+    per_row: u32,
+    table: u32,
+    bits: u32,
+    mask: u32,
+}
+
+fn fmt_of(psm: u32, bp: u32, bw: u32) -> Fmt {
+    var pws = 6u;
+    var phs = 5u;
+    var table = T_OFF32;
+    var amask = 0u;
+    var nbit = 0u;
+    var fixed = 0u;
+    var mask = 0xFFFFFFFFu;
+    switch psm {
+        case 0x30u {
+            table = T_OFFZ32;
+        }
+        case 0x31u {
+            table = T_OFFZ32;
+            mask = 0xFFFFFFu;
+        }
+        case 0x01u {
+            mask = 0xFFFFFFu;
+        }
+        case 0x02u {
+            phs = 6u;
+            table = T_OFF16;
+            amask = 2u;
+            mask = 0xFFFFu;
+        }
+        case 0x0Au {
+            phs = 6u;
+            table = T_OFF16S;
+            amask = 2u;
+            mask = 0xFFFFu;
+        }
+        case 0x32u {
+            phs = 6u;
+            table = T_OFFZ16;
+            amask = 2u;
+            mask = 0xFFFFu;
+        }
+        case 0x3Au {
+            phs = 6u;
+            table = T_OFFZ16S;
+            amask = 2u;
+            mask = 0xFFFFu;
+        }
+        case 0x13u {
+            pws = 7u;
+            phs = 6u;
+            table = T_OFF8;
+            amask = 3u;
+            mask = 0xFFu;
+        }
+        case 0x14u {
+            pws = 7u;
+            phs = 7u;
+            table = T_OFF4;
+            amask = 3u;
+            nbit = 1u;
+            mask = 0xFu;
+        }
+        case 0x1Bu {
+            fixed = 24u;
+            mask = 0xFFu;
+        }
+        case 0x24u {
+            fixed = 24u;
+            mask = 0xFu;
+        }
+        case 0x2Cu {
+            fixed = 28u;
+            mask = 0xFu;
+        }
+        default {
+        }
+    }
+    return Fmt(bp * 256u, max(1u, (bw * 64u) >> pws), table, pws | (phs << 4u) | (amask << 8u) | (nbit << 10u) | (fixed << 11u), mask);
+}
+
+fn addr(f: Fmt, x: u32, y: u32) -> Loc {
+    let pws = f.bits & 15u;
+    let phs = (f.bits >> 4u) & 15u;
+    let amask = (f.bits >> 8u) & 3u;
+    let nbit = (f.bits >> 10u) & 1u;
+    let n = tables[f.table + ((y & ((1u << phs) - 1u)) << pws) + (x & ((1u << pws) - 1u))];
+    let a = f.base + ((x >> pws) + (y >> phs) * f.per_row) * 8192u + (n >> nbit);
+    return Loc((a & 0x3FFFFFu) >> 2u, (f.bits >> 11u) + (a & amask) * 8u + (n & nbit) * 4u, f.mask);
+}
+
+fn load_at(l: Loc, k: u32) -> u32 {
+    return (atomicLoad(&vram[l.word * SCALE * SCALE + k]) >> l.shift) & l.mask;
 }
 
 fn read_sample(psm: u32, bp: u32, bw: u32, x: u32, y: u32, k: u32) -> u32 {
@@ -320,6 +416,9 @@ struct Setup {
     fogcol: u32,
     clut: u32,
     zmax: u32,
+    tf: Fmt,
+    ff: Fmt,
+    zf: Fmt,
 }
 
 const F_IIP: u32 = 1u;
@@ -371,6 +470,9 @@ fn load_setup(at: u32) -> Setup {
     s.fogcol = data[at + 21u];
     s.clut = data[at + 22u];
     s.zmax = data[at + 23u];
+    s.tf = fmt_of(s.tpsm, s.tbp, s.tbw);
+    s.ff = fmt_of(s.fpsm, s.fbp, s.fbw);
+    s.zf = fmt_of(s.zpsm, s.zbp, s.fbw);
     return s;
 }
 
@@ -425,7 +527,7 @@ fn texel_y(s: Setup, yi: i32) -> u32 {
 }
 
 fn fetch(s: Setup, xi: i32, yi: i32, k: u32) -> u32 {
-    return convert(s, read_sample(s.tpsm, s.tbp, s.tbw, texel_x(s, xi), texel_y(s, yi), k));
+    return convert(s, load_at(addr(s.tf, texel_x(s, xi), texel_y(s, yi)), k));
 }
 
 fn convert(s: Setup, raw: u32) -> u32 {
@@ -488,8 +590,8 @@ fn blend4(c00: u32, c10: u32, c01: u32, c11: u32, fx: f32, fy: f32) -> u32 {
     return out;
 }
 
-fn read_frame(s: Setup, x: u32, y: u32, k: u32) -> u32 {
-    let raw = read_sample(s.fpsm, s.fbp, s.fbw, x, y, k);
+fn read_frame(s: Setup, l: Loc, k: u32) -> u32 {
+    let raw = load_at(l, k);
     switch s.fpsm {
         case 0x01u {
             return raw | 0x80000000u;
@@ -515,28 +617,29 @@ fn pack16(v: u32) -> u32 {
     return ((v >> 3u) & 0x1Fu) | (((v >> 11u) & 0x1Fu) << 5u) | (((v >> 19u) & 0x1Fu) << 10u) | a;
 }
 
-fn write_frame(s: Setup, x: u32, y: u32, k: u32, c: u32, mask: u32) {
+fn write_frame(s: Setup, l: Loc, k: u32, c: u32, mask: u32) {
     switch s.fpsm {
         case 0x02u, 0x0Au {
-            let old = read_sample(s.fpsm, s.fbp, s.fbw, x, y, k);
+            let old = load_at(l, k);
             var m16 = pack16(mask);
             if ((mask & 0x80000000u) != 0u) {
                 m16 = m16 | 0x8000u;
             }
-            write_sample(s.fpsm, s.fbp, s.fbw, x, y, k, (pack16(c) & ~m16) | (old & m16));
+            store(l, k, (pack16(c) & ~m16) | (old & m16));
         }
         case 0x01u {
-            let old = read_sample(PSMCT32, s.fbp, s.fbw, x, y, k);
+            let l32 = Loc(l.word, 0u, 0xFFFFFFFFu);
+            let old = load_at(l32, k);
             let m = mask | 0xFF000000u;
-            write_sample(PSMCT32, s.fbp, s.fbw, x, y, k, (c & ~m) | (old & m));
+            store(l32, k, (c & ~m) | (old & m));
         }
         default {
             var v = c;
             if (mask != 0u) {
-                let old = read_sample(s.fpsm, s.fbp, s.fbw, x, y, k);
+                let old = load_at(l, k);
                 v = (c & ~mask) | (old & mask);
             }
-            write_sample(s.fpsm, s.fbp, s.fbw, x, y, k, v);
+            store(l, k, v);
         }
     }
 }
@@ -567,6 +670,8 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
     let ux = u32(x);
     let uy = u32(y);
     let z = min(at.z, s.zmax);
+    let fl = addr(s.ff, ux, uy);
+    var zl = Loc(0u, 0u, 0u);
 
     var r = i32(at.r);
     var g = i32(at.g);
@@ -691,7 +796,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
     var dst = 0u;
     var have_dst = false;
     if (has(s, F_DATE)) {
-        dst = read_frame(s, ux, uy, k);
+        dst = read_frame(s, fl, k);
         have_dst = true;
         if (((dst & 0x80000000u) != 0u) != has(s, F_DATM)) {
             return;
@@ -700,7 +805,8 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
 
     let zte = has(s, F_ZTE);
     if (zte) {
-        let old = read_sample(s.zpsm, s.zbp, s.fbw, ux, uy, k) & s.zmax;
+        zl = addr(s.zf, ux, uy);
+        let old = load_at(zl, k) & s.zmax;
         var ok = false;
         switch mode(s, 8u, 2u) {
             case 0u {
@@ -725,7 +831,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
         let colclamp = has(s, F_COLCLAMP);
         if (has(s, F_ABE) && (!has(s, F_PABE) || (a & 0x80) != 0)) {
             if (!have_dst) {
-                dst = read_frame(s, ux, uy, k);
+                dst = read_frame(s, fl, k);
             }
             let cd = vec3<i32>(i32(dst & 0xFFu), i32((dst >> 8u) & 0xFFu), i32((dst >> 16u) & 0xFFu));
             let cs = vec3<i32>(r, g, b);
@@ -780,10 +886,10 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
         if (!write_alpha) {
             mask = mask | 0xFF000000u;
         }
-        write_frame(s, ux, uy, k, u32(r) | (u32(g) << 8u) | (u32(b) << 16u) | (out_a << 24u), mask);
+        write_frame(s, fl, k, u32(r) | (u32(g) << 8u) | (u32(b) << 16u) | (out_a << 24u), mask);
     }
     if (write_z && zte) {
-        write_sample(s.zpsm, s.zbp, s.fbw, ux, uy, k, z);
+        store(zl, k, z);
     }
 }
 
@@ -914,18 +1020,20 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     scratch[i] = atomicLoad(&vram[i * SCALE * SCALE]);
 }
 
-@compute @workgroup_size(WG, WG)
+@compute @workgroup_size(16, 16)
 fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let tile = prm(0u) + (wid.x + wid.y * 1024u) * 4u;
     if (wid.x + wid.y * 1024u >= prm(3u)) {
         return;
     }
     let origin = data[tile];
-    let x = i32((origin & 0xFFFFu) * TILE + lid.x / SCALE);
-    let y = i32((origin >> 16u) * TILE + lid.y / SCALE);
-    let k = (lid.y % SCALE) * SCALE + lid.x % SCALE;
-    let px = f32(x) + f32(lid.x % SCALE) / f32(SCALE);
-    let py = f32(y) + f32(lid.y % SCALE) / f32(SCALE);
+    let sx = (origin & 0xFFFFu) * 16u + lid.x;
+    let sy = (origin >> 16u) * 16u + lid.y;
+    let x = i32(sx / SCALE);
+    let y = i32(sy / SCALE);
+    let k = (sy % SCALE) * SCALE + sx % SCALE;
+    let px = f32(x) + f32(sx % SCALE) / f32(SCALE);
+    let py = f32(y) + f32(sy % SCALE) / f32(SCALE);
     let list = data[tile + 1u];
     let count = data[tile + 2u];
     let prims = prm(1u);
@@ -934,15 +1042,15 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
     var s: Setup;
     for (var i = 0u; i < count; i = i + 1u) {
         let p = prims + data[list + i] * PRIM_WORDS;
-        let lo = data[p + 2u];
-        let hi = data[p + 3u];
-        if (x < i32(lo & 0xFFFFu) || y < i32(lo >> 16u) || x > i32(hi & 0xFFFFu) || y > i32(hi >> 16u)) {
-            continue;
-        }
         let si = data[p];
         if (si != last_setup) {
             s = load_setup(setups + si * SETUP_WORDS);
             last_setup = si;
+        }
+        let lo = data[p + 2u];
+        let hi = data[p + 3u];
+        if (x < i32(lo & 0xFFFFu) || y < i32(lo >> 16u) || x > i32(hi & 0xFFFFu) || y > i32(hi >> 16u)) {
+            continue;
         }
         shade_at(p, s, x, y, k, px, py);
     }

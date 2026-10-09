@@ -144,7 +144,7 @@ bool uploads_overlap(const PreOp &a, const PreOp &b) {
 std::vector<PreOp> g_pre;
 std::vector<Range> g_batch_reads;
 
-int g_tile = 16, g_tiles_per_row = 128;
+int g_tiles_per_row = 128;
 std::vector<std::uint32_t> g_tile_count(128 * 128), g_tile_fill(128 * 128);
 std::vector<std::uint32_t> g_touched;
 
@@ -219,6 +219,65 @@ std::uint32_t arena_append(const void *bytes, std::size_t size) {
     return offset;
 }
 
+float u2f(std::uint32_t u) {
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+struct Span {
+    std::int16_t ty, tx0, tx1;
+};
+std::vector<Span> g_spans;
+std::vector<std::uint32_t> g_span_start;
+
+void add_spans(const std::uint32_t *rec, std::uint32_t lo, std::uint32_t hi) {
+    const int sc = static_cast<int>(g_scale);
+    const int tx0 = static_cast<int>(lo & 0xFFFFu) * sc / 16, ty0 = static_cast<int>(lo >> 16) * sc / 16;
+    const int tx1 = (static_cast<int>(hi & 0xFFFFu) * sc + sc - 1) / 16, ty1 = (static_cast<int>(hi >> 16) * sc + sc - 1) / 16;
+    const auto whole = [&] {
+        for (int ty = ty0; ty <= ty1; ++ty) g_spans.push_back({static_cast<std::int16_t>(ty), static_cast<std::int16_t>(tx0), static_cast<std::int16_t>(tx1)});
+    };
+    if (rec[1] != 0 || tx1 - tx0 < 2) {
+        whole();
+        return;
+    }
+    const double x[3] = {u2f(rec[4]), u2f(rec[6]), u2f(rec[8])}, y[3] = {u2f(rec[5]), u2f(rec[7]), u2f(rec[9])};
+    const double inv = u2f(rec[10]);
+    static const int kEdges[3][2] = {{1, 2}, {2, 0}, {0, 1}};
+    double m[3], q[3];
+    int kind[3];
+    for (int e = 0; e < 3; ++e) {
+        const int a = kEdges[e][0], b = kEdges[e][1];
+        const double ca = (y[a] - y[b]) * inv, cb = (x[b] - x[a]) * inv, cc = (x[a] * y[b] - x[b] * y[a]) * inv;
+        if (!std::isfinite(ca) || !std::isfinite(cb) || !std::isfinite(cc)) {
+            whole();
+            return;
+        }
+        kind[e] = ca > 0.0 ? 1 : ca < 0.0 ? -1 : 0;
+        m[e] = kind[e] ? -cb / ca : cb;
+        q[e] = kind[e] ? -cc / ca : cc;
+    }
+    const double span = 16.0 / static_cast<double>(sc);
+    for (int ty = ty0; ty <= ty1; ++ty) {
+        const double y0 = ty * span - 1.0, y1 = (ty + 1) * span + 1.0;
+        double left = -1e30, right = 1e30;
+        bool empty = false;
+        for (int e = 0; e < 3; ++e) {
+            const double a0 = m[e] * y0, a1 = m[e] * y1;
+            if (kind[e] == 0) empty = empty || std::max(a0, a1) + q[e] < 0.0;
+            else if (kind[e] > 0) left = std::max(left, std::min(a0, a1) + q[e]);
+            else right = std::min(right, std::max(a0, a1) + q[e]);
+        }
+        left -= 1.0;
+        right += 1.0;
+        if (empty || left > right) continue;
+        const int rx0 = std::max(tx0, static_cast<int>(std::floor(std::max(left, -1.0) / span)));
+        const int rx1 = std::min(tx1, static_cast<int>(std::floor(std::min(right, 4096.0) / span)));
+        if (rx0 <= rx1) g_spans.push_back({static_cast<std::int16_t>(ty), static_cast<std::int16_t>(rx0), static_cast<std::int16_t>(rx1)});
+    }
+}
+
 void flush_batch() {
     Batch &b = g_batch;
     if (b.prims.empty()) {
@@ -227,16 +286,19 @@ void flush_batch() {
     }
     const std::uint32_t prims = static_cast<std::uint32_t>(b.prims.size() / kPrimWords);
     g_touched.clear();
+    g_spans.clear();
+    g_span_start.resize(prims + 1);
     for (std::uint32_t i = 0; i < prims; ++i) {
-        const std::uint32_t lo = b.boxes[i * 2], hi = b.boxes[i * 2 + 1];
-        const int tx0 = static_cast<int>(lo & 0xFFFFu) / g_tile, ty0 = static_cast<int>(lo >> 16) / g_tile;
-        const int tx1 = static_cast<int>(hi & 0xFFFFu) / g_tile, ty1 = static_cast<int>(hi >> 16) / g_tile;
-        for (int ty = ty0; ty <= ty1; ++ty)
-            for (int tx = tx0; tx <= tx1; ++tx) {
-                const std::uint32_t t = static_cast<std::uint32_t>(ty * g_tiles_per_row + tx);
+        g_span_start[i] = static_cast<std::uint32_t>(g_spans.size());
+        add_spans(b.prims.data() + i * kPrimWords, b.boxes[i * 2], b.boxes[i * 2 + 1]);
+        for (std::size_t k = g_span_start[i]; k < g_spans.size(); ++k) {
+            const Span &sp = g_spans[k];
+            std::uint32_t t = static_cast<std::uint32_t>(sp.ty * g_tiles_per_row + sp.tx0);
+            for (int tx = sp.tx0; tx <= sp.tx1; ++tx, ++t)
                 if (!g_tile_count[t]++) g_touched.push_back(t);
-            }
+        }
     }
+    g_span_start[prims] = static_cast<std::uint32_t>(g_spans.size());
     const std::uint32_t prim_offset = arena_append(b.prims.data(), b.prims.size() * 4);
     const std::uint32_t setup_offset = arena_append(b.setups.data(), b.setups.size() * 4);
     std::uint32_t total = 0;
@@ -256,13 +318,13 @@ void flush_batch() {
         g_tile_fill[t] = cursor;
         cursor += g_tile_count[t];
     }
-    for (std::uint32_t i = 0; i < prims; ++i) {
-        const std::uint32_t lo = b.boxes[i * 2], hi = b.boxes[i * 2 + 1];
-        const int tx0 = static_cast<int>(lo & 0xFFFFu) / g_tile, ty0 = static_cast<int>(lo >> 16) / g_tile;
-        const int tx1 = static_cast<int>(hi & 0xFFFFu) / g_tile, ty1 = static_cast<int>(hi >> 16) / g_tile;
-        for (int ty = ty0; ty <= ty1; ++ty)
-            for (int tx = tx0; tx <= tx1; ++tx) g_arena[g_tile_fill[static_cast<std::uint32_t>(ty * g_tiles_per_row + tx)]++] = i;
-    }
+    std::uint32_t *arena = g_arena.data();
+    for (std::uint32_t i = 0; i < prims; ++i)
+        for (std::uint32_t k = g_span_start[i]; k < g_span_start[i + 1]; ++k) {
+            const Span &sp = g_spans[k];
+            std::uint32_t t = static_cast<std::uint32_t>(sp.ty * g_tiles_per_row + sp.tx0);
+            for (int tx = sp.tx0; tx <= sp.tx1; ++tx, ++t) arena[g_tile_fill[t]++] = i;
+        }
     for (std::uint32_t t : g_touched) g_tile_count[t] = 0;
     const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles});
     g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
@@ -439,17 +501,11 @@ void ensure_capacity() {
 }
 
 // Browsers copy writes above about 1 MiB through a slower path, so large uploads go in pieces.
-void write_buffer(WGPUBuffer buffer, const void *data, std::uint64_t bytes) {
-    constexpr std::uint64_t kPiece = 1u << 20;
-    for (std::uint64_t at = 0; at < bytes; at += kPiece)
-        wgpuQueueWriteBuffer(g_queue, buffer, at, static_cast<const std::uint8_t *>(data) + at, std::min(kPiece, bytes - at));
-}
-
 void submit(WGPUTextureView present_view = nullptr) {
     if (g_commands.empty() && !present_view) return;
     ensure_capacity();
-    write_buffer(g_data, g_arena.data(), g_arena.size() * 4);
-    write_buffer(g_params, g_param_records.data(), g_param_records.size() * kParamStride);
+    wgpuQueueWriteBuffer(g_queue, g_data, 0, g_arena.data(), g_arena.size() * 4);
+    wgpuQueueWriteBuffer(g_queue, g_params, 0, g_param_records.data(), g_param_records.size() * kParamStride);
     if (g_query_ready) {
         const void *mapped = wgpuBufferGetConstMappedRange(g_query_read, 0, 16);
         if (mapped) {
@@ -687,8 +743,7 @@ bool init(Mode m) {
 
     if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 3u);
     g_copy_words = (1u << 20) * g_scale * g_scale;
-    g_tile = 16 / static_cast<int>(g_scale);
-    g_tiles_per_row = (2048 + g_tile - 1) / g_tile;
+    g_tiles_per_row = (2048 * static_cast<int>(g_scale) + 15) / 16;
     g_tile_count.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row, 0);
     g_tile_fill.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row, 0);
     g_field_words = (1u << 19) * g_scale * g_scale;
