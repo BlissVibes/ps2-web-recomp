@@ -445,6 +445,32 @@ Lower lower(std::uint32_t w, std::uint32_t pc) {
 
 bool upper_sets_flags(std::uint32_t hi) { return upper(hi, true).sets_flags; }
 
+void replace_all(std::string &s, const std::string &from, const std::string &to) {
+    for (std::size_t at = s.find(from); at != std::string::npos; at = s.find(from, at + to.size())) s.replace(at, from.size(), to);
+}
+
+std::string local_vi(std::string o) {
+    std::string declare, sync;
+    replace_all(o, "set_vi(r, 0, ", "drop_vi(");
+    replace_all(o, "r.vi[0]", "0u");
+    for (int n = 1; n < 16; ++n) {
+        const std::string set = std::format("set_vi(r, {}, ", n), get = std::format("r.vi[{}]", n);
+        const bool written = o.find(set) != std::string::npos;
+        if (!written && o.find(get) == std::string::npos) continue;
+        replace_all(o, set, std::format("set_vi(i{}, ", n));
+        replace_all(o, get, std::format("i{}", n));
+        declare += std::format("    std::uint16_t i{} = r.vi[{}];\n", n, n);
+        if (written) sync += std::format("r.vi[{}] = i{}; ", n, n);
+    }
+    const std::size_t body = o.find("    goto L_");
+    o.insert(body, declare);
+    if (!sync.empty()) {
+        replace_all(o, "vu::interpret(", sync + "vu::interpret(");
+        replace_all(o, "r.tpc = ", sync + "r.tpc = ");
+    }
+    return o;
+}
+
 std::string generate(const Program &p, std::string &name) {
     const std::vector<std::uint32_t> pcs = ps2::vu::reachable(p.code.data(), kMask, p.entry);
     std::set<std::uint32_t> in(pcs.begin(), pcs.end());
@@ -531,10 +557,19 @@ std::string generate(const Program &p, std::string &name) {
         const std::uint32_t next = (pc + 8u) & kMask;
         if (!in.count(next)) o += std::format("    vu::interpret(1, {}u);\n    return;\n", next);
     }
+    std::set<std::uint32_t> targets;
+    for (std::uint32_t pc : pcs) {
+        const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
+        if (hi & 0x80000000u) continue;
+        const std::uint32_t op = lo >> 25;
+        if (op == 0x21 || op == 0x25) targets.insert((pc + 16u) & kMask);
+        if (op == 0x08 && ((lo >> 11) & 15u) == 0) targets.insert(((((lo >> 10) & 0x7800u) | (lo & 0x7FFu)) * 8u) & kMask);
+    }
     o += "dispatch:\n    switch (jpc) {\n";
-    for (std::uint32_t pc : pcs) o += std::format("    case {}u: goto {};\n", pc, label(pc));
+    for (std::uint32_t pc : pcs)
+        if (targets.count(pc)) o += std::format("    case {}u: goto {};\n", pc, label(pc));
     o += "    default: vu::interpret(1, jpc); return;\n    }\n}\n\n";
-    return o;
+    return local_vi(o);
 }
 
 }

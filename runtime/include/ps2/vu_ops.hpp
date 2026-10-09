@@ -261,6 +261,8 @@ PS2_VU_INLINE std::uint8_t *qword(std::uint8_t *mem, std::uint32_t index) { retu
 PS2_VU_INLINE void set_vi(Vu0Regs &r, unsigned i, std::uint32_t v) {
     if (i) r.vi[i] = static_cast<std::uint16_t>(v);
 }
+PS2_VU_INLINE void set_vi(std::uint16_t &dst, std::uint32_t v) { dst = static_cast<std::uint16_t>(v); }
+PS2_VU_INLINE void drop_vi(std::uint32_t) {}
 
 PS2_VU_INLINE std::uint32_t f2u(float f) {
     std::uint32_t v;
