@@ -219,7 +219,7 @@ private:
                 control(i, ds);
                 falls = fl != Flow::Jump && fl != Flow::JumpRegister;
                 skip = true;
-                if (falls && labels_.count(a + 4)) {
+                if (falls && (labels_.count(a + 4) || !in_unit(a + 4))) {
                     if (in_unit(a + 8)) line("goto " + label(a + 8) + ";");
                     else exit_to(a + 8);
                     falls = false;
