@@ -372,7 +372,11 @@ var Module = {
   presentCopy: params.has('copy'),
   print: (text) => console.log(text),
   printErr: (text) => console.log(text),
-  setStatus: (text) => { if (text && !Module.gpuInfo) statusEl.textContent = text; },
+  setStatus: (text) => {
+    if (!text || Module.gpuInfo) return;
+    const progress = text.match(/^Downloading data\.\.\. \((\d+)\/\d+\)/);
+    statusEl.textContent = progress ? 'Downloading game data, ' + (Number(progress[1]) / 1048576).toFixed(1) + ' MB unpacked' : text;
+  },
   onRuntimeInitialized: () => {
     const start = document.getElementById('start');
     if (missing.length) return;
