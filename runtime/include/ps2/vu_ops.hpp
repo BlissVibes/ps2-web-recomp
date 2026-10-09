@@ -168,6 +168,25 @@ PS2_VU_INLINE v4u vmin(v4u a, v4u b) {
     return (a & le) | (b & ~le);
 }
 PS2_VU_INLINE v4u vabs(v4u a) { return a & 0x7FFFFFFFu; }
+PS2_VU_INLINE v4u vftoi(v4u x, int fraction) {
+    const v4f f = (v4f)vfix(x) * static_cast<float>(1u << fraction);
+    const v4i big = f >= 2147483648.0f;
+    const v4i small = f < -2147483648.0f;
+    const v4i out = big | small;
+    const v4i t = __builtin_convertvector((v4f)((v4i)f & ~out), v4i);
+    return (v4u)((t & ~out) | (big & 0x7FFFFFFF) | (small & (v4i)vsplat(0x80000000u)));
+}
+PS2_VU_INLINE v4u vitof(v4u x, int fraction) {
+    const v4i v = (v4i)x;
+    v4f f = __builtin_convertvector(v, v4f);
+    if (__builtin_reduce_or((v4i)(x + 0x01000000u > 0x02000000u))) {
+        const v4i big = f >= 2147483648.0f;
+        const v4i back = __builtin_convertvector((v4f)((v4i)f & ~big), v4i);
+        const v4i over = big | ((v >= 0) & (back > v)) | ((v < 0) & (back < v));
+        f = (v4f)((v4i)f + over);
+    }
+    return (v4u)(f * (1.0f / static_cast<float>(1u << fraction)));
+}
 
 PS2_VU_INLINE void flags(Vu0Regs &r, const Reg128 &v, unsigned dest) {
     std::uint32_t mac = 0;

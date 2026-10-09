@@ -156,7 +156,7 @@ Upper upper(std::uint32_t hi, bool flags_live) {
         }
     };
     const std::string dst = target == kAcc ? "r.acc" : std::format("r.vf[{}]", target);
-    const bool vector = kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub || kind == Max || kind == Min || kind == Abs;
+    const bool vector = kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub || kind == Max || kind == Min || kind == Abs || kind == Ftoi || kind == Itof;
     const bool arithmetic = kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub;
     if (target != 0) {
         u.target = target;
@@ -203,6 +203,8 @@ Upper upper(std::uint32_t hi, bool flags_live) {
         case Max: e = std::format("vmax({}, {})", vs, vb); break;
         case Min: e = std::format("vmin({}, {})", vs, vb); break;
         case Abs: e = std::format("vabs({})", vs); break;
+        case Ftoi: e = std::format("vftoi({}, {})", vs, frac); break;
+        case Itof: e = std::format("vitof({}, {})", vs, frac); break;
         default: break;
         }
         if (!e.empty()) u.pre += std::format("const v4u uv = {}; ", e);
