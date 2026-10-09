@@ -965,18 +965,41 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             let y0 = fat(p + 5u);
             let dx = fat(p + 6u);
             let dy = fat(p + 7u);
-            if (SCALE > 1u && (px < min(x0, x0 + dx) || px >= max(x0, x0 + dx) || py < min(y0, y0 + dy) || py >= max(y0, y0 + dy))) {
-                return;
-            }
             let a = vertex_tex(p, 0u);
             let b = vertex_tex(p, 1u);
+            var du = b.x - a.x;
+            var dv = b.y - a.y;
+            if (has(s, F_FST)) {
+                du = du / 16.0;
+                dv = dv / 16.0;
+            } else {
+                var q = b.z;
+                if (q == 0.0) {
+                    q = 1.0;
+                }
+                du = du / q * f32(1u << s.tw);
+                dv = dv / q * f32(1u << s.th);
+            }
+            var ux = px;
+            var uy = py;
+            let direct = s.tpsm == 0x00u || s.tpsm == 0x01u || s.tpsm == 0x02u || s.tpsm == 0x0Au || s.tpsm >= 0x30u;
+            let point = has(s, F_TME) && (!has(s, F_BILINEAR) || direct);
+            if (point && abs(du) >= abs(dx) * 0.999) {
+                ux = f32(x);
+            }
+            if (point && abs(dv) >= abs(dy) * 0.999) {
+                uy = f32(y);
+            }
+            if (SCALE > 1u && (ux < min(x0, x0 + dx) || ux >= max(x0, x0 + dx) || uy < min(y0, y0 + dy) || uy >= max(y0, y0 + dy))) {
+                return;
+            }
             var tx = 0.0;
             var ty = 0.0;
             if (dx != 0.0) {
-                tx = (px - x0) / dx;
+                tx = (ux - x0) / dx;
             }
             if (dy != 0.0) {
-                ty = (py - y0) / dy;
+                ty = (uy - y0) / dy;
             }
             let c = vertex_attr(p, 1u);
             at = Attr(c.x, c.y, c.z, c.w, a.x + (b.x - a.x) * tx, a.y + (b.y - a.y) * ty, b.z, b.w, data[p + 24u]);
