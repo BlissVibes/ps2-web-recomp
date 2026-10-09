@@ -216,9 +216,14 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
         std::uint8_t *code = unit ? g_vu1_code : g_vu0_code;
         const std::uint32_t size = unit ? 16384u : 4096u;
         const std::uint32_t count = num ? num : 256u;
-        for (std::uint32_t i = 0; i < count; ++i)
-            std::memcpy(code + ((imm * 8u + i * 8u) & (size - 1)), data + i * 2, 8);
-        vu::code_changed(unit);
+        bool changed = false;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            std::uint8_t *at = code + ((imm * 8u + i * 8u) & (size - 1));
+            if (std::memcmp(at, data + i * 2, 8) == 0) continue;
+            std::memcpy(at, data + i * 2, 8);
+            changed = true;
+        }
+        if (changed) vu::code_changed(unit);
         break;
     }
     case 0x50: case 0x51:

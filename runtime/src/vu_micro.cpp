@@ -798,6 +798,7 @@ void run_fast(int n, std::uint32_t address) {
     UpperOut out;
     static std::uint64_t total = 0, calls = 0;
     static const bool count = std::getenv("PS2_VU_COUNT") != nullptr;
+    static const bool record_jumps = std::getenv("PS2_VU_RECORD") != nullptr || static_cast<bool>(g_options.on_vu_program);
     if (count && ++calls % 20000 == 0) std::fprintf(stderr, "[vu1] %llu calls, %llu instructions\n", (unsigned long long)calls, (unsigned long long)total);
     for (std::uint32_t steps = 0; steps < 1'000'000; ++steps, ++total) {
         std::uint32_t lo, hi;
@@ -820,6 +821,7 @@ void run_fast(int n, std::uint32_t address) {
             std::uint32_t target = npc;
             lower(u, lo, current, target, branch);
             if (branch) npc = target;
+            if (branch && record_jumps && n == 1 && ((lo >> 25) == 0x24u || (lo >> 25) == 0x25u)) lookup(target);
         }
         if (out.target > 0) {
             Reg128 &dst = out.target == kAcc ? r.acc : r.vf[out.target];
