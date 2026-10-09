@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -241,14 +242,20 @@ void boot(std::uint32_t entry, const std::vector<std::string> &args) {
         std::fprintf(stderr, "[ee] cannot open disc image %s\n", g_options.disc_path.c_str());
     iop::set_trace(g_options.trace_iop_modules, g_options.trace_iop_hle);
     iop::reset();
-    std::uint32_t argv = 0x00000800u, payload = argv + 4u * static_cast<std::uint32_t>(args.size() + 1);
-    for (std::size_t i = 0; i < args.size(); ++i) {
-        store<std::uint32_t>(g_ram + argv + 4 * i, payload);
-        std::memcpy(g_ram + payload, args[i].c_str(), args[i].size() + 1);
-        payload += static_cast<std::uint32_t>(args[i].size() + 1);
+    std::vector<std::string> guest_args = args;
+    if (!guest_args.empty() && guest_args[0].find(':') == std::string::npos) {
+        std::string name = guest_args[0].substr(guest_args[0].find_last_of("/\\") + 1);
+        for (char &ch : name) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        guest_args[0] = "cdrom0:\\" + name + ";1";
     }
-    store<std::uint32_t>(g_ram + argv + 4 * args.size(), 0);
-    kernel::start_main_thread(entry, 0, static_cast<std::uint32_t>(args.size()), argv);
+    std::uint32_t argv = 0x00000800u, payload = argv + 4u * static_cast<std::uint32_t>(guest_args.size() + 1);
+    for (std::size_t i = 0; i < guest_args.size(); ++i) {
+        store<std::uint32_t>(g_ram + argv + 4 * i, payload);
+        std::memcpy(g_ram + payload, guest_args[i].c_str(), guest_args[i].size() + 1);
+        payload += static_cast<std::uint32_t>(guest_args[i].size() + 1);
+    }
+    store<std::uint32_t>(g_ram + argv + 4 * guest_args.size(), 0);
+    kernel::start_main_thread(entry, 0, static_cast<std::uint32_t>(guest_args.size()), argv);
     schedule(hw::kEventVblank, frame_cycles(), vblank);
 }
 

@@ -533,6 +533,39 @@ void install_servers() {
             }
             return false;
         }
+        if (method == 0x06) {
+            const std::uint32_t ptr = ee_read<std::uint32_t>(args) & (iop::kRamSize - 1);
+            const std::uint32_t arg_len = ee_read<std::uint32_t>(args + 4);
+            const std::string margs(reinterpret_cast<const char *>(g_ram + args + 8 + 252), std::min<std::uint32_t>(arg_len, 252));
+            const std::uint8_t *elf = iop::ram_ptr(ptr);
+            std::uint32_t size = 0;
+            if (std::memcmp(elf, "\x7F" "ELF", 4) == 0) {
+                const auto u16 = [elf](std::uint32_t o) { return static_cast<std::uint32_t>(elf[o] | (elf[o + 1] << 8)); };
+                const auto u32 = [elf](std::uint32_t o) { return static_cast<std::uint32_t>(elf[o] | (elf[o + 1] << 8) | (elf[o + 2] << 16) | (elf[o + 3] << 24)); };
+                size = u32(0x20) + u16(0x30) * u16(0x2E);
+                for (std::uint32_t i = 0; i < u16(0x2C); ++i) {
+                    const std::uint32_t ph = u32(0x1C) + i * u16(0x2A);
+                    size = std::max(size, u32(ph + 4) + u32(ph + 16));
+                }
+                for (std::uint32_t i = 0; i < u16(0x30); ++i) {
+                    const std::uint32_t sh = u32(0x20) + i * u16(0x2E);
+                    if (u32(sh + 4) != 8u) size = std::max(size, u32(sh + 16) + u32(sh + 20));
+                }
+            }
+            size = std::min(size, iop::kRamSize - ptr);
+            std::fprintf(stderr, "[loadfile] buffer at 0x%X, %u bytes\n", ptr, size);
+            const std::int32_t id = size ? iop::load_module_buffer(std::vector<std::uint8_t>(elf, elf + size), "buffer", margs, [ret](int module, int result) {
+                store<std::int32_t>(g_ram + ret, module);
+                store<std::int32_t>(g_ram + ret + 4, result);
+                complete_call(0x80000006u);
+            }) : -1;
+            if (id < 0) {
+                store<std::int32_t>(g_ram + ret, id);
+                store<std::int32_t>(g_ram + ret + 4, 0);
+                return true;
+            }
+            return false;
+        }
         if (method == 0x09) {
             store<std::int32_t>(g_ram + ret, -202);
             return true;

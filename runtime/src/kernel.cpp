@@ -380,7 +380,11 @@ void reset() {
     std::memset(g_ram + kSyscallTable, 0, 0x400);
 }
 
+std::uint32_t g_boot_argc = 0, g_boot_argv = 0;
+
 void start_main_thread(std::uint32_t entry, std::uint32_t gp, std::uint32_t argc, std::uint32_t argv) {
+    g_boot_argc = argc;
+    g_boot_argv = argv;
     Thread t;
     t.id = 1;
     t.status = kRun;
@@ -597,6 +601,27 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
         t->stack = top - size;
         t->stack_size = size;
         t->gp = arg(c, 0);
+        if (const std::uint32_t args = arg(c, 3); args && g_boot_argv) {
+            const std::uint32_t count = std::min<std::uint32_t>(g_boot_argc, 16u);
+            std::uint32_t payload = args + 4u + 16u * 4u;
+            const std::uint32_t end = payload + 256u;
+            std::uint32_t used = 0;
+            for (std::uint32_t i = 0; i < count; ++i) {
+                const std::uint32_t from = ld32(g_boot_argv + 4u * i);
+                st32(args + 4u + 4u * i, payload);
+                std::uint32_t k = 0;
+                for (; payload + k + 1u < end; ++k) {
+                    const std::uint8_t ch = ld8(from + k);
+                    st8(payload + k, ch);
+                    if (!ch) break;
+                }
+                st8(payload + k, 0);
+                payload += k + 1u;
+                ++used;
+                if (payload >= end) break;
+            }
+            st32(args, used);
+        }
         ret(c, top - kContextReserve);
         break;
     }
@@ -658,6 +683,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
     case 0x4A: g_osd_config = ld32(arg(c, 0)); ret(c, 0); break;
     case 0x4B: st32(arg(c, 0), g_osd_config); ret(c, 0); break;
     case 0x64: case 0x68: ret(c, 0); break;
+    case 0x5B: case 0x6B: ret(c, 0); break;
     case 0x70: ret(c, static_cast<std::int64_t>(hw::gs_imr())); break;
     case 0x71: { const std::uint64_t old = hw::gs_imr(); hw::gs_set_imr(arg(c, 0)); ret(c, static_cast<std::int64_t>(old)); break; }
     case 0x73: g_vsync_flag = arg(c, 0); g_vsync_data = arg(c, 1); ret(c, 0); break;
@@ -747,7 +773,9 @@ const char *syscall_name(std::uint32_t n) {
     case 0x48: return "iReferSemaStatus";
     case 0x4A: return "SetOsdConfigParam";
     case 0x4B: return "GetOsdConfigParam";
+    case 0x5B: return "GetEntryAddress";
     case 0x64: return "FlushCache";
+    case 0x6B: return "SifStopDma";
     case 0x68: return "iFlushCache";
     case 0x70: return "GsGetIMR";
     case 0x71: return "GsPutIMR";
