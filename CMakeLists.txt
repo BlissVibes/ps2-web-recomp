@@ -7,8 +7,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(PS2_GENERATED "" CACHE PATH "Folder with the C++ generated for a game")
 
 if(EMSCRIPTEN)
-    add_compile_options(-msimd128 -mtail-call -fwasm-exceptions -pthread)
-    add_link_options(-msimd128 -mtail-call -fwasm-exceptions -pthread)
+    add_compile_options(-msimd128 -mtail-call -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -pthread)
+    add_link_options(-msimd128 -mtail-call -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0 -pthread)
 endif()
 
 if(NOT EMSCRIPTEN)
