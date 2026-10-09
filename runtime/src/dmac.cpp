@@ -83,12 +83,40 @@ void finish(int ch) {
     hw::dmac_raise(static_cast<unsigned>(ch));
 }
 
+void spr_to_ram(Channel &c, std::uint32_t qwc) {
+    for (std::uint32_t i = 0; i < qwc; ++i)
+        std::memcpy(target(c.madr + i * 16), g_spr + ((c.sadr + i * 16) & (kScratchpadSize - 1)), 16);
+    c.sadr = (c.sadr + qwc * 16) & (kScratchpadSize - 1);
+}
+
+void run_from_spr_chain() {
+    Channel &c = g_ch[8];
+    const bool tie = c.chcr & 0x80u;
+    bool end = false;
+    if (c.qwc) {
+        end = ((c.chcr >> 28) & 7u) == 7u || (tie && (c.chcr & 0x80000000u));
+        spr_to_ram(c, c.qwc);
+        c.madr += c.qwc * 16;
+        c.qwc = 0;
+    }
+    for (int guard = 0; !end && guard < 1'000'000; ++guard) {
+        std::uint64_t tag;
+        std::memcpy(&tag, g_spr + (c.sadr & (kScratchpadSize - 1)), 8);
+        c.sadr = (c.sadr + 16) & (kScratchpadSize - 1);
+        c.chcr = (c.chcr & 0xFFFFu) | (static_cast<std::uint32_t>(tag >> 16) << 16);
+        const std::uint32_t qwc = static_cast<std::uint32_t>(tag) & 0xFFFFu;
+        c.madr = static_cast<std::uint32_t>(tag >> 32);
+        spr_to_ram(c, qwc);
+        c.madr += qwc * 16;
+        end = ((tag >> 28) & 7u) == 7u || (tie && ((tag >> 31) & 1u));
+    }
+    finish(8);
+}
+
 void run_normal(int ch) {
     Channel &c = g_ch[ch];
     if (ch == 8) {
-        for (std::uint32_t i = 0; i < c.qwc; ++i)
-            std::memcpy(target(c.madr + i * 16), g_spr + ((c.sadr + i * 16) & (kScratchpadSize - 1)), 16);
-        c.sadr = (c.sadr + c.qwc * 16) & (kScratchpadSize - 1);
+        spr_to_ram(c, c.qwc);
     } else if ((c.chcr & 1u) || ch == 2 || ch == 0 || ch == 9) {
         deliver(ch, c.madr, c.qwc);
     } else if (ch == 1) {
@@ -204,7 +232,8 @@ void start(int ch) {
         return;
     }
     const std::uint32_t mode = (c.chcr >> 2) & 3u;
-    if (mode == 1 && ch != 8) run_chain(ch);
+    if (mode == 1 && ch == 8) run_from_spr_chain();
+    else if (mode == 1) run_chain(ch);
     else run_normal(ch);
 }
 
