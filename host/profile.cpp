@@ -24,7 +24,7 @@ std::uintptr_t g_outside_pc[kOutside];
 std::uint32_t g_outside_hits[kOutside];
 std::uintptr_t g_base = 0;
 std::uint64_t g_samples = 0, g_lost = 0;
-std::uint64_t g_frame = 0, g_from = 0;
+std::uint64_t g_from = 0;
 
 void sample(int, siginfo_t *, void *context) {
     const auto *uc = static_cast<const ucontext_t *>(context);
@@ -76,7 +76,7 @@ void start_profile(std::uint64_t from_frame) {
     }
     auto previous = ps2::g_options.on_vblank;
     ps2::g_options.on_vblank = [previous]() {
-        if (++g_frame == g_from) arm();
+        if (ps2::frame_count() == g_from) arm();
         if (previous) previous();
     };
 }

@@ -70,6 +70,59 @@ void run_vu(int unit, std::uint32_t address) {
     vu::run(unit, address);
 }
 
+template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
+void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num) {
+    std::uint32_t cycle = 0;
+    for (std::uint32_t n = 0; n < num; ++n) {
+        std::uint32_t value[4];
+        for (std::uint32_t j = 0; j < Components; ++j) {
+            const std::size_t at = static_cast<std::size_t>(n) * Components + j;
+            if constexpr (Bits == 32) {
+                std::memcpy(&value[j], bytes + at * 4, 4);
+            } else if constexpr (Bits == 16) {
+                std::uint16_t h;
+                std::memcpy(&h, bytes + at * 2, 2);
+                value[j] = Usn ? h : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(h)));
+            } else {
+                value[j] = Usn ? bytes[at] : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int8_t>(bytes[at])));
+            }
+        }
+        if constexpr (Components == 1) {
+            value[1] = value[2] = value[3] = value[0];
+        } else if constexpr (Components == 2) {
+            value[2] = value[0];
+            value[3] = value[1];
+        } else if constexpr (Components == 3) {
+            value[3] = 0;
+        }
+        std::memcpy(mem + (addr & mask) * 16, value, 16);
+        ++addr;
+        if (++cycle >= wl) {
+            addr += skip;
+            cycle = 0;
+        }
+    }
+}
+
+using FastUnpack = void (*)(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, const std::uint8_t *, std::uint32_t);
+
+template <std::uint32_t Bits>
+constexpr FastUnpack fast_pair(std::uint32_t components, bool usn) {
+    switch (components) {
+    case 1: return usn ? unpack_fast<Bits, 1, true> : unpack_fast<Bits, 1, false>;
+    case 2: return usn ? unpack_fast<Bits, 2, true> : unpack_fast<Bits, 2, false>;
+    case 3: return usn ? unpack_fast<Bits, 3, true> : unpack_fast<Bits, 3, false>;
+    default: return usn ? unpack_fast<Bits, 4, true> : unpack_fast<Bits, 4, false>;
+    }
+}
+
+constexpr FastUnpack kFastUnpack[4][4][2] = {
+    {{fast_pair<32>(1, false), fast_pair<32>(1, true)}, {fast_pair<32>(2, false), fast_pair<32>(2, true)}, {fast_pair<32>(3, false), fast_pair<32>(3, true)}, {fast_pair<32>(4, false), fast_pair<32>(4, true)}},
+    {{fast_pair<16>(1, false), fast_pair<16>(1, true)}, {fast_pair<16>(2, false), fast_pair<16>(2, true)}, {fast_pair<16>(3, false), fast_pair<16>(3, true)}, {fast_pair<16>(4, false), fast_pair<16>(4, true)}},
+    {{fast_pair<8>(1, false), fast_pair<8>(1, true)}, {fast_pair<8>(2, false), fast_pair<8>(2, true)}, {fast_pair<8>(3, false), fast_pair<8>(3, true)}, {fast_pair<8>(4, false), fast_pair<8>(4, true)}},
+    {{fast_pair<16>(1, false), fast_pair<16>(1, true)}, {fast_pair<16>(2, false), fast_pair<16>(2, true)}, {fast_pair<16>(3, false), fast_pair<16>(3, true)}, {fast_pair<16>(4, false), fast_pair<16>(4, true)}},
+};
+
 void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data) {
     Unit &u = state(unit);
     const bool dry = shadow(unit);
@@ -101,36 +154,7 @@ void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data) {
     std::uint8_t *mem = dry ? g_dry_run : vu_data(unit);
     const std::uint32_t wrap = vu_qwords(unit);
     if (!masked && u.mode == 0 && !(wl > cl) && !(vn == 3 && vl == 3)) {
-        const auto *bytes = reinterpret_cast<const std::uint8_t *>(data);
-        for (std::uint32_t n = 0; n < num; ++n) {
-            std::uint32_t value[4];
-            const std::size_t first = static_cast<std::size_t>(n) * components;
-            for (std::uint32_t j = 0; j < components; ++j) {
-                if (bits == 32) {
-                    std::memcpy(&value[j], bytes + (first + j) * 4, 4);
-                } else if (bits == 16) {
-                    std::uint16_t h;
-                    std::memcpy(&h, bytes + (first + j) * 2, 2);
-                    value[j] = usn ? h : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(h)));
-                } else {
-                    const std::uint8_t b = bytes[first + j];
-                    value[j] = usn ? b : static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int8_t>(b)));
-                }
-            }
-            if (components == 1) value[1] = value[2] = value[3] = value[0];
-            else if (components == 2) {
-                value[2] = value[0];
-                value[3] = value[1];
-            } else if (components == 3) {
-                value[3] = 0;
-            }
-            std::memcpy(mem + (addr % wrap) * 16, value, 16);
-            ++addr;
-            if (++cycle >= wl) {
-                addr += cl - wl;
-                cycle = 0;
-            }
-        }
+        kFastUnpack[vl][vn][usn ? 1 : 0](mem, wrap - 1, addr, wl, cl - wl, reinterpret_cast<const std::uint8_t *>(data), num);
         u.num = 0;
         return;
     }
