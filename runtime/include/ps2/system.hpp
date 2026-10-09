@@ -89,13 +89,10 @@ void start_render_thread();
 void post_present();
 bool render_pending(bool surface, const std::function<void(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height)> &copy);
 void wait_render_work(int timeout_ms);
-// Latest frame for hosts that draw it themselves, fields blended; may lag a frame and is false while none is ready.
+void wake_render_thread();
 bool copy_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
-// Parses "frame:button[+button][:frames]" as used by --press.
 bool parse_press(const std::string &spec, Press &press);
-// GPU time spent on emulation so far, estimated from timestamp queries (0 when unsupported).
 double gpu_busy_ms();
-// Returns to the browser event loop once without the 4 ms clamp of nested timers (Emscripten only).
 void browser_yield();
 std::uint64_t frames_run();
 std::uint64_t primitives_drawn();

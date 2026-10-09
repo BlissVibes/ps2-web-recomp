@@ -7,6 +7,7 @@ usage: serve.py <build dir> <disc image> [port]
 import http.server
 import os
 import re
+import shutil
 import sys
 
 BUILD = os.path.abspath(sys.argv[1])
@@ -28,8 +29,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         full = os.path.join(BUILD, name)
         return full if os.path.isfile(full) else None
 
-    def headers_for(self, path, length):
+    def headers_for(self, path, length, encoding=None):
         self.send_header('Content-Type', TYPES.get(os.path.splitext(path)[1], 'application/octet-stream'))
+        if encoding:
+            self.send_header('Content-Encoding', encoding)
+            self.send_header('Vary', 'Accept-Encoding')
         self.send_header('Content-Length', str(length))
         self.send_header('Accept-Ranges', 'bytes')
         self.send_header('Cache-Control', 'no-cache')
@@ -50,6 +54,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = self.target()
         if not path:
             self.send_error(404)
+            return
+        packed = path + '.gz'
+        if ('Range' not in self.headers and 'gzip' in self.headers.get('Accept-Encoding', '') and os.path.isfile(packed)
+                and os.path.getmtime(packed) >= os.path.getmtime(path)):
+            self.send_response(200)
+            self.headers_for(path, os.path.getsize(packed), 'gzip')
+            with open(packed, 'rb') as f:
+                shutil.copyfileobj(f, self.wfile, 1 << 20)
             return
         size = os.path.getsize(path)
         match = re.match(r'bytes=(\d+)-(\d*)', self.headers.get('Range', ''))

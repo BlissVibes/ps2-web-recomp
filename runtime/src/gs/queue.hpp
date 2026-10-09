@@ -20,6 +20,7 @@ void post(Type type, std::uint32_t arg0, std::uint32_t arg1, const void *data, s
 bool peek(Header &header, const std::uint8_t *&payload);
 void pop(const Header &header);
 void wait_for_work(int timeout_ms);
+void wake();
 
 void wait(std::atomic<std::uint32_t> &value, std::uint32_t seen);
 void notify(std::atomic<std::uint32_t> &value);

@@ -110,6 +110,11 @@ void pop(const Header &header) {
     if (g_producer_waiting.exchange(0)) notify(g_freed);
 }
 
+void wake() {
+    g_posted.fetch_add(1);
+    if (g_consumer_waiting.exchange(0)) notify(g_posted);
+}
+
 void wait_for_work(int timeout_ms) {
     const std::uint32_t seen = g_posted.load();
     g_consumer_waiting.store(1);

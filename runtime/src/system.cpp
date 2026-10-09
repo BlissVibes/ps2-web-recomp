@@ -299,6 +299,7 @@ bool render_pending(bool surface, const std::function<void(const std::uint32_t *
 }
 
 void wait_render_work(int timeout_ms) { gs::queue::wait_for_work(timeout_ms); }
+void wake_render_thread() { gs::queue::wake(); }
 bool copy_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) { return gs::copy_frame(rgba, width, height); }
 
 bool parse_press(const std::string &spec, Press &press) {

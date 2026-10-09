@@ -2,16 +2,16 @@
 #include "ps2/system.hpp"
 
 #include <emscripten.h>
+#include <emscripten/threading.h>
 #include <pthread.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <list>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 void register_generated_code();
@@ -19,26 +19,26 @@ void register_generated_vu();
 
 EM_JS_DEPS(ps2web, "$stringToNewUTF8,$UTF8ToString");
 
-EM_JS(int, ps2web_fetch, (const char *url, double offset, int size, void *out), {
+EM_JS(void, ps2web_fetch, (const char *url, double offset, int size, void *out, std::atomic<std::uint32_t> *state), {
     const target = UTF8ToString(url);
-    for (let attempt = 0; attempt < 4; ++attempt) {
-        try {
-            const xhr = new XMLHttpRequest();
-            xhr.open('GET', target, false);
-            xhr.responseType = 'arraybuffer';
-            xhr.setRequestHeader('Range', 'bytes=' + offset + '-' + (offset + size - 1));
-            xhr.send();
-            if (xhr.status !== 206 && xhr.status !== 200) continue;
-            let bytes = new Uint8Array(xhr.response);
-            if (xhr.status === 200) bytes = bytes.subarray(offset, offset + size);
-            const length = Math.min(bytes.length, size);
-            HEAPU8.set(bytes.subarray(0, length), out);
-            return length;
-        } catch (e) {
+    const finish = (value) => {
+        Atomics.store(HEAP32, state >> 2, value);
+        Atomics.notify(HEAP32, state >> 2);
+    };
+    fetch(target, {headers: {Range: 'bytes=' + offset + '-' + (offset + size - 1)}})
+        .then((response) => {
+            if (response.status !== 206 && response.status !== 200) throw new Error('status ' + response.status);
+            return response.arrayBuffer().then((buffer) => {
+                let bytes = new Uint8Array(buffer);
+                if (response.status === 200) bytes = bytes.subarray(offset, offset + size);
+                HEAPU8.set(bytes.subarray(0, Math.min(bytes.length, size)), out);
+                finish(3);
+            });
+        })
+        .catch((e) => {
             console.warn('disc read failed', e);
-        }
-    }
-    return 0;
+            finish(4);
+        });
 });
 
 EM_JS(double, ps2web_disc_size, (), { return Module.discSize || 0; });
@@ -64,9 +64,19 @@ EM_JS(void, ps2web_blit, (const std::uint32_t *rgba, int width, int height), {
 
 namespace {
 
-constexpr std::size_t kChunk = 1u << 20;
-constexpr std::size_t kCacheChunks = 64;
+constexpr std::size_t kChunk = 256u << 10;
+constexpr std::uint32_t kSlots = 256;
+constexpr std::uint64_t kReadAhead = 16;
 constexpr std::uint32_t kAudioFrames = 1u << 14;
+
+enum : std::uint32_t { kEmpty, kWanted, kLoading, kReady, kFailed };
+
+struct Slot {
+    std::atomic<std::uint32_t> state{kEmpty};
+    std::uint64_t index = 0, used = 0;
+    std::uint32_t size = 0;
+    std::uint8_t *data = nullptr;
+};
 
 struct AudioRing {
     std::atomic<std::uint32_t> write{0}, read{0};
@@ -76,29 +86,56 @@ struct AudioRing {
 };
 
 AudioRing g_audio;
-
-std::unordered_map<std::uint64_t, std::list<std::pair<std::uint64_t, std::vector<std::uint8_t>>>::iterator> g_chunks;
-std::list<std::pair<std::uint64_t, std::vector<std::uint8_t>>> g_lru;
-std::uint64_t g_disc_size = 0;
+Slot g_slots[kSlots];
+std::uint64_t g_disc_size = 0, g_use_clock = 0, g_last_chunk = ~0ull, g_run = 0;
 char *g_disc_url = nullptr;
 
-const std::vector<std::uint8_t> *chunk(std::uint64_t index) {
-    auto it = g_chunks.find(index);
-    if (it != g_chunks.end()) {
-        g_lru.splice(g_lru.begin(), g_lru, it->second);
-        return &it->second->second;
+Slot *find_slot(std::uint64_t index) {
+    for (Slot &s : g_slots)
+        if (s.state.load(std::memory_order_acquire) != kEmpty && s.index == index) return &s;
+    return nullptr;
+}
+
+Slot *want(std::uint64_t index) {
+    if (index * kChunk >= g_disc_size) return nullptr;
+    if (Slot *s = find_slot(index)) return s;
+    Slot *victim = nullptr;
+    for (Slot &s : g_slots) {
+        const std::uint32_t state = s.state.load(std::memory_order_acquire);
+        if (state == kEmpty) {
+            victim = &s;
+            break;
+        }
+        if ((state == kReady || state == kFailed) && (!victim || s.used < victim->used)) victim = &s;
     }
-    const std::uint64_t offset = index * kChunk;
-    const std::size_t size = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, g_disc_size - offset));
-    std::vector<std::uint8_t> data(size);
-    if (ps2web_fetch(g_disc_url, static_cast<double>(offset), static_cast<int>(size), data.data()) <= 0) return nullptr;
-    if (g_lru.size() >= kCacheChunks) {
-        g_chunks.erase(g_lru.back().first);
-        g_lru.pop_back();
+    if (!victim) return nullptr;
+    if (!victim->data) victim->data = new std::uint8_t[kChunk];
+    victim->index = index;
+    victim->size = static_cast<std::uint32_t>(std::min<std::uint64_t>(kChunk, g_disc_size - index * kChunk));
+    victim->used = ++g_use_clock;
+    victim->state.store(kWanted, std::memory_order_release);
+    ps2::wake_render_thread();
+    return victim;
+}
+
+const Slot *chunk(std::uint64_t index) {
+    Slot *s = want(index);
+    if (index == g_last_chunk + 1) ++g_run;
+    else if (index != g_last_chunk) g_run = 0;
+    g_last_chunk = index;
+    for (std::uint64_t k = 1; k <= std::min(g_run * 2, kReadAhead); ++k) want(index + k);
+    for (int attempt = 0; s && attempt < 4; ++attempt) {
+        for (std::uint32_t state = s->state.load(); state != kReady && state != kFailed; state = s->state.load())
+            emscripten_futex_wait(&s->state, state, INFINITY);
+        if (s->state.load() == kReady) {
+            s->used = ++g_use_clock;
+            return s;
+        }
+        usleep(100000);
+        s->state.store(kWanted, std::memory_order_release);
+        ps2::wake_render_thread();
     }
-    g_lru.emplace_front(index, std::move(data));
-    g_chunks[index] = g_lru.begin();
-    return &g_lru.front().second;
+    return nullptr;
 }
 
 std::size_t read_disc(std::uint64_t offset, void *out, std::size_t size) {
@@ -106,14 +143,22 @@ std::size_t read_disc(std::uint64_t offset, void *out, std::size_t size) {
     auto *to = static_cast<std::uint8_t *>(out);
     while (done < size && offset + done < g_disc_size) {
         const std::uint64_t at = offset + done;
-        const std::vector<std::uint8_t> *c = chunk(at / kChunk);
+        const Slot *c = chunk(at / kChunk);
         if (!c) break;
         const std::size_t within = static_cast<std::size_t>(at % kChunk);
-        const std::size_t take = std::min(size - done, c->size() - within);
-        std::memcpy(to + done, c->data() + within, take);
+        const std::size_t take = std::min<std::size_t>(size - done, c->size - within);
+        std::memcpy(to + done, c->data + within, take);
         done += take;
     }
     return done;
+}
+
+void service_disc() {
+    for (Slot &s : g_slots) {
+        std::uint32_t expected = kWanted;
+        if (s.state.compare_exchange_strong(expected, kLoading, std::memory_order_acq_rel))
+            ps2web_fetch(g_disc_url, static_cast<double>(s.index * kChunk), static_cast<int>(s.size), s.data, &s.state);
+    }
 }
 
 void push_audio(const std::int16_t *samples, std::size_t frames) {
@@ -237,6 +282,7 @@ int main(int argc, char **argv) {
     };
     const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> none;
     for (;;) {
+        service_disc();
         if (ps2::render_pending(surface, copy ? blit : none)) {
             ps2web_frame_done();
             ps2::browser_yield();
