@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -233,7 +234,10 @@ extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_frames() { return static_cast<doub
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_primitives() { return static_cast<double>(ps2::primitives_drawn()); }
 extern "C" EMSCRIPTEN_KEEPALIVE void *ps2web_audio_ring() { return &g_audio; }
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_audio_queued_ms() { return audio_queued_ms(); }
-extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_idle_ms(int render) { return render ? g_render_idle.load() : g_emulation_idle.load(); }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_idle_ms(int which) {
+    if (which == 2) return ps2::vu_thread_idle_ms();
+    return which ? g_render_idle.load() : g_emulation_idle.load();
+}
 
 int main(int argc, char **argv) {
     static Launch launch;
@@ -272,6 +276,17 @@ int main(int argc, char **argv) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 16u << 20);
+    if (!std::getenv("PS2_NO_VU_THREAD")) {
+        ps2::start_vu_thread();
+        pthread_t vu_thread;
+        if (pthread_create(&vu_thread, &attr, [](void *) -> void * {
+                ps2::run_vu_thread();
+                return nullptr;
+            }, nullptr) != 0) {
+            std::fprintf(stderr, "[web] cannot start the VU thread\n");
+            return 1;
+        }
+    }
     pthread_t thread;
     if (pthread_create(&thread, &attr, emulate, &launch) != 0) {
         std::fprintf(stderr, "[web] cannot start the emulation thread\n");

@@ -824,7 +824,7 @@ bool copy_frame(const DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uin
 std::atomic<std::uint32_t> g_presented{0};
 std::uint32_t g_posted_presents = 0;
 
-void start_thread() { queue::start(32u << 20); }
+void start_thread() { queue::render().start(32u << 20); }
 
 void post_present() {
     const DisplayRegs regs = display_regs();
@@ -834,9 +834,10 @@ void post_present() {
 }
 
 bool render_pending(const std::function<void(const DisplayRegs &)> &on_present) {
+    queue::role() = queue::Role::Render;
     queue::Header h;
     const std::uint8_t *payload = nullptr;
-    while (queue::peek(h, payload)) {
+    while (queue::render().peek(h, payload)) {
         bool presented = false;
         switch (h.type) {
         case queue::kGif: gif::render(static_cast<int>(h.arg0), payload, h.arg1); break;
@@ -865,7 +866,7 @@ bool render_pending(const std::function<void(const DisplayRegs &)> &on_present) 
         }
         default: break;
         }
-        queue::pop(h);
+        queue::render().pop(h);
         if (presented) {
             g_presented.fetch_add(1);
             queue::notify(g_presented);

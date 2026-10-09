@@ -167,9 +167,11 @@ void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
         render(path, data, qwc);
         return;
     }
-    scan(g_scan[path], data, qwc);
+    if (gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);
     gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), qwc, data, qwc * 16);
 }
+
+void scan_signals(int path, const std::uint8_t *data, std::uint32_t qwc) { scan(g_scan[path], data, qwc); }
 
 bool busy(int path) { return g_paths[path].active; }
 

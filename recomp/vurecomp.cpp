@@ -44,7 +44,6 @@ struct Upper {
     std::vector<int> shadow_reads;
 };
 
-// VF0 is hardwired to (0, 0, 0, 1), so its reads become constants the compiler can fold.
 std::string vf(unsigned i, int lane_index) {
     if (!i) return lane_index == 3 ? "0x3F800000u" : "0u";
     return std::format("r.vf[{}].w[{}]", i, lane_index);
@@ -52,7 +51,6 @@ std::string vf(unsigned i, int lane_index) {
 
 std::string vreg(unsigned i) { return i ? std::format("vload(r.vf[{}])", i) : "v4u{0u, 0u, 0u, 0x3F800000u}"; }
 
-// Arithmetic reads n<reg>, a copy of the register kept normalized, so vfix runs once per write instead of once per read.
 std::string shadow(int reg) { return reg == kAcc ? "nacc" : std::format("n{}", reg); }
 std::string raw(int reg) { return reg == kAcc ? "r.acc" : std::format("r.vf[{}]", reg); }
 

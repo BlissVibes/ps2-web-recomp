@@ -17,7 +17,6 @@ struct Entry {
     bool directory;
 };
 
-// Reads up to size bytes at a byte offset of the image and returns how many it got.
 using Reader = std::function<std::size_t(std::uint64_t offset, void *out, std::size_t size)>;
 
 bool open(const std::string &path);

@@ -2,6 +2,7 @@
 
 #include "dmac.hpp"
 #include "gs/gif.hpp"
+#include "gs/queue.hpp"
 #include "hw.hpp"
 #include "vu_micro.hpp"
 
@@ -22,7 +23,13 @@ struct Unit {
 };
 
 Unit g_units[2];
+Unit g_vu_side;
 std::uint64_t g_commands[2][128];
+std::uint8_t g_dry_run[16384];
+
+bool on_vu_thread() { return gs::queue::role() == gs::queue::Role::Vu; }
+bool shadow(int unit) { return unit == 1 && gs::queue::vu_active() && !on_vu_thread(); }
+Unit &state(int unit) { return unit == 1 && on_vu_thread() ? g_vu_side : g_units[unit]; }
 
 std::uint8_t *vu_data(int unit) { return unit ? g_vu1_mem : g_vu0_mem; }
 std::uint32_t vu_qwords(int unit) { return unit ? 1024u : 256u; }
@@ -46,12 +53,13 @@ std::uint32_t unpack_words(std::uint32_t cmd, const Unit &u, std::uint32_t num) 
 }
 
 void run_vu(int unit, std::uint32_t address) {
-    Unit &u = g_units[unit];
+    Unit &u = state(unit);
     if (unit == 1) {
         u.top = u.tops;
         u.itop = u.itops;
         u.dbf = !u.dbf;
         u.tops = u.base + (u.dbf ? u.ofst : 0);
+        if (shadow(unit)) return;
         vu::set_tops(u.top, u.itop);
     } else {
         u.itop = u.itops;
@@ -61,7 +69,12 @@ void run_vu(int unit, std::uint32_t address) {
 }
 
 void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data) {
-    Unit &u = g_units[unit];
+    Unit &u = state(unit);
+    const bool dry = shadow(unit);
+    if (dry && u.mode != 2) {
+        u.num = 0;
+        return;
+    }
     const std::uint32_t vn = (cmd >> 26) & 3u, vl = (cmd >> 24) & 3u;
     const bool masked = (cmd >> 28) & 1u;
     const bool usn = (cmd >> 14) & 1u;
@@ -83,7 +96,7 @@ void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data) {
         return raw;
     };
     std::uint32_t cycle = 0;
-    std::uint8_t *mem = vu_data(unit);
+    std::uint8_t *mem = dry ? g_dry_run : vu_data(unit);
     const std::uint32_t wrap = vu_qwords(unit);
     if (!masked && u.mode == 0 && !(wl > cl) && !(vn == 3 && vl == 3)) {
         const auto *bytes = reinterpret_cast<const std::uint8_t *>(data);
@@ -164,7 +177,7 @@ void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data) {
 }
 
 std::uint32_t data_words(int unit, std::uint32_t cmd) {
-    const Unit &u = g_units[unit];
+    const Unit &u = state(unit);
     const std::uint32_t op = (cmd >> 24) & 0x7Fu;
     const std::uint32_t num = (cmd >> 16) & 0xFFu;
     switch (op) {
@@ -179,10 +192,10 @@ std::uint32_t data_words(int unit, std::uint32_t cmd) {
 }
 
 void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
-    Unit &u = g_units[unit];
+    Unit &u = state(unit);
     const std::uint32_t op = (cmd >> 24) & 0x7Fu, imm = cmd & 0xFFFFu, num = (cmd >> 16) & 0xFFu;
     u.code = cmd;
-    ++g_commands[unit][op];
+    if (!on_vu_thread()) ++g_commands[unit][op];
     switch (op) {
     case 0x00: break;
     case 0x01: u.cycle = imm; break;
@@ -194,11 +207,12 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
     case 0x07: u.mark = imm; break;
     case 0x10: case 0x11: case 0x13: break;
     case 0x14: case 0x15: run_vu(unit, imm * 8u); break;
-    case 0x17: run_vu(unit, vu::tpc(unit)); break;
+    case 0x17: run_vu(unit, shadow(unit) ? 0u : vu::tpc(unit)); break;
     case 0x20: u.mask = data[0]; break;
     case 0x30: std::memcpy(u.row, data, 16); break;
     case 0x31: std::memcpy(u.col, data, 16); break;
     case 0x4A: {
+        if (shadow(unit)) break;
         std::uint8_t *code = unit ? g_vu1_code : g_vu0_code;
         const std::uint32_t size = unit ? 16384u : 4096u;
         const std::uint32_t count = num ? num : 256u;
@@ -208,7 +222,8 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
         break;
     }
     case 0x50: case 0x51:
-        gif::transfer(2, reinterpret_cast<const std::uint8_t *>(data), imm ? imm : 0x10000u);
+        if (shadow(unit)) gif::scan_signals(2, reinterpret_cast<const std::uint8_t *>(data), imm ? imm : 0x10000u);
+        else gif::transfer(2, reinterpret_cast<const std::uint8_t *>(data), imm ? imm : 0x10000u);
         break;
     default:
         if ((op & 0x60u) == 0x60u) unpack(unit, cmd, data);
@@ -218,12 +233,12 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
     if ((cmd & 0x80000000u) && !(u.err & 1u)) {
         u.stat |= 0xC00u;
         u.stalled = true;
-        hw::intc_raise(4u + static_cast<unsigned>(unit));
+        if (!on_vu_thread()) hw::intc_raise(4u + static_cast<unsigned>(unit));
     }
 }
 
 std::size_t run(int unit, const std::uint32_t *words, std::size_t count) {
-    Unit &u = g_units[unit];
+    Unit &u = state(unit);
     std::size_t pos = 0;
     while (pos < count && !u.stalled) {
         const std::uint32_t cmd = words[pos];
@@ -237,7 +252,7 @@ std::size_t run(int unit, const std::uint32_t *words, std::size_t count) {
 }
 
 void process(int unit) {
-    Unit &u = g_units[unit];
+    Unit &u = state(unit);
     const std::size_t pos = run(unit, u.pending.data(), u.pending.size());
     u.pending.erase(u.pending.begin(), u.pending.begin() + static_cast<std::ptrdiff_t>(pos));
 }
@@ -247,6 +262,8 @@ void process(int unit) {
 void reset() {
     for (Unit &u : g_units) u = Unit{};
 }
+
+void reset_vu_side() { g_vu_side = Unit{}; }
 
 void stats() {
     for (int u = 0; u < 2; ++u) {
@@ -258,7 +275,8 @@ void stats() {
 }
 
 void transfer(int unit, const std::uint8_t *data, std::uint32_t qwc) {
-    Unit &u = g_units[unit];
+    if (shadow(unit)) gs::queue::vu().post(gs::queue::kVif1, qwc, 0, data, qwc * 16);
+    Unit &u = state(unit);
     if (u.pending.empty() && !u.stalled) {
         const auto *words = reinterpret_cast<const std::uint32_t *>(data);
         const std::size_t count = static_cast<std::size_t>(qwc) * 4;
@@ -272,10 +290,10 @@ void transfer(int unit, const std::uint8_t *data, std::uint32_t qwc) {
     process(unit);
 }
 
-bool stalled(int unit) { return g_units[unit].stalled; }
+bool stalled(int unit) { return state(unit).stalled; }
 
 std::uint32_t read(int unit, std::uint32_t reg) {
-    const Unit &u = g_units[unit];
+    const Unit &u = state(unit);
     switch (reg) {
     case 0x00: return u.stat | (u.dbf ? 0x80u : 0u);
     case 0x20: return u.err;
@@ -299,7 +317,8 @@ std::uint32_t read(int unit, std::uint32_t reg) {
 }
 
 void write(int unit, std::uint32_t reg, std::uint32_t value) {
-    Unit &u = g_units[unit];
+    if (shadow(unit)) gs::queue::vu().post(gs::queue::kVif1Write, reg, value, nullptr, 0);
+    Unit &u = state(unit);
     switch (reg) {
     case 0x10:
         if (value & 1u) {
@@ -310,7 +329,7 @@ void write(int unit, std::uint32_t reg, std::uint32_t value) {
             if (u.stalled) {
                 u.stalled = false;
                 process(unit);
-                if (!u.stalled) dmac::resume(unit);
+                if (!u.stalled && !on_vu_thread()) dmac::resume(unit);
             }
         }
         break;

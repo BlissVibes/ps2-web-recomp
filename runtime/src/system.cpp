@@ -1,6 +1,7 @@
 #include "dmac.hpp"
 #include "gs/gif.hpp"
 #include "vif.hpp"
+#include "vu_micro.hpp"
 #include "gs/gs.hpp"
 #include "gs/queue.hpp"
 #include "hw.hpp"
@@ -20,6 +21,8 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -284,6 +287,35 @@ void resize_window(std::uint32_t width, std::uint32_t height) { gs::resize_windo
 bool present_frame() { return gs::present(); }
 void init_graphics() { gs::init(); }
 void start_render_thread() { gs::start_thread(); }
+void start_vu_thread() { gs::queue::vu().start(32u << 20); }
+
+std::atomic<double> g_vu_idle_ms{0.0};
+
+double vu_thread_idle_ms() { return g_vu_idle_ms.load(); }
+
+void run_vu_thread() {
+    gs::queue::role() = gs::queue::Role::Vu;
+    gs::queue::Ring &in = gs::queue::vu();
+    for (;;) {
+        gs::queue::Header h;
+        const std::uint8_t *payload = nullptr;
+        while (in.peek(h, payload)) {
+            switch (h.type) {
+            case gs::queue::kVif1: vif::transfer(1, payload, h.arg0); break;
+            case gs::queue::kVif1Write: vif::write(1, h.arg0, h.arg1); break;
+            case gs::queue::kVuReset:
+                vif::reset_vu_side();
+                vu::reset();
+                break;
+            default: gs::queue::render().post(static_cast<gs::queue::Type>(h.type), h.arg0, h.arg1, payload, h.bytes); break;
+            }
+            in.pop(h);
+        }
+        const auto start = std::chrono::steady_clock::now();
+        in.wait_for_work(50);
+        g_vu_idle_ms.store(g_vu_idle_ms.load() + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+    }
+}
 void post_present() { gs::post_present(); }
 
 bool render_pending(bool surface, const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> &copy) {
@@ -298,8 +330,8 @@ bool render_pending(bool surface, const std::function<void(const std::uint32_t *
     });
 }
 
-void wait_render_work(int timeout_ms) { gs::queue::wait_for_work(timeout_ms); }
-void wake_render_thread() { gs::queue::wake(); }
+void wait_render_work(int timeout_ms) { gs::queue::render().wait_for_work(timeout_ms); }
+void wake_render_thread() { gs::queue::render().wake(); }
 bool copy_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) { return gs::copy_frame(rgba, width, height); }
 
 bool parse_press(const std::string &spec, Press &press) {

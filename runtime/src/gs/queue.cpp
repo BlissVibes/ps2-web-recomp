@@ -2,8 +2,8 @@
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstring>
-#include <memory>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -17,16 +17,10 @@ namespace ps2::gs::queue {
 
 namespace {
 
-std::unique_ptr<std::uint8_t[]> g_buffer;
-std::uint64_t g_capacity = 0;
-bool g_active = false;
-alignas(64) std::atomic<std::uint64_t> g_head{0};
-alignas(64) std::atomic<std::uint64_t> g_tail{0};
-alignas(64) std::atomic<std::uint32_t> g_posted{0};
-alignas(64) std::atomic<std::uint32_t> g_freed{0};
-std::atomic<std::uint32_t> g_consumer_waiting{0}, g_producer_waiting{0};
-
 constexpr std::uint64_t align16(std::uint64_t n) { return (n + 15) & ~15ull; }
+
+Ring g_render, g_vu;
+thread_local Role g_role = Role::Emulation;
 
 }
 
@@ -53,77 +47,89 @@ void notify(std::atomic<std::uint32_t> &value) {
 #endif
 }
 
-bool active() { return g_active; }
+Ring &render() { return g_render; }
+Ring &vu() { return g_vu; }
+Role &role() { return g_role; }
 
-void start(std::size_t capacity) {
-    g_capacity = capacity;
-    g_buffer = std::make_unique<std::uint8_t[]>(capacity);
-    g_active = true;
+Ring &outbox() {
+    if (g_role == Role::Emulation && g_vu.active()) return g_vu;
+    return g_render;
 }
 
-void post(Type type, std::uint32_t arg0, std::uint32_t arg1, const void *data, std::uint32_t bytes) {
+bool active() { return g_render.active(); }
+bool vu_active() { return g_vu.active(); }
+
+void post(Type type, std::uint32_t arg0, std::uint32_t arg1, const void *data, std::uint32_t bytes) { outbox().post(type, arg0, arg1, data, bytes); }
+
+void Ring::start(std::size_t capacity) {
+    buffer_ = std::make_unique<std::uint8_t[]>(capacity);
+    capacity_ = capacity;
+}
+
+void Ring::post(Type type, std::uint32_t arg0, std::uint32_t arg1, const void *data, std::uint32_t bytes) {
     const std::uint64_t need = sizeof(Header) + align16(bytes);
-    std::uint64_t head = g_head.load(std::memory_order_relaxed);
+    std::uint64_t head = head_.load(std::memory_order_relaxed);
     for (;;) {
-        const std::uint64_t pos = head % g_capacity;
-        const std::uint64_t pad = pos + need > g_capacity ? g_capacity - pos : 0;
-        const std::uint32_t seen = g_freed.load(std::memory_order_acquire);
-        if (head + pad + need - g_tail.load(std::memory_order_acquire) <= g_capacity) {
+        const std::uint64_t pos = head % capacity_;
+        const std::uint64_t pad = pos + need > capacity_ ? capacity_ - pos : 0;
+        const std::uint32_t seen = freed_.load(std::memory_order_acquire);
+        if (head + pad + need - tail_.load(std::memory_order_acquire) <= capacity_) {
             if (pad) {
                 const Header wrap{kWrap, 0, 0, 0};
-                std::memcpy(g_buffer.get() + pos, &wrap, sizeof wrap);
+                std::memcpy(buffer_.get() + pos, &wrap, sizeof wrap);
                 head += pad;
             }
             break;
         }
-        g_producer_waiting.store(1);
-        if (head + pad + need - g_tail.load() > g_capacity) wait(g_freed, seen);
+        producer_waiting_.store(1);
+        if (head + pad + need - tail_.load() > capacity_) wait(freed_, seen);
     }
-    std::uint8_t *at = g_buffer.get() + head % g_capacity;
+    std::uint8_t *at = buffer_.get() + head % capacity_;
     const Header h{type, bytes, arg0, arg1};
     std::memcpy(at, &h, sizeof h);
     if (bytes) std::memcpy(at + sizeof h, data, bytes);
-    g_head.store(head + need, std::memory_order_release);
-    g_posted.fetch_add(1);
-    if (g_consumer_waiting.exchange(0)) notify(g_posted);
+    head_.store(head + need, std::memory_order_release);
+    posted_.fetch_add(1);
+    if (consumer_waiting_.exchange(0)) notify(posted_);
 }
 
-bool peek(Header &header, const std::uint8_t *&payload) {
-    std::uint64_t tail = g_tail.load(std::memory_order_relaxed);
-    const std::uint64_t head = g_head.load(std::memory_order_acquire);
+bool Ring::peek(Header &header, const std::uint8_t *&payload) {
+    std::uint64_t tail = tail_.load(std::memory_order_relaxed);
+    const std::uint64_t head = head_.load(std::memory_order_acquire);
     while (tail != head) {
-        const std::uint64_t pos = tail % g_capacity;
-        std::memcpy(&header, g_buffer.get() + pos, sizeof header);
+        const std::uint64_t pos = tail % capacity_;
+        std::memcpy(&header, buffer_.get() + pos, sizeof header);
         if (header.type != kWrap) {
-            payload = g_buffer.get() + pos + sizeof header;
+            payload = buffer_.get() + pos + sizeof header;
             return true;
         }
-        tail += g_capacity - pos;
-        g_tail.store(tail, std::memory_order_release);
+        tail += capacity_ - pos;
+        tail_.store(tail, std::memory_order_release);
     }
     return false;
 }
 
-void pop(const Header &header) {
-    g_tail.store(g_tail.load(std::memory_order_relaxed) + sizeof(Header) + align16(header.bytes), std::memory_order_release);
-    g_freed.fetch_add(1);
-    if (g_producer_waiting.exchange(0)) notify(g_freed);
+void Ring::pop(const Header &header) {
+    tail_.store(tail_.load(std::memory_order_relaxed) + sizeof(Header) + align16(header.bytes), std::memory_order_release);
+    freed_.fetch_add(1);
+    if (producer_waiting_.exchange(0)) notify(freed_);
 }
 
-void wake() {
-    g_posted.fetch_add(1);
-    if (g_consumer_waiting.exchange(0)) notify(g_posted);
+void Ring::wake() {
+    posted_.fetch_add(1);
+    if (consumer_waiting_.exchange(0)) notify(posted_);
 }
 
-void wait_for_work(int timeout_ms) {
-    const std::uint32_t seen = g_posted.load();
-    g_consumer_waiting.store(1);
-    if (g_head.load() != g_tail.load()) {
-        g_consumer_waiting.store(0);
+void Ring::wait_for_work(int timeout_ms) {
+    const std::uint32_t seen = posted_.load();
+    consumer_waiting_.store(1);
+    if (head_.load() != tail_.load()) {
+        consumer_waiting_.store(0);
         return;
     }
 #ifdef __EMSCRIPTEN__
-    ps2_wait_async(&g_posted, seen, timeout_ms);
+    if (emscripten_is_main_browser_thread()) ps2_wait_async(&posted_, seen, timeout_ms);
+    else emscripten_futex_wait(&posted_, seen, timeout_ms);
 #else
     (void)seen;
     std::this_thread::sleep_for(std::chrono::milliseconds(std::min(timeout_ms, 1)));

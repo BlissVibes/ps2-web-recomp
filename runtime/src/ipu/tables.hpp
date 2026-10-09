@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-// Adapted from Play! (BSD-2-Clause), see NOTICE in this directory.
+// adapted from Play! (BSD-2-Clause), see NOTICE in this directory
 namespace ps2::ipu::tables {
 
 struct Vlc {

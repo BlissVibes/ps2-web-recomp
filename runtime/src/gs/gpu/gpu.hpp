@@ -33,7 +33,6 @@ void load_clut(std::uint64_t tex0, std::uint64_t texclut);
 void flush();
 void download(std::uint8_t *memory);
 bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba);
-// Starts a readback of the frame and returns the newest finished one without waiting; false while none is ready.
 bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 bool attach_surface(const SurfaceTarget &target);
 void resize_surface(std::uint32_t width, std::uint32_t height);

@@ -5,6 +5,7 @@
 namespace ps2::vif {
 
 void reset();
+void reset_vu_side();
 void stats();
 void transfer(int unit, const std::uint8_t *data, std::uint32_t qwc);
 bool stalled(int unit);

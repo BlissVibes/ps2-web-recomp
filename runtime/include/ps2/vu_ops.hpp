@@ -41,7 +41,6 @@ inline std::uint32_t branch_target(std::uint32_t lo, std::uint32_t pc, std::uint
     return (pc + 8u + static_cast<std::uint32_t>(imm11) * 8u) & mask;
 }
 
-// Walks the instructions reachable from an entry; both the runtime and vurecomp key programs by this set.
 inline std::vector<std::uint32_t> reachable(const std::uint8_t *code, std::uint32_t mask, std::uint32_t entry) {
     std::vector<std::uint8_t> seen((mask + 1) / 8, 0);
     std::vector<std::uint32_t> work{entry & mask}, out;
@@ -134,7 +133,6 @@ PS2_VU_INLINE v4u vload(const Reg128 &r) {
 PS2_VU_INLINE void vstore(Reg128 &r, v4u v) { std::memcpy(&r, &v, 16); }
 PS2_VU_INLINE v4u vsplat(std::uint32_t x) { return v4u{x, x, x, x}; }
 PS2_VU_INLINE v4u vsel(v4u old, v4u now, v4u mask) { return (now & mask) | (old & ~mask); }
-// Denormals become signed zero and exponent 255 becomes the largest finite value.
 PS2_VU_INLINE v4u vfix(v4u x) {
     const v4i clamped = __builtin_elementwise_min((v4i)(x & 0x7FFFFFFFu), (v4i){0x7F7FFFFF, 0x7F7FFFFF, 0x7F7FFFFF, 0x7F7FFFFF});
     const v4i normal = (v4f)clamped >= (v4f)(v4i){0x00800000, 0x00800000, 0x00800000, 0x00800000};
@@ -213,7 +211,6 @@ PS2_VU_INLINE void clip(Vu0Regs &r, const Reg128 &s, std::uint32_t w) {
     r.clip = ((r.clip << 6) | f) & 0xFFFFFFu;
 }
 
-// MAC, status and clip flags reach the lower pipeline four instructions after the upper op that set them.
 struct FlagPipe {
     std::uint32_t t = 16;
     std::uint32_t mac_ts[8] = {}, mac_v[8] = {}, status_v[8] = {}, clip_ts[8] = {}, clip_v[8] = {};

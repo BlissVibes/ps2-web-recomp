@@ -1,6 +1,7 @@
 #include "vu_micro.hpp"
 
 #include "gs/gif.hpp"
+#include "gs/queue.hpp"
 #include "hw.hpp"
 #include "ps2/fpu.hpp"
 #include "ps2/system.hpp"
@@ -611,6 +612,10 @@ void lower(Unit &u, std::uint32_t w, std::uint32_t pc, std::uint32_t &npc, bool 
 }
 
 void reset() {
+    if (gs::queue::vu_active() && gs::queue::role() != gs::queue::Role::Vu) {
+        gs::queue::vu().post(gs::queue::kVuReset, 0, 0, nullptr, 0);
+        return;
+    }
     std::memset(&g_vu1, 0, sizeof g_vu1);
     g_vu1.vf[0].w[3] = fp::kOne;
     g_top = g_itop = 0;

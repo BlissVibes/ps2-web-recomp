@@ -15,5 +15,4 @@
 *.wav
 __pycache__/
 
-/.claude/
 /third_party/wgpu-native/

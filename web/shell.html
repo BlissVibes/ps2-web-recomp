@@ -363,7 +363,7 @@ async function chooseGpu() {
   return 'GPU cannot draw to the page, copying frames';
 }
 
-let frames = 0, last = performance.now(), lastGpu = 0, lastEmuIdle = 0, lastRenderIdle = 0;
+let frames = 0, last = performance.now(), lastGpu = 0, lastEmuIdle = 0, lastRenderIdle = 0, lastVuIdle = 0;
 var Module = {
   canvas,
   arguments: ['/game/core.elf', '--arg', params.get('arg') || 'cdrom0:\\CORE.GT4;1'].concat(params.getAll('press').flatMap((p) => p.split(',').flatMap((x) => ['--press', x]))),
@@ -402,12 +402,14 @@ var Module = {
     if (now - last >= 1000) {
       const gpu = Module._ps2web_gpu_ms();
       const memory = (Module.HEAPU8.length / 1048576).toFixed(0);
-      const emuIdle = Module._ps2web_idle_ms(0), renderIdle = Module._ps2web_idle_ms(1), span = now - last;
+      const emuIdle = Module._ps2web_idle_ms(0), renderIdle = Module._ps2web_idle_ms(1), vuIdle = Module._ps2web_idle_ms(2), span = now - last;
       statsEl.textContent = 'frame ' + Module._ps2web_frames() + '   ' + (frames * 1000 / span).toFixed(1) + ' fps   GPU ' + ((gpu - lastGpu) / span * 100).toFixed(0) +
-                            '%   idle emu ' + ((emuIdle - lastEmuIdle) / span * 100).toFixed(0) + '% gs ' + ((renderIdle - lastRenderIdle) / span * 100).toFixed(0) +
+                            '%   idle emu ' + ((emuIdle - lastEmuIdle) / span * 100).toFixed(0) + '% vu ' + ((vuIdle - lastVuIdle) / span * 100).toFixed(0) +
+                            '% gs ' + ((renderIdle - lastRenderIdle) / span * 100).toFixed(0) +
                             '%   heap ' + memory + ' MB   audio ' + Module.audioQueuedMs().toFixed(0) + ' ms';
       lastEmuIdle = emuIdle;
       lastRenderIdle = renderIdle;
+      lastVuIdle = vuIdle;
       lastGpu = gpu;
       frames = 0;
       last = now;
