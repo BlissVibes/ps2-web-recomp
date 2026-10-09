@@ -68,10 +68,20 @@ EM_JS(void, ps2web_blit, (const std::uint32_t *rgba, int width, int height), {
     const ctx = Module.blitContext;
     const scale = Math.min(canvas.width / 4, canvas.height / 3);
     const w = scale * 4, h = scale * 3;
+    const sx = Math.max(1, Math.floor(w / width)), sy = Math.max(1, Math.floor(h / height));
+    let source = Module.blitSource;
+    if (sx > 1 || sy > 1) {
+        if (!Module.blitSharp || Module.blitSharp.width !== width * sx || Module.blitSharp.height !== height * sy)
+            Module.blitSharp = new OffscreenCanvas(width * sx, height * sy);
+        const sharp = Module.blitSharp.getContext('2d');
+        sharp.imageSmoothingEnabled = false;
+        sharp.drawImage(Module.blitSource, 0, 0, width * sx, height * sy);
+        source = Module.blitSharp;
+    }
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.imageSmoothingEnabled = true;
-    ctx.drawImage(Module.blitSource, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
+    ctx.drawImage(source, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
 });
 
 namespace {

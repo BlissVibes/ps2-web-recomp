@@ -1105,7 +1105,9 @@ bool present(const DisplaySource &src) {
     const bool blend = src.halved && g_have_previous && g_last_width == src.width && g_last_height == src.height && !weave_off;
     const std::uint32_t param = push_params({src.fbp, src.fbw, src.psm, src.dbx, src.dby, src.width, src.height, src.halved ? 1u : 0u, current});
     g_commands.push_back({kDisplay, (src.width + 7) / 8, (src.height + 7) / 8, param});
-    const std::uint32_t blit[8] = {src.width, src.height, current, previous, blend ? 1u : 0u, 0, 0, 0};
+    const float sw = static_cast<float>(g_surface_width), sh = static_cast<float>(g_surface_height);
+    const float vw = std::min(sw, sh * 4.0f / 3.0f), vh = vw * 3.0f / 4.0f;
+    const std::uint32_t blit[8] = {src.width, src.height, current, previous, blend ? 1u : 0u, static_cast<std::uint32_t>(vw), static_cast<std::uint32_t>(vh), 0};
     wgpuQueueWriteBuffer(g_queue, g_blit_params, 0, blit, sizeof blit);
     ++g_field;
     g_have_previous = true;

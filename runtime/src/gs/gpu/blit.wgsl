@@ -4,9 +4,9 @@ struct Blit {
     current: u32,
     previous: u32,
     blend: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
+    out_width: u32,
+    out_height: u32,
+    pad: u32,
 }
 
 @group(0) @binding(0) var<storage, read> pixels: array<u32>;
@@ -33,7 +33,12 @@ fn texel(base: u32, x: i32, y: i32) -> vec4<f32> {
 }
 
 fn sample(base: u32, uv: vec2<f32>) -> vec4<f32> {
-    let p = uv * vec2<f32>(f32(blit.width), f32(blit.height)) - 0.5;
+    let size = vec2<f32>(f32(blit.width), f32(blit.height));
+    let scale = max(floor(vec2<f32>(f32(blit.out_width), f32(blit.out_height)) / size), vec2<f32>(1.0));
+    let t = uv * size;
+    let d = fract(t) - 0.5;
+    let region = 0.5 - 0.5 / scale;
+    let p = floor(t) + (d - clamp(d, -region, region)) * scale;
     let origin = floor(p);
     let f = p - origin;
     let x = i32(origin.x);
