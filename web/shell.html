@@ -41,36 +41,47 @@ window.addEventListener('resize', fitCanvas);
 
 const workletSource = `
 class Output extends AudioWorkletProcessor {
-  constructor() {
+  constructor(options) {
     super();
-    this.queue = [];
-    this.offset = 0;
-    this.consumed = 0;
-    this.port.onmessage = (e) => this.queue.push(e.data);
+    const { buffer, base } = options.processorOptions;
+    this.ring = new Uint32Array(buffer, base, 4);
+    this.capacity = this.ring[2];
+    this.samples = new Int16Array(buffer, base + 16, this.capacity * 2);
+    this.left = 0;
+    this.right = 0;
   }
   process(inputs, outputs) {
     const left = outputs[0][0], right = outputs[0][1];
+    const write = Atomics.load(this.ring, 0), mask = this.capacity - 1;
+    let read = Atomics.load(this.ring, 1);
     for (let i = 0; i < left.length; ++i) {
-      if (!this.queue.length) { left[i] = right[i] = 0; continue; }
-      const block = this.queue[0];
-      left[i] = block[this.offset];
-      right[i] = block[this.offset + 1];
-      this.offset += 2;
-      ++this.consumed;
-      if (this.offset >= block.length) { this.queue.shift(); this.offset = 0; }
+      if (read !== write) {
+        const at = (read & mask) * 2;
+        this.left = this.samples[at] / 32768;
+        this.right = this.samples[at + 1] / 32768;
+        read = (read + 1) >>> 0;
+      } else {
+        this.left *= 0.995;
+        this.right *= 0.995;
+      }
+      left[i] = this.left;
+      right[i] = this.right;
     }
-    if ((currentFrame & 1023) < left.length) this.port.postMessage(this.consumed);
+    Atomics.store(this.ring, 1, read);
+    Atomics.store(this.ring, 3, 1);
     return true;
   }
 }
 registerProcessor('ps2-output', Output);`;
 
-let audio = null, node = null, posted = 0, consumed = 0;
+let audio = null, node = null;
 async function startAudio() {
   audio = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
   await audio.audioWorklet.addModule(URL.createObjectURL(new Blob([workletSource], { type: 'application/javascript' })));
-  node = new AudioWorkletNode(audio, 'ps2-output', { outputChannelCount: [2] });
-  node.port.onmessage = (e) => { consumed = e.data; };
+  node = new AudioWorkletNode(audio, 'ps2-output', {
+    outputChannelCount: [2],
+    processorOptions: { buffer: Module.HEAPU8.buffer, base: Module._ps2web_audio_ring() },
+  });
   node.connect(audio.destination);
 }
 
@@ -155,7 +166,7 @@ async function chooseGpu() {
   return 'GPU cannot draw to the page, copying frames';
 }
 
-let frames = 0, last = performance.now(), lastGpu = 0;
+let frames = 0, last = performance.now(), lastGpu = 0, lastEmuIdle = 0, lastRenderIdle = 0;
 var Module = {
   canvas,
   arguments: ['/game/core.elf', '--arg', params.get('arg') || 'cdrom0:\\CORE.GT4;1'].concat(params.getAll('press').flatMap((p) => p.split(',').flatMap((x) => ['--press', x]))),
@@ -167,6 +178,10 @@ var Module = {
   setStatus: (text) => { if (text) statusEl.textContent = text; },
   onRuntimeInitialized: () => {
     const start = document.getElementById('start');
+    if (!crossOriginIsolated) {
+      start.textContent = 'This page needs cross-origin isolation (COOP and COEP headers)';
+      return;
+    }
     start.disabled = false;
     start.textContent = 'Start';
   },
@@ -180,14 +195,7 @@ var Module = {
       Module.removeRunDependency('disc');
     });
   }],
-  pushAudio: (samples) => {
-    if (!node) return;
-    const block = new Float32Array(samples.length);
-    for (let i = 0; i < samples.length; ++i) block[i] = samples[i] / 32768;
-    node.port.postMessage(block, [block.buffer]);
-    posted += samples.length / 2;
-  },
-  audioQueuedMs: () => (node ? (posted - consumed) / 48 : 0),
+  audioQueuedMs: () => Module._ps2web_audio_queued_ms(),
   onFrame: () => {
     pollInput();
     ++frames;
@@ -195,8 +203,12 @@ var Module = {
     if (now - last >= 1000) {
       const gpu = Module._ps2web_gpu_ms();
       const memory = (Module.HEAPU8.length / 1048576).toFixed(0);
-      statsEl.textContent = 'frame ' + Module._ps2web_frames() + '   prims ' + Module._ps2web_primitives() + '   ' + (frames * 1000 / (now - last)).toFixed(1) + ' fps   GPU ' + ((gpu - lastGpu) / (now - last) * 100).toFixed(0) +
+      const emuIdle = Module._ps2web_idle_ms(0), renderIdle = Module._ps2web_idle_ms(1), span = now - last;
+      statsEl.textContent = 'frame ' + Module._ps2web_frames() + '   ' + (frames * 1000 / span).toFixed(1) + ' fps   GPU ' + ((gpu - lastGpu) / span * 100).toFixed(0) +
+                            '%   idle emu ' + ((emuIdle - lastEmuIdle) / span * 100).toFixed(0) + '% gs ' + ((renderIdle - lastRenderIdle) / span * 100).toFixed(0) +
                             '%   heap ' + memory + ' MB   audio ' + Module.audioQueuedMs().toFixed(0) + ' ms';
+      lastEmuIdle = emuIdle;
+      lastRenderIdle = renderIdle;
       lastGpu = gpu;
       frames = 0;
       last = now;

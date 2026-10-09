@@ -1,6 +1,7 @@
 #include "gif.hpp"
 
 #include "gs.hpp"
+#include "queue.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -15,21 +16,15 @@ struct Path {
     std::uint32_t nloop = 0, loop = 0, nreg = 0, reg = 0, flg = 0;
     std::uint64_t regs = 0;
     bool eop = false;
+    bool address_data = false;
 };
 
 Path g_paths[4];
 std::uint32_t g_stat = 0;
 std::uint64_t g_tags[4][4];
 
-}
-
-void reset() {
-    for (Path &p : g_paths) p = Path{};
-    g_stat = 0;
-}
-
-void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
-    Path &p = g_paths[path];
+template <typename Sink>
+void walk(Path &p, const std::uint8_t *data, std::uint32_t qwc, Sink &sink) {
     for (std::uint32_t i = 0; i < qwc; ++i) {
         Reg128 q;
         std::memcpy(&q, data + static_cast<std::size_t>(i) * 16, 16);
@@ -40,17 +35,15 @@ void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
             p.nreg = static_cast<std::uint32_t>(q.d[0] >> 60) & 0xFu;
             if (!p.nreg) p.nreg = 16;
             p.regs = q.d[1];
-            ++g_tags[path][p.flg];
             p.loop = 0;
             p.reg = 0;
-            gs::g_state.q = 1.0f;
-            if (((q.d[0] >> 46) & 1u) && p.flg == 0) gs::write(0x00, (q.d[0] >> 47) & 0x7FFu);
+            sink.tag(p, q);
             p.active = p.nloop != 0;
             continue;
         }
         switch (p.flg) {
         case 0:
-            gs::write_packed(static_cast<std::uint32_t>(p.regs >> (p.reg * 4)) & 0xFu, q);
+            sink.packed(static_cast<std::uint32_t>(p.regs >> (p.reg * 4)) & 0xFu, q);
             if (++p.reg >= p.nreg) {
                 p.reg = 0;
                 if (++p.loop >= p.nloop) p.active = false;
@@ -58,7 +51,7 @@ void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
             break;
         case 1:
             for (int half = 0; half < 2 && p.active; ++half) {
-                gs::write(static_cast<std::uint32_t>(p.regs >> (p.reg * 4)) & 0xFu, q.d[half]);
+                sink.reglist(static_cast<std::uint32_t>(p.regs >> (p.reg * 4)) & 0xFu, q.d[half]);
                 if (++p.reg >= p.nreg) {
                     p.reg = 0;
                     if (++p.loop >= p.nloop) p.active = false;
@@ -67,7 +60,7 @@ void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
             break;
         default: {
             const std::uint32_t run = std::min(qwc - i, p.nloop - p.loop);
-            gs::write_image(data + static_cast<std::size_t>(i) * 16, run);
+            sink.image(data + static_cast<std::size_t>(i) * 16, run);
             p.loop += run;
             i += run - 1;
             if (p.loop >= p.nloop) p.active = false;
@@ -75,6 +68,107 @@ void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
         }
         }
     }
+}
+
+struct GsSink {
+    int path;
+    void tag(const Path &p, const Reg128 &q) {
+        ++g_tags[path][p.flg];
+        gs::g_state.q = 1.0f;
+        if (((q.d[0] >> 46) & 1u) && p.flg == 0) gs::write(0x00, (q.d[0] >> 47) & 0x7FFu);
+    }
+    void packed(std::uint32_t reg, const Reg128 &q) { gs::write_packed(reg, q); }
+    void reglist(std::uint32_t reg, std::uint64_t value) { gs::write(reg, value); }
+    void image(const std::uint8_t *data, std::uint32_t qwords) { gs::write_image(data, qwords); }
+};
+
+void scan(Path &p, const std::uint8_t *data, std::uint32_t qwc) {
+    std::uint32_t i = 0;
+    while (i < qwc) {
+        Reg128 q;
+        if (!p.active) {
+            std::memcpy(&q, data + static_cast<std::size_t>(i) * 16, 16);
+            p.nloop = static_cast<std::uint32_t>(q.d[0]) & 0x7FFFu;
+            p.flg = static_cast<std::uint32_t>(q.d[0] >> 58) & 3u;
+            p.nreg = static_cast<std::uint32_t>(q.d[0] >> 60) & 0xFu;
+            if (!p.nreg) p.nreg = 16;
+            p.regs = q.d[1];
+            p.loop = 0;
+            p.reg = 0;
+            p.address_data = false;
+            if (p.flg == 0)
+                for (std::uint32_t r = 0; r < p.nreg; ++r) p.address_data = p.address_data || ((p.regs >> (r * 4)) & 0xFu) == 0xEu;
+            p.active = p.nloop != 0;
+            ++i;
+            continue;
+        }
+        if (p.flg == 0 && p.address_data) {
+            for (; i < qwc && p.active; ++i) {
+                const std::uint8_t *at = data + static_cast<std::size_t>(i) * 16;
+                if (((p.regs >> (p.reg * 4)) & 0xFu) == 0xEu && at[8] >= 0x60 && at[8] <= 0x62) {
+                    std::uint64_t value;
+                    std::memcpy(&value, at, 8);
+                    gs::signal(at[8], value);
+                }
+                if (++p.reg >= p.nreg) {
+                    p.reg = 0;
+                    if (++p.loop >= p.nloop) p.active = false;
+                }
+            }
+            continue;
+        }
+        const std::uint64_t done = static_cast<std::uint64_t>(p.loop) * p.nreg + p.reg;
+        const std::uint64_t left = static_cast<std::uint64_t>(p.nloop) * p.nreg - done;
+        std::uint64_t take, used;
+        if (p.flg == 0) {
+            take = used = std::min<std::uint64_t>(left, qwc - i);
+        } else if (p.flg == 1) {
+            take = std::min<std::uint64_t>((left + 1) / 2, qwc - i);
+            used = std::min<std::uint64_t>(take * 2, left);
+        } else {
+            take = std::min<std::uint64_t>(p.nloop - p.loop, qwc - i);
+            p.loop += static_cast<std::uint32_t>(take);
+            if (p.loop >= p.nloop) p.active = false;
+            i += static_cast<std::uint32_t>(take);
+            continue;
+        }
+        p.loop = static_cast<std::uint32_t>((done + used) / p.nreg);
+        p.reg = static_cast<std::uint32_t>((done + used) % p.nreg);
+        if (used == left) p.active = false;
+        i += static_cast<std::uint32_t>(take);
+    }
+}
+
+Path g_scan[4];
+
+}
+
+void reset() {
+    g_stat = 0;
+    if (gs::queue::active()) {
+        for (Path &p : g_scan) p = Path{};
+        gs::queue::post(gs::queue::kGifReset, 0, 0, nullptr, 0);
+        return;
+    }
+    render_reset();
+}
+
+void render_reset() {
+    for (Path &p : g_paths) p = Path{};
+}
+
+void render(int path, const std::uint8_t *data, std::uint32_t qwc) {
+    GsSink sink{path};
+    walk(g_paths[path], data, qwc, sink);
+}
+
+void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
+    if (!gs::queue::active()) {
+        render(path, data, qwc);
+        return;
+    }
+    scan(g_scan[path], data, qwc);
+    gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), qwc, data, qwc * 16);
 }
 
 bool busy(int path) { return g_paths[path].active; }

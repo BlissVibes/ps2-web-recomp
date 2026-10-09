@@ -33,6 +33,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(length))
         self.send_header('Accept-Ranges', 'bytes')
         self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
+        self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')
+        self.send_header('Cross-Origin-Resource-Policy', 'same-origin')
         self.end_headers()
 
     def do_HEAD(self):

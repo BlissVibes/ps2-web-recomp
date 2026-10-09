@@ -222,17 +222,23 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
     }
 }
 
-void process(int unit) {
+std::size_t run(int unit, const std::uint32_t *words, std::size_t count) {
     Unit &u = g_units[unit];
     std::size_t pos = 0;
-    while (pos < u.pending.size() && !u.stalled) {
-        const std::uint32_t cmd = u.pending[pos];
+    while (pos < count && !u.stalled) {
+        const std::uint32_t cmd = words[pos];
         const std::size_t start = pos + 1;
         const std::uint32_t need = data_words(unit, cmd);
-        if (start + need > u.pending.size()) break;
-        execute(unit, cmd, u.pending.data() + start);
+        if (start + need > count) break;
+        execute(unit, cmd, words + start);
         pos = start + need;
     }
+    return pos;
+}
+
+void process(int unit) {
+    Unit &u = g_units[unit];
+    const std::size_t pos = run(unit, u.pending.data(), u.pending.size());
     u.pending.erase(u.pending.begin(), u.pending.begin() + static_cast<std::ptrdiff_t>(pos));
 }
 
@@ -253,6 +259,13 @@ void stats() {
 
 void transfer(int unit, const std::uint8_t *data, std::uint32_t qwc) {
     Unit &u = g_units[unit];
+    if (u.pending.empty() && !u.stalled) {
+        const auto *words = reinterpret_cast<const std::uint32_t *>(data);
+        const std::size_t count = static_cast<std::size_t>(qwc) * 4;
+        const std::size_t pos = run(unit, words, count);
+        if (pos < count) u.pending.assign(words + pos, words + count);
+        return;
+    }
     const std::size_t old = u.pending.size();
     u.pending.resize(old + static_cast<std::size_t>(qwc) * 4);
     std::memcpy(u.pending.data() + old, data, static_cast<std::size_t>(qwc) * 16);

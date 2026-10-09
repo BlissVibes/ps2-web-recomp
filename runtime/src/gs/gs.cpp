@@ -1,5 +1,7 @@
 #include "gs.hpp"
 
+#include "gif.hpp"
+#include "queue.hpp"
 #include "raster.hpp"
 #include "../hw.hpp"
 #ifdef PS2_GPU
@@ -7,6 +9,8 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -341,24 +345,32 @@ void write_pixel(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uin
     }
 }
 
-void reset() {
+void init() {
     static bool built = false;
-    if (!built) {
-        build_tables();
-        built = true;
+    if (built) return;
+    build_tables();
+    built = true;
 #ifdef PS2_GPU
-        const char *backend = std::getenv("PS2_GS");
-        const gpu::Mode wanted = !backend || std::strcmp(backend, "gpu") == 0 ? gpu::Mode::primary : std::strcmp(backend, "both") == 0 ? gpu::Mode::mirror : gpu::Mode::off;
-        if (wanted != gpu::Mode::off && !gpu::init(wanted)) std::fprintf(stderr, "[gs] WebGPU unavailable, using the software renderer\n");
+    const char *backend = std::getenv("PS2_GS");
+    const gpu::Mode wanted = !backend || std::strcmp(backend, "gpu") == 0 ? gpu::Mode::primary : std::strcmp(backend, "both") == 0 ? gpu::Mode::mirror : gpu::Mode::off;
+    if (wanted != gpu::Mode::off && !gpu::init(wanted)) std::fprintf(stderr, "[gs] WebGPU unavailable, using the software renderer\n");
 #endif
-    }
+}
+
+void render_reset() {
+    init();
     std::memset(&g_state, 0, sizeof g_state);
     std::memset(g_memory, 0, sizeof g_memory);
-    g_csr = 0x551B4000ull;
-    g_imr = 0x7F00ull;
     g_transfer = Transfer{};
     g_primitives = 0;
     raster::reset();
+}
+
+void reset() {
+    g_csr = 0x551B4000ull;
+    g_imr = 0x7F00ull;
+    if (queue::active()) queue::post(queue::kReset, 0, 0, nullptr, 0);
+    else render_reset();
 }
 
 void kick(bool draw) {
@@ -497,21 +509,28 @@ void write(std::uint32_t reg, std::uint64_t value) {
     case 0x54:
         feed_image(reinterpret_cast<const std::uint8_t *>(&value), 8);
         break;
-    case 0x60: {
-        const std::uint32_t mask = static_cast<std::uint32_t>(value >> 32), id = static_cast<std::uint32_t>(value);
+    case 0x60: case 0x61: case 0x62:
+        if (!queue::active()) signal(reg, value);
+        break;
+    default:
+        break;
+    }
+}
+
+void signal(std::uint32_t reg, std::uint64_t value) {
+    const std::uint32_t mask = static_cast<std::uint32_t>(value >> 32), id = static_cast<std::uint32_t>(value);
+    switch (reg) {
+    case 0x60:
         g_siglblid = (g_siglblid & ~static_cast<std::uint64_t>(mask)) | (id & mask);
         raise(1);
         break;
-    }
     case 0x61: raise(2); break;
     case 0x62: {
-        const std::uint32_t mask = static_cast<std::uint32_t>(value >> 32), id = static_cast<std::uint32_t>(value);
         const std::uint64_t label = (g_siglblid >> 32 & ~static_cast<std::uint64_t>(mask)) | (id & mask);
         g_siglblid = (g_siglblid & 0xFFFFFFFFull) | (label << 32);
         break;
     }
-    default:
-        break;
+    default: break;
     }
 }
 
@@ -556,7 +575,20 @@ void write_packed(std::uint32_t reg, const Reg128 &q) {
 
 void write_image(const std::uint8_t *data, std::uint32_t qwords) { feed_image(data, static_cast<std::size_t>(qwords) * 16); }
 
+std::atomic<std::uint32_t> g_downloads{0};
+
 void read_image(std::uint8_t *data, std::uint32_t qwords) {
+    if (!queue::active()) {
+        render_read_image(data, qwords);
+        return;
+    }
+    const std::uint32_t seen = g_downloads.load();
+    const std::uintptr_t target = reinterpret_cast<std::uintptr_t>(data);
+    queue::post(queue::kDownload, qwords, 0, &target, sizeof target);
+    while (g_downloads.load() == seen) queue::wait(g_downloads, seen);
+}
+
+void render_read_image(std::uint8_t *data, std::uint32_t qwords) {
     const std::size_t bytes = static_cast<std::size_t>(qwords) * 16;
     std::memset(data, 0, bytes);
     if (!g_transfer.active || (g_state.trxdir & 3u) != 1) return;
@@ -634,7 +666,8 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
         g_csr &= ~(value & 0x1Fu);
         if (value & 0x200u) {
             g_csr = 0x551B4000ull;
-            g_state.count = 0;
+            if (queue::active()) queue::post(queue::kVertexReset, 0, 0, nullptr, 0);
+            else g_state.count = 0;
         }
         break;
     case 0x1010: g_imr = value; break;
@@ -648,8 +681,9 @@ void vblank(bool start) {
     if (start) {
         g_odd_field = !g_odd_field;
         raise(8);
+        if (queue::active()) queue::post(queue::kVblank, 0, 0, nullptr, 0);
 #ifdef PS2_GPU
-        if (gpu_on()) gpu::flush();
+        else if (gpu_on()) gpu::flush();
 #endif
     }
 }
@@ -683,27 +717,33 @@ double gpu_busy_ms() {
 #endif
 }
 
-bool present() {
+DisplayRegs display_regs() { return DisplayRegs{g_pmode, g_smode2, {g_dispfb[0], g_dispfb[1]}, {g_display[0], g_display[1]}}; }
+
+bool present() { return present(display_regs()); }
+
+bool present(const DisplayRegs &r) {
 #ifdef PS2_GPU
     if (!gpu::has_surface()) return false;
-    const int circuit = (g_pmode & 2u) ? 1 : (g_pmode & 1u) ? 0 : -1;
+    const int circuit = (r.pmode & 2u) ? 1 : (r.pmode & 1u) ? 0 : -1;
     if (circuit < 0) return true;
-    const std::uint64_t fb = g_dispfb[circuit], disp = g_display[circuit];
+    const std::uint64_t fb = r.dispfb[circuit], disp = r.display[circuit];
     const std::uint32_t magh = (static_cast<std::uint32_t>(disp >> 23) & 0xFu) + 1, magv = (static_cast<std::uint32_t>(disp >> 27) & 3u) + 1;
     const std::uint32_t width = ((static_cast<std::uint32_t>(disp >> 32) & 0xFFFu) + 1) / magh, height = ((static_cast<std::uint32_t>(disp >> 44) & 0x7FFu) + 1) / magv;
     if (!width || !height || width > 2048 || height > 2048) return true;
     const gpu::DisplaySource src{(static_cast<std::uint32_t>(fb) & 0x1FFu) * 32, static_cast<std::uint32_t>(fb >> 9) & 0x3Fu, static_cast<std::uint32_t>(fb >> 15) & 0x1Fu,
-                                 static_cast<std::uint32_t>(fb >> 32) & 0x7FFu, static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, width, height, (g_smode2 & 3u) == 3u};
+                                 static_cast<std::uint32_t>(fb >> 32) & 0x7FFu, static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, width, height, (r.smode2 & 3u) == 3u};
     return gpu::present(src);
 #else
     return false;
 #endif
 }
 
-bool display(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
-    const int circuit = (g_pmode & 2u) ? 1 : (g_pmode & 1u) ? 0 : -1;
+bool display(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) { return display(display_regs(), rgba, width, height); }
+
+bool display(const DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
+    const int circuit = (r.pmode & 2u) ? 1 : (r.pmode & 1u) ? 0 : -1;
     if (circuit < 0) return false;
-    const std::uint64_t fb = g_dispfb[circuit], disp = g_display[circuit];
+    const std::uint64_t fb = r.dispfb[circuit], disp = r.display[circuit];
     const std::uint32_t fbp = static_cast<std::uint32_t>(fb) & 0x1FFu, fbw = static_cast<std::uint32_t>(fb >> 9) & 0x3Fu;
     const std::uint32_t psm = static_cast<std::uint32_t>(fb >> 15) & 0x1Fu;
     const std::uint32_t dbx = static_cast<std::uint32_t>(fb >> 32) & 0x7FFu, dby = static_cast<std::uint32_t>(fb >> 43) & 0x7FFu;
@@ -712,7 +752,7 @@ bool display(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32
     width = dw / magh;
     height = dh / magv;
     if (!width || !height || width > 2048 || height > 2048) return false;
-    const bool halved = (g_smode2 & 3u) == 3u;
+    const bool halved = (r.smode2 & 3u) == 3u;
 #ifdef PS2_GPU
     if (gpu_on()) {
         const gpu::DisplaySource src{fbp * 32, fbw, psm, dbx, dby, width, height, halved};
@@ -747,36 +787,92 @@ bool display(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32
     return true;
 }
 
-bool copy_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
+bool copy_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) { return copy_frame(display_regs(), rgba, width, height); }
+
+bool copy_frame(const DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) {
     static std::vector<std::uint32_t> previous;
     bool got = false;
 #ifdef PS2_GPU
     if (gpu_on() && !cpu_raster()) {
-        const int circuit = (g_pmode & 2u) ? 1 : (g_pmode & 1u) ? 0 : -1;
+        const int circuit = (r.pmode & 2u) ? 1 : (r.pmode & 1u) ? 0 : -1;
         if (circuit < 0) return false;
-        const std::uint64_t fb = g_dispfb[circuit], disp = g_display[circuit];
+        const std::uint64_t fb = r.dispfb[circuit], disp = r.display[circuit];
         const std::uint32_t magh = (static_cast<std::uint32_t>(disp >> 23) & 0xFu) + 1, magv = (static_cast<std::uint32_t>(disp >> 27) & 3u) + 1;
         const std::uint32_t w = ((static_cast<std::uint32_t>(disp >> 32) & 0xFFFu) + 1) / magh, h = ((static_cast<std::uint32_t>(disp >> 44) & 0x7FFu) + 1) / magv;
         if (!w || !h || w > 2048 || h > 2048) return false;
         const gpu::DisplaySource src{(static_cast<std::uint32_t>(fb) & 0x1FFu) * 32, static_cast<std::uint32_t>(fb >> 9) & 0x3Fu, static_cast<std::uint32_t>(fb >> 15) & 0x1Fu,
-                                     static_cast<std::uint32_t>(fb >> 32) & 0x7FFu, static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, w, h, (g_smode2 & 3u) == 3u};
+                                     static_cast<std::uint32_t>(fb >> 32) & 0x7FFu, static_cast<std::uint32_t>(fb >> 43) & 0x7FFu, w, h, (r.smode2 & 3u) == 3u};
         got = gpu::display_async(src, rgba, width, height);
     } else
 #endif
-        got = display(rgba, width, height);
+        got = display(r, rgba, width, height);
     if (!got) return false;
     if (previous.size() != rgba.size()) {
         previous = rgba;
         return true;
     }
     static const bool weave_off = std::getenv("PS2_NO_DEINTERLACE") != nullptr;
-    const bool blend = (g_smode2 & 3u) == 3u && !weave_off;
+    const bool blend = (r.smode2 & 3u) == 3u && !weave_off;
     for (std::size_t i = 0; i < rgba.size(); ++i) {
         const std::uint32_t c = rgba[i];
         if (blend) rgba[i] = (c & previous[i]) + (((c ^ previous[i]) & 0xFEFEFEFEu) >> 1);
         previous[i] = c;
     }
     return true;
+}
+
+std::atomic<std::uint32_t> g_presented{0};
+std::uint32_t g_posted_presents = 0;
+
+void start_thread() { queue::start(32u << 20); }
+
+void post_present() {
+    const DisplayRegs regs = display_regs();
+    queue::post(queue::kPresent, 0, 0, &regs, sizeof regs);
+    ++g_posted_presents;
+    for (std::uint32_t done = g_presented.load(); g_posted_presents - done > 2; done = g_presented.load()) queue::wait(g_presented, done);
+}
+
+bool render_pending(const std::function<void(const DisplayRegs &)> &on_present) {
+    queue::Header h;
+    const std::uint8_t *payload = nullptr;
+    while (queue::peek(h, payload)) {
+        bool presented = false;
+        switch (h.type) {
+        case queue::kGif: gif::render(static_cast<int>(h.arg0), payload, h.arg1); break;
+        case queue::kGifReset: gif::render_reset(); break;
+        case queue::kReset: render_reset(); break;
+        case queue::kVertexReset: g_state.count = 0; break;
+        case queue::kVblank:
+#ifdef PS2_GPU
+            if (gpu_on()) gpu::flush();
+#endif
+            break;
+        case queue::kPresent: {
+            DisplayRegs regs;
+            std::memcpy(&regs, payload, sizeof regs);
+            on_present(regs);
+            presented = true;
+            break;
+        }
+        case queue::kDownload: {
+            std::uintptr_t target;
+            std::memcpy(&target, payload, sizeof target);
+            render_read_image(reinterpret_cast<std::uint8_t *>(target), h.arg0);
+            g_downloads.fetch_add(1);
+            queue::notify(g_downloads);
+            break;
+        }
+        default: break;
+        }
+        queue::pop(h);
+        if (presented) {
+            g_presented.fetch_add(1);
+            queue::notify(g_presented);
+            return true;
+        }
+    }
+    return false;
 }
 
 std::uint64_t primitives_drawn() { return g_primitives; }

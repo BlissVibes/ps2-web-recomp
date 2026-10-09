@@ -44,15 +44,22 @@ std::uint8_t *target(std::uint32_t address) {
 
 void deliver(int ch, std::uint32_t address, std::uint32_t qwc) {
     if (!qwc) return;
-    std::vector<std::uint8_t> buffer(static_cast<std::size_t>(qwc) * 16);
-    for (std::uint32_t i = 0; i < qwc; ++i) std::memcpy(buffer.data() + i * 16, source(address + i * 16), 16);
+    static std::vector<std::uint8_t> buffer;
+    const std::size_t bytes = static_cast<std::size_t>(qwc) * 16;
+    const std::size_t room = (address & 0x80000000u) ? kScratchpadSize - (address & (kScratchpadSize - 1)) : kRamSize - (address & (kRamSize - 16));
+    const std::uint8_t *data = source(address);
+    if (bytes > room || ch == 9) {
+        buffer.resize(bytes);
+        for (std::uint32_t i = 0; i < qwc; ++i) std::memcpy(buffer.data() + i * 16, source(address + i * 16), 16);
+        data = buffer.data();
+    }
     switch (ch) {
-    case 0: vif::transfer(0, buffer.data(), qwc); break;
-    case 1: vif::transfer(1, buffer.data(), qwc); break;
-    case 2: gif::transfer(3, buffer.data(), qwc); break;
+    case 0: vif::transfer(0, data, qwc); break;
+    case 1: vif::transfer(1, data, qwc); break;
+    case 2: gif::transfer(3, data, qwc); break;
     case 9:
         for (std::uint32_t i = 0; i < qwc; ++i)
-            std::memcpy(g_spr + ((g_ch[9].sadr + i * 16) & (kScratchpadSize - 1)), buffer.data() + i * 16, 16);
+            std::memcpy(g_spr + ((g_ch[9].sadr + i * 16) & (kScratchpadSize - 1)), data + i * 16, 16);
         g_ch[9].sadr = (g_ch[9].sadr + qwc * 16) & (kScratchpadSize - 1);
         break;
     default:

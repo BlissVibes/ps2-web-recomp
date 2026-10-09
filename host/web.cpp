@@ -2,8 +2,11 @@
 #include "ps2/system.hpp"
 
 #include <emscripten.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <list>
@@ -14,25 +17,32 @@
 void register_generated_code();
 void register_generated_vu();
 
-EM_ASYNC_JS(int, ps2web_fetch, (double offset, int size, void *out), {
+EM_JS_DEPS(ps2web, "$stringToNewUTF8,$UTF8ToString");
+
+EM_JS(int, ps2web_fetch, (const char *url, double offset, int size, void *out), {
+    const target = UTF8ToString(url);
     for (let attempt = 0; attempt < 4; ++attempt) {
         try {
-            const response = await fetch(Module.discUrl, {headers: {Range: 'bytes=' + offset + '-' + (offset + size - 1)}});
-            if (response.status !== 206 && response.status !== 200) continue;
-            const bytes = new Uint8Array(await response.arrayBuffer());
+            const xhr = new XMLHttpRequest();
+            xhr.open('GET', target, false);
+            xhr.responseType = 'arraybuffer';
+            xhr.setRequestHeader('Range', 'bytes=' + offset + '-' + (offset + size - 1));
+            xhr.send();
+            if (xhr.status !== 206 && xhr.status !== 200) continue;
+            let bytes = new Uint8Array(xhr.response);
+            if (xhr.status === 200) bytes = bytes.subarray(offset, offset + size);
             const length = Math.min(bytes.length, size);
             HEAPU8.set(bytes.subarray(0, length), out);
             return length;
         } catch (e) {
-            console.warn('disc fetch failed', e);
+            console.warn('disc read failed', e);
         }
     }
     return 0;
 });
 
 EM_JS(double, ps2web_disc_size, (), { return Module.discSize || 0; });
-EM_JS(void, ps2web_audio, (const std::int16_t *samples, int frames), { Module.pushAudio(HEAP16.subarray(samples >> 1, (samples >> 1) + frames * 2)); });
-EM_JS(double, ps2web_audio_queued_ms, (), { return Module.audioQueuedMs ? Module.audioQueuedMs() : 0; });
+EM_JS(char *, ps2web_disc_url, (), { return stringToNewUTF8(new URL(Module.discUrl, location.href).href); });
 EM_JS(void, ps2web_frame_done, (), { if (Module.onFrame) Module.onFrame(); });
 EM_JS(void, ps2web_blit, (const std::uint32_t *rgba, int width, int height), {
     const canvas = Module.canvas;
@@ -52,20 +62,25 @@ EM_JS(void, ps2web_blit, (const std::uint32_t *rgba, int width, int height), {
     ctx.drawImage(Module.blitSource, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
 });
 
-EM_JS(void, ps2web_snapshot, (const std::uint32_t *rgba, int width, int height), {
-    const pixels = new Uint8ClampedArray(HEAPU8.buffer, rgba, width * height * 4).slice();
-    Module.snapshot = {width: width, height: height, pixels: pixels};
-    Module.wantSnapshot = false;
-});
-
 namespace {
 
 constexpr std::size_t kChunk = 1u << 20;
 constexpr std::size_t kCacheChunks = 64;
+constexpr std::uint32_t kAudioFrames = 1u << 14;
+
+struct AudioRing {
+    std::atomic<std::uint32_t> write{0}, read{0};
+    std::uint32_t capacity = kAudioFrames;
+    std::atomic<std::uint32_t> active{0};
+    std::int16_t samples[kAudioFrames * 2];
+};
+
+AudioRing g_audio;
 
 std::unordered_map<std::uint64_t, std::list<std::pair<std::uint64_t, std::vector<std::uint8_t>>>::iterator> g_chunks;
 std::list<std::pair<std::uint64_t, std::vector<std::uint8_t>>> g_lru;
 std::uint64_t g_disc_size = 0;
+char *g_disc_url = nullptr;
 
 const std::vector<std::uint8_t> *chunk(std::uint64_t index) {
     auto it = g_chunks.find(index);
@@ -76,7 +91,7 @@ const std::vector<std::uint8_t> *chunk(std::uint64_t index) {
     const std::uint64_t offset = index * kChunk;
     const std::size_t size = static_cast<std::size_t>(std::min<std::uint64_t>(kChunk, g_disc_size - offset));
     std::vector<std::uint8_t> data(size);
-    if (ps2web_fetch(static_cast<double>(offset), static_cast<int>(size), data.data()) <= 0) return nullptr;
+    if (ps2web_fetch(g_disc_url, static_cast<double>(offset), static_cast<int>(size), data.data()) <= 0) return nullptr;
     if (g_lru.size() >= kCacheChunks) {
         g_chunks.erase(g_lru.back().first);
         g_lru.pop_back();
@@ -101,38 +116,57 @@ std::size_t read_disc(std::uint64_t offset, void *out, std::size_t size) {
     return done;
 }
 
-bool g_window_tried = false, g_window = false, g_copy = false;
-std::vector<std::uint32_t> g_frame;
+void push_audio(const std::int16_t *samples, std::size_t frames) {
+    std::uint32_t write = g_audio.write.load(std::memory_order_relaxed);
+    const std::uint32_t read = g_audio.read.load(std::memory_order_acquire);
+    for (std::size_t i = 0; i < frames && write - read < kAudioFrames; ++i, ++write) {
+        const std::uint32_t at = (write & (kAudioFrames - 1)) * 2;
+        g_audio.samples[at] = samples[i * 2];
+        g_audio.samples[at + 1] = samples[i * 2 + 1];
+    }
+    g_audio.write.store(write, std::memory_order_release);
+}
+
+double audio_queued_ms() { return static_cast<double>(g_audio.write.load() - g_audio.read.load()) / 48.0; }
+
+double g_next_frame = 0.0;
+std::atomic<double> g_emulation_idle{0.0}, g_render_idle{0.0};
+
+void pace() {
+    ps2::post_present();
+    if (g_audio.active.load()) {
+        while (audio_queued_ms() > 80.0) usleep(1000);
+        g_next_frame = 0.0;
+        return;
+    }
+    const double period = ps2::g_options.pal ? 20.0 : 1000.0 / 59.94;
+    const double now = emscripten_get_now();
+    if (g_next_frame == 0.0 || now - g_next_frame > 200.0) g_next_frame = now;
+    g_next_frame += period;
+    if (g_next_frame > now) usleep(static_cast<useconds_t>((g_next_frame - now) * 1000.0));
+}
 
 void on_vblank() {
-    if (!g_window_tried) {
-        g_window_tried = true;
-        const bool no_surface = EM_ASM_INT({ return Module.noSurface ? 1 : 0; });
-        g_copy = EM_ASM_INT({ return Module.presentCopy ? 1 : 0; });
-        if (!g_copy && !no_surface) {
-            ps2::WindowTarget target;
-            target.kind = ps2::WindowTarget::Canvas;
-            target.selector = "#canvas";
-            target.width = static_cast<std::uint32_t>(EM_ASM_INT({ return Module.canvas.width; }));
-            target.height = static_cast<std::uint32_t>(EM_ASM_INT({ return Module.canvas.height; }));
-            g_window = ps2::attach_window(target);
-        }
-        g_copy = g_copy || (!g_window && !no_surface);
-        std::fprintf(stderr, "[web] %s\n", g_window ? "presenting through WebGPU" : g_copy ? "presenting through a 2D canvas copy" : "not presenting");
+    const double start = emscripten_get_now();
+    pace();
+    g_emulation_idle.store(g_emulation_idle.load() + emscripten_get_now() - start);
+}
+
+struct Launch {
+    std::vector<std::string> args;
+};
+
+void *emulate(void *data) {
+    const Launch &launch = *static_cast<const Launch *>(data);
+    if (g_disc_size && !ps2::disc::open("disc", g_disc_size, read_disc)) std::fprintf(stderr, "[web] cannot read the disc image\n");
+    std::uint32_t entry = 0;
+    if (!ps2::load_elf("/game/core.elf", entry)) {
+        std::fprintf(stderr, "cannot load the game executable\n");
+        return nullptr;
     }
-    if (g_window) ps2::present_frame();
-    std::uint32_t w = 0, h = 0;
-    if (g_copy && ps2::copy_frame(g_frame, w, h)) ps2web_blit(g_frame.data(), static_cast<int>(w), static_cast<int>(h));
-    if (EM_ASM_INT({ return Module.wantSnapshot ? 1 : 0; })) {
-        std::vector<std::uint32_t> rgba;
-        std::uint32_t w = 0, h = 0;
-        if (ps2::display_frame(rgba, w, h)) {
-            ps2web_snapshot(rgba.data(), static_cast<int>(w), static_cast<int>(h));
-        }
-    }
-    ps2web_frame_done();
-    ps2::browser_yield();
-    while (ps2web_audio_queued_ms() > 80.0) emscripten_sleep(2);
+    ps2::boot(entry, launch.args);
+    ps2::run();
+    return nullptr;
 }
 
 }
@@ -152,16 +186,15 @@ extern "C" EMSCRIPTEN_KEEPALIVE void ps2web_resize(int width, int height) {
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_gpu_ms() { return ps2::gpu_busy_ms(); }
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_frames() { return static_cast<double>(ps2::frames_run()); }
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_primitives() { return static_cast<double>(ps2::primitives_drawn()); }
+extern "C" EMSCRIPTEN_KEEPALIVE void *ps2web_audio_ring() { return &g_audio; }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_audio_queued_ms() { return audio_queued_ms(); }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_idle_ms(int render) { return render ? g_render_idle.load() : g_emulation_idle.load(); }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        std::fprintf(stderr, "usage: ps2web <elf> [--arg text]...\n");
-        return 1;
-    }
-    std::vector<std::string> args;
+    static Launch launch;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
-        if (a == "--arg" && i + 1 < argc) args.push_back(argv[++i]);
+        if (a == "--arg" && i + 1 < argc) launch.args.push_back(argv[++i]);
         else if (a == "--frames" && i + 1 < argc) ps2::g_options.max_frames = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--press" && i + 1 < argc) {
             ps2::Press press;
@@ -169,16 +202,48 @@ int main(int argc, char **argv) {
         }
     }
     g_disc_size = static_cast<std::uint64_t>(ps2web_disc_size());
-    if (g_disc_size && !ps2::disc::open("disc", g_disc_size, read_disc)) std::fprintf(stderr, "[web] cannot read the disc image\n");
+    g_disc_url = ps2web_disc_url();
     ps2::g_options.on_vblank = on_vblank;
-    ps2::set_audio_sink([](const std::int16_t *samples, std::size_t frames) { ps2web_audio(samples, static_cast<int>(frames)); });
+    ps2::set_audio_sink(push_audio);
     register_generated_code();
     register_generated_vu();
-    std::uint32_t entry = 0;
-    if (!ps2::load_elf(argv[1], entry)) {
-        std::fprintf(stderr, "cannot load %s\n", argv[1]);
+
+    ps2::init_graphics();
+    const bool no_surface = EM_ASM_INT({ return Module.noSurface ? 1 : 0; });
+    bool copy = EM_ASM_INT({ return Module.presentCopy ? 1 : 0; });
+    bool surface = false;
+    if (!copy && !no_surface) {
+        ps2::WindowTarget target;
+        target.kind = ps2::WindowTarget::Canvas;
+        target.selector = "#canvas";
+        target.width = static_cast<std::uint32_t>(EM_ASM_INT({ return Module.canvas.width; }));
+        target.height = static_cast<std::uint32_t>(EM_ASM_INT({ return Module.canvas.height; }));
+        surface = ps2::attach_window(target);
+    }
+    copy = copy || (!surface && !no_surface);
+    std::fprintf(stderr, "[web] %s\n", surface ? "presenting through WebGPU" : copy ? "presenting through a 2D canvas copy" : "not presenting");
+
+    ps2::start_render_thread();
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 16u << 20);
+    pthread_t thread;
+    if (pthread_create(&thread, &attr, emulate, &launch) != 0) {
+        std::fprintf(stderr, "[web] cannot start the emulation thread\n");
         return 1;
     }
-    ps2::boot(entry, args);
-    return ps2::run();
+    const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> blit = [](const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height) {
+        ps2web_blit(rgba, static_cast<int>(width), static_cast<int>(height));
+    };
+    const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> none;
+    for (;;) {
+        if (ps2::render_pending(surface, copy ? blit : none)) {
+            ps2web_frame_done();
+            ps2::browser_yield();
+        } else {
+            const double start = emscripten_get_now();
+            ps2::wait_render_work(50);
+            g_render_idle.store(g_render_idle.load() + emscripten_get_now() - start);
+        }
+    }
 }

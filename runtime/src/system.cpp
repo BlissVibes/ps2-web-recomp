@@ -2,6 +2,7 @@
 #include "gs/gif.hpp"
 #include "vif.hpp"
 #include "gs/gs.hpp"
+#include "gs/queue.hpp"
 #include "hw.hpp"
 #include "iop/iop.hpp"
 #include "iop/sif.hpp"
@@ -281,6 +282,23 @@ bool display_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::
 bool attach_window(const WindowTarget &t) { return gs::attach_window(static_cast<int>(t.kind), t.display, t.window, t.surface, t.selector, t.width, t.height); }
 void resize_window(std::uint32_t width, std::uint32_t height) { gs::resize_window(width, height); }
 bool present_frame() { return gs::present(); }
+void init_graphics() { gs::init(); }
+void start_render_thread() { gs::start_thread(); }
+void post_present() { gs::post_present(); }
+
+bool render_pending(bool surface, const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> &copy) {
+    static std::vector<std::uint32_t> frame;
+    return gs::render_pending([&](const gs::DisplayRegs &regs) {
+        if (surface) {
+            gs::present(regs);
+            return;
+        }
+        std::uint32_t width = 0, height = 0;
+        if (copy && gs::copy_frame(regs, frame, width, height)) copy(frame.data(), width, height);
+    });
+}
+
+void wait_render_work(int timeout_ms) { gs::queue::wait_for_work(timeout_ms); }
 bool copy_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) { return gs::copy_frame(rgba, width, height); }
 
 bool parse_press(const std::string &spec, Press &press) {

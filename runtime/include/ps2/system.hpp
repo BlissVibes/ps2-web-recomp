@@ -84,6 +84,11 @@ struct WindowTarget {
 bool attach_window(const WindowTarget &target);
 void resize_window(std::uint32_t width, std::uint32_t height);
 bool present_frame();
+void init_graphics();
+void start_render_thread();
+void post_present();
+bool render_pending(bool surface, const std::function<void(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height)> &copy);
+void wait_render_work(int timeout_ms);
 // Latest frame for hosts that draw it themselves, fields blended; may lag a frame and is false while none is ready.
 bool copy_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 // Parses "frame:button[+button][:frames]" as used by --press.
