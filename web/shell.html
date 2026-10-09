@@ -56,6 +56,14 @@
     border-radius: 50%; background: var(--ctl-on); border: 1px solid var(--ctl-line);
   }
   body.touch.hide-controls .controls { display: none; }
+  #exit-fullscreen {
+    display: none; position: fixed; z-index: 3; top: calc(8px + env(safe-area-inset-top)); right: calc(8px + env(safe-area-inset-right));
+    padding: 4px 10px; font-size: 12px; background: rgba(255, 255, 255, 0.15); opacity: 0.4;
+  }
+  #exit-fullscreen:hover { opacity: 0.9; }
+  body.fullscreen { background: #000; }
+  body.fullscreen #bar { display: none; }
+  body.fullscreen #exit-fullscreen { display: block; }
   @media (orientation: landscape) {
     body.touch #stage { flex: 1; aspect-ratio: auto; max-height: none; }
     body.touch .controls { position: fixed; inset: 0; display: block; padding: 0; pointer-events: none; z-index: 1;
@@ -67,6 +75,8 @@
     body.touch .dpad { width: 105px; height: 105px; grid-template-columns: repeat(3, 35px); grid-template-rows: repeat(3, 35px); }
     body.touch .stick { width: 105px; height: 105px; }
     body.touch .face { grid-template-columns: repeat(3, 44px); grid-template-rows: repeat(3, 44px); }
+    body.fullscreen.touch .cluster { bottom: calc(8px + env(safe-area-inset-bottom)); }
+    body.fullscreen.touch .cluster.mid { bottom: calc(8px + env(safe-area-inset-bottom)); }
   }
 </style>
 </head>
@@ -101,7 +111,9 @@
     <option value="2">1280×1024</option>
     <option value="3">1920×1536</option>
   </select>
-  <button id="controls-toggle" type="button" hidden>Hide controls</button></div>
+  <button id="controls-toggle" type="button" hidden>Hide controls</button>
+  <button id="fullscreen" type="button" title="Fullscreen (F or double click)">Fullscreen</button></div>
+<button id="exit-fullscreen" type="button">Exit fullscreen</button>
 <div id="overlay"><div id="panel"><p id="help" hidden></p><button id="start" disabled>Loading…</button></div></div>
 <script>
 const statusEl = document.getElementById('status');
@@ -220,6 +232,48 @@ function fitCanvas() {
   }
 }
 window.addEventListener('resize', fitCanvas);
+
+const fullscreenButton = document.getElementById('fullscreen');
+const root = document.documentElement;
+const requestFullscreen = root.requestFullscreen || root.webkitRequestFullscreen;
+const exitFullscreen = document.exitFullscreen || document.webkitExitFullscreen;
+const nativeFullscreen = () => document.fullscreenElement || document.webkitFullscreenElement;
+let fullscreen = false;
+function setFullscreen(on) {
+  fullscreen = on;
+  document.body.classList.toggle('fullscreen', on);
+  fullscreenButton.textContent = on ? 'Exit fullscreen' : 'Fullscreen';
+  fitCanvas();
+}
+function toggleFullscreen() {
+  if (fullscreen) {
+    if (nativeFullscreen() && exitFullscreen) exitFullscreen.call(document);
+    setFullscreen(false);
+    return;
+  }
+  setFullscreen(true);
+  if (!requestFullscreen) return;
+  const result = requestFullscreen.call(root, { navigationUI: 'hide' });
+  if (result && result.then) {
+    result.then(() => {
+      if (document.body.classList.contains('touch') && screen.orientation && screen.orientation.lock) screen.orientation.lock('landscape').catch(() => {});
+    }).catch(() => {});
+  }
+}
+function onFullscreenChange() {
+  if (!nativeFullscreen() && fullscreen && requestFullscreen) setFullscreen(false);
+  else fitCanvas();
+}
+document.addEventListener('fullscreenchange', onFullscreenChange);
+document.addEventListener('webkitfullscreenchange', onFullscreenChange);
+fullscreenButton.addEventListener('click', toggleFullscreen);
+document.getElementById('exit-fullscreen').addEventListener('click', toggleFullscreen);
+canvas.addEventListener('dblclick', toggleFullscreen);
+window.addEventListener('keydown', (e) => {
+  if (e.code !== 'KeyF' || e.repeat || e.target.tagName === 'SELECT') return;
+  e.preventDefault();
+  toggleFullscreen();
+});
 
 const workletSource = `
 class Output extends AudioWorkletProcessor {
