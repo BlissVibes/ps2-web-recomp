@@ -34,8 +34,6 @@ constexpr std::uint32_t kClutSlots = 2048;
 constexpr std::uint32_t kClutEntries = 512;
 constexpr std::uint32_t kPrimWords = 40;
 constexpr std::uint32_t kSetupWords = 24;
-constexpr int kTileShift = 4;
-constexpr int kTilesPerRow = 2048 >> kTileShift;
 
 Mode g_mode = Mode::off;
 std::uint64_t g_dispatches[kPipelines] = {}, g_submits = 0;
@@ -146,7 +144,8 @@ bool uploads_overlap(const PreOp &a, const PreOp &b) {
 std::vector<PreOp> g_pre;
 std::vector<Range> g_batch_reads;
 
-std::vector<std::uint32_t> g_tile_count(kTilesPerRow * kTilesPerRow), g_tile_fill(kTilesPerRow * kTilesPerRow);
+int g_tile = 16, g_tiles_per_row = 128;
+std::vector<std::uint32_t> g_tile_count(128 * 128), g_tile_fill(128 * 128);
 std::vector<std::uint32_t> g_touched;
 
 WGPUStringView view(const char *s) { return WGPUStringView{s, WGPU_STRLEN}; }
@@ -230,11 +229,11 @@ void flush_batch() {
     g_touched.clear();
     for (std::uint32_t i = 0; i < prims; ++i) {
         const std::uint32_t lo = b.boxes[i * 2], hi = b.boxes[i * 2 + 1];
-        const int tx0 = static_cast<int>(lo & 0xFFFFu) >> kTileShift, ty0 = static_cast<int>(lo >> 16) >> kTileShift;
-        const int tx1 = static_cast<int>(hi & 0xFFFFu) >> kTileShift, ty1 = static_cast<int>(hi >> 16) >> kTileShift;
+        const int tx0 = static_cast<int>(lo & 0xFFFFu) / g_tile, ty0 = static_cast<int>(lo >> 16) / g_tile;
+        const int tx1 = static_cast<int>(hi & 0xFFFFu) / g_tile, ty1 = static_cast<int>(hi >> 16) / g_tile;
         for (int ty = ty0; ty <= ty1; ++ty)
             for (int tx = tx0; tx <= tx1; ++tx) {
-                const std::uint32_t t = static_cast<std::uint32_t>(ty * kTilesPerRow + tx);
+                const std::uint32_t t = static_cast<std::uint32_t>(ty * g_tiles_per_row + tx);
                 if (!g_tile_count[t]++) g_touched.push_back(t);
             }
     }
@@ -251,7 +250,7 @@ void flush_batch() {
         const std::uint32_t t = g_touched[i];
         std::uint32_t *rec = g_arena.data() + tile_offset + i * 4;
         rec[3] = 0;
-        rec[0] = (t % kTilesPerRow) | ((t / kTilesPerRow) << 16);
+        rec[0] = (t % static_cast<std::uint32_t>(g_tiles_per_row)) | ((t / static_cast<std::uint32_t>(g_tiles_per_row)) << 16);
         rec[1] = cursor;
         rec[2] = g_tile_count[t];
         g_tile_fill[t] = cursor;
@@ -259,10 +258,10 @@ void flush_batch() {
     }
     for (std::uint32_t i = 0; i < prims; ++i) {
         const std::uint32_t lo = b.boxes[i * 2], hi = b.boxes[i * 2 + 1];
-        const int tx0 = static_cast<int>(lo & 0xFFFFu) >> kTileShift, ty0 = static_cast<int>(lo >> 16) >> kTileShift;
-        const int tx1 = static_cast<int>(hi & 0xFFFFu) >> kTileShift, ty1 = static_cast<int>(hi >> 16) >> kTileShift;
+        const int tx0 = static_cast<int>(lo & 0xFFFFu) / g_tile, ty0 = static_cast<int>(lo >> 16) / g_tile;
+        const int tx1 = static_cast<int>(hi & 0xFFFFu) / g_tile, ty1 = static_cast<int>(hi >> 16) / g_tile;
         for (int ty = ty0; ty <= ty1; ++ty)
-            for (int tx = tx0; tx <= tx1; ++tx) g_arena[g_tile_fill[static_cast<std::uint32_t>(ty * kTilesPerRow + tx)]++] = i;
+            for (int tx = tx0; tx <= tx1; ++tx) g_arena[g_tile_fill[static_cast<std::uint32_t>(ty * g_tiles_per_row + tx)]++] = i;
     }
     for (std::uint32_t t : g_touched) g_tile_count[t] = 0;
     const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles});
@@ -688,6 +687,10 @@ bool init(Mode m) {
 
     if (const char *scale = std::getenv("PS2_SCALE")) g_scale = std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::atoi(scale)), 1u, 3u);
     g_copy_words = (1u << 20) * g_scale * g_scale;
+    g_tile = 16 / static_cast<int>(g_scale);
+    g_tiles_per_row = (2048 + g_tile - 1) / g_tile;
+    g_tile_count.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row, 0);
+    g_tile_fill.assign(static_cast<std::size_t>(g_tiles_per_row) * g_tiles_per_row, 0);
     g_field_words = (1u << 19) * g_scale * g_scale;
     g_vram = make_buffer(static_cast<std::uint64_t>(kMemorySize) * g_scale * g_scale, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
     std::vector<std::uint32_t> tables;
@@ -977,6 +980,18 @@ void flush() {
     if (g_mode == Mode::off) return;
     flush_all();
     submit();
+}
+
+void wait_idle() {
+    flush_all();
+    submit();
+    bool done = false;
+    WGPUQueueWorkDoneCallbackInfo cb = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
+    cb.mode = WGPUCallbackMode_AllowProcessEvents;
+    cb.callback = [](WGPUQueueWorkDoneStatus, WGPUStringView, void *flag, void *) { *static_cast<bool *>(flag) = true; };
+    cb.userdata1 = &done;
+    wgpuQueueOnSubmittedWorkDone(g_queue, cb);
+    wait_until(done);
 }
 
 void download(std::uint8_t *memory) {

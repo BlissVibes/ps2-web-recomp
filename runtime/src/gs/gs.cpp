@@ -825,6 +825,12 @@ bool copy_frame(const DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uin
 std::atomic<std::uint32_t> g_presented{0};
 std::uint32_t g_posted_presents = 0;
 
+void flush_and_wait() {
+#ifdef PS2_GPU
+    if (gpu_on()) gpu::wait_idle();
+#endif
+}
+
 void start_thread() { queue::render().start(32u << 20); }
 
 void post_present() {

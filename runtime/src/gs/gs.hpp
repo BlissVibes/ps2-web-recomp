@@ -75,6 +75,7 @@ void resize_window(std::uint32_t width, std::uint32_t height);
 bool present();
 bool present(const DisplayRegs &regs);
 void start_thread();
+void flush_and_wait();
 void post_present();
 bool render_pending(const std::function<void(const DisplayRegs &)> &on_present);
 double gpu_busy_ms();

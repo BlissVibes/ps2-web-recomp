@@ -103,8 +103,25 @@ void apply_presses() {
     iop::sio2::set_buttons(0, mask);
 }
 
+void time_frames() {
+    static const char *spec = std::getenv("PS2_TIME");
+    if (!spec) return;
+    static const std::uint64_t from = std::strtoull(spec, nullptr, 10);
+    static const std::uint64_t count = std::strchr(spec, ',') ? std::strtoull(std::strchr(spec, ',') + 1, nullptr, 10) : 500;
+    static std::chrono::steady_clock::time_point start;
+    if (g_frames == from) {
+        gs::flush_and_wait();
+        start = std::chrono::steady_clock::now();
+    } else if (g_frames == from + count) {
+        gs::flush_and_wait();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        std::fprintf(stderr, "[time] frames %llu-%llu: %.2f ms per frame\n", static_cast<unsigned long long>(from), static_cast<unsigned long long>(from + count), ms / static_cast<double>(count));
+    }
+}
+
 void vblank() {
     ++g_frames;
+    time_frames();
     apply_presses();
     if (g_options.on_vblank) g_options.on_vblank();
     if (g_options.trace_iop_modules && g_frames % 25 == 0) std::fprintf(stderr, "[frame] %llu prims %llu\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(gs::primitives_drawn()));

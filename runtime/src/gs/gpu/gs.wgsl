@@ -10,6 +10,8 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> scratch: array<u32>;
 
 override SCALE: u32 = 1u;
+override TILE: u32 = 16u / SCALE;
+override WG: u32 = TILE * SCALE;
 
 const PSMCT32: u32 = 0x00u;
 const PSMCT24: u32 = 0x01u;
@@ -809,14 +811,6 @@ fn z_at(p: u32, d: f32) -> u32 {
     return z0 - u32(min(-step, f32(z0)));
 }
 
-fn shade(p: u32, s: Setup, x: i32, y: i32) {
-    for (var k = 0u; k < SCALE * SCALE; k = k + 1u) {
-        let px = f32(x) + f32(k % SCALE) / f32(SCALE);
-        let py = f32(y) + f32(k / SCALE) / f32(SCALE);
-        shade_at(p, s, x, y, k, px, py);
-    }
-}
-
 fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
     let kind = data[p + 1u];
     var at: Attr;
@@ -920,15 +914,18 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     scratch[i] = atomicLoad(&vram[i * SCALE * SCALE]);
 }
 
-@compute @workgroup_size(16, 16)
+@compute @workgroup_size(WG, WG)
 fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let tile = prm(0u) + (wid.x + wid.y * 1024u) * 4u;
     if (wid.x + wid.y * 1024u >= prm(3u)) {
         return;
     }
     let origin = data[tile];
-    let x = i32((origin & 0xFFFFu) * 16u + lid.x);
-    let y = i32((origin >> 16u) * 16u + lid.y);
+    let x = i32((origin & 0xFFFFu) * TILE + lid.x / SCALE);
+    let y = i32((origin >> 16u) * TILE + lid.y / SCALE);
+    let k = (lid.y % SCALE) * SCALE + lid.x % SCALE;
+    let px = f32(x) + f32(lid.x % SCALE) / f32(SCALE);
+    let py = f32(y) + f32(lid.y % SCALE) / f32(SCALE);
     let list = data[tile + 1u];
     let count = data[tile + 2u];
     let prims = prm(1u);
@@ -947,6 +944,6 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
             s = load_setup(setups + si * SETUP_WORDS);
             last_setup = si;
         }
-        shade(p, s, x, y);
+        shade_at(p, s, x, y, k, px, py);
     }
 }
