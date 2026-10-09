@@ -1,13 +1,22 @@
 #!/bin/bash
-# Builds the web version of a recompiled game into build/web.
+# Builds the web version of a recompiled game into build/web-<game>.
 # usage: scripts/build_web.sh <game folder under games/> [emsdk dir]
 set -e
 here=$(cd "$(dirname "$0")/.." && pwd)
 game=${1:-gt4}
-emsdk=${2:-${EMSDK:-$here/../webGame/tools/emsdk}}
+emsdk=${2:-${EMSDK:-$here/tools/emsdk}}
+out="$here/build/web-$game"
+boot=$(sed -n 's/^BOOT2 *= *//p' "$here/games/$game/disc/SYSTEM.CNF" | tr -d '\r')
+elf="$here/games/$game/core.elf"
+if [ ! -f "$elf" ]; then
+    name=${boot#*\\}
+    elf="$here/games/$game/disc/${name%;*}"
+fi
+mkdir -p "$out"
+printf '%s\n' "$boot" > "$out/boot.txt"
 source "$emsdk/emsdk_env.sh" > /dev/null 2>&1
-emcmake cmake -S "$here" -B "$here/build/web" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-    -DPS2_GENERATED="$here/generated/$game" -DPS2_WEB_ELF="$here/games/$game/core.elf"
-ninja -C "$here/build/web" ps2web
-gzip -kf9 "$here/build/web/ps2web.wasm" "$here/build/web/ps2web.data" "$here/build/web/ps2web.js"
-echo "built $here/build/web/ps2web.html; serve it with scripts/serve.py build/web games/$game/disc.iso"
+emcmake cmake -S "$here" -B "$out" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DPS2_GENERATED="$here/generated/$game" -DPS2_WEB_ELF="$elf" -DPS2_WEB_BOOT_FILE="$out/boot.txt"
+ninja -C "$out" ps2web
+gzip -kf9 "$out/ps2web.wasm" "$out/ps2web.data" "$out/ps2web.js"
+echo "built $out/ps2web.html; serve it with scripts/serve.py build/web-$game games/$game/disc.iso"

@@ -272,6 +272,18 @@ int main(int argc, char **argv) {
             if (ps2::parse_press(argv[++i], press)) ps2::g_options.presses.push_back(press);
         }
     }
+    if (launch.args.empty()) {
+        std::string boot = "/game/core.elf";
+        if (std::FILE *f = std::fopen("/game/boot.txt", "rb")) {
+            char text[256] = {};
+            const std::size_t n = std::fread(text, 1, sizeof text - 1, f);
+            std::fclose(f);
+            std::string line(text, n);
+            line.erase(line.find_last_not_of(" \r\n\t") + 1);
+            if (!line.empty()) boot = line;
+        }
+        launch.args.push_back(boot);
+    }
     g_disc_size = static_cast<std::uint64_t>(ps2web_disc_size());
     g_disc_url = ps2web_disc_url();
     ps2::g_options.on_vblank = on_vblank;
