@@ -757,11 +757,35 @@ void check_jit(ProgramFn compiled, ProgramFn jit) {
     if (escape >= 0) interpret(1, static_cast<std::uint32_t>(escape));
 }
 
+void run_entry(int unit, std::uint32_t pc);
+
+bool g_chaining = false;
+std::int64_t g_chained = -1;
+
 void interpret(int unit, std::uint32_t pc) {
     if (unit == 1 && g_capture) {
         *g_capture = pc;
         return;
     }
+    if (unit != 1) {
+        run_entry(unit, pc);
+        return;
+    }
+    if (g_chaining) {
+        g_chained = pc;
+        return;
+    }
+    g_chaining = true;
+    for (;;) {
+        run_entry(1, pc);
+        if (g_chained < 0) break;
+        pc = static_cast<std::uint32_t>(g_chained);
+        g_chained = -1;
+    }
+    g_chaining = false;
+}
+
+void run_entry(int unit, std::uint32_t pc) {
     static const bool interpret_only = std::getenv("PS2_VU_INTERPRET") != nullptr;
     static const bool count = std::getenv("PS2_VU_COUNT") != nullptr;
     static std::uint64_t compiled = 0, interpreted = 0;
