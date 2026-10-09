@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>ps2-web-recomp</title>
 <style>
   :root { color-scheme: dark; }
@@ -17,11 +17,84 @@
   #overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,.6); padding: 16px; }
   #panel { display: flex; flex-direction: column; align-items: center; gap: 14px; max-width: 520px; text-align: center; }
   #help { margin: 0; line-height: 1.5; color: #e8c37a; }
+  .controls { display: none; }
+  body.touch { overscroll-behavior: none; touch-action: none; -webkit-user-select: none; user-select: none; }
+  body.touch #stage { flex: none; width: 100%; aspect-ratio: 4 / 3; max-height: 60vh; }
+  body.touch .controls {
+    flex: 1; display: grid; grid-template-columns: 1fr 1fr; grid-template-areas: "mid mid" "left right";
+    gap: 10px 8px; align-content: center; padding: 8px 12px calc(8px + env(safe-area-inset-bottom));
+    touch-action: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+    --ctl: #1d2433; --ctl-on: #4a6aa5; --ctl-line: #34405a; --ctl-text: #dfe6f3;
+  }
+  .cluster { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+  .cluster.left { grid-area: left; } .cluster.right { grid-area: right; }
+  .cluster.mid { grid-area: mid; flex-direction: row; gap: 10px; justify-self: center; }
+  .shoulders { display: flex; gap: 8px; width: 100%; max-width: 160px; }
+  .ctl {
+    display: flex; align-items: center; justify-content: center; color: var(--ctl-text);
+    background: var(--ctl); border: 1px solid var(--ctl-line); font-weight: 600;
+  }
+  .ctl.on, .dpad span.on { background: var(--ctl-on); }
+  .shoulder { flex: 1; height: 38px; border-radius: 12px 12px 6px 6px; }
+  .small { padding: 0 12px; height: 30px; border-radius: 15px; font-size: 12px; font-weight: 500; }
+  .face { display: grid; grid-template-columns: repeat(3, 50px); grid-template-rows: repeat(3, 50px); }
+  .face .ctl { border-radius: 50%; font-size: 20px; }
+  .face .tri { grid-area: 1 / 2; } .face .sq { grid-area: 2 / 1; }
+  .face .ci { grid-area: 2 / 3; } .face .cr { grid-area: 3 / 2; }
+  .dpad { width: 120px; height: 120px; display: grid; grid-template-columns: repeat(3, 40px); grid-template-rows: repeat(3, 40px); }
+  .dpad span {
+    display: flex; align-items: center; justify-content: center; font-size: 14px;
+    color: var(--ctl-text); background: var(--ctl); border: 1px solid var(--ctl-line);
+  }
+  .dpad .up { grid-area: 1 / 2; border-radius: 8px 8px 0 0; } .dpad .down { grid-area: 3 / 2; border-radius: 0 0 8px 8px; }
+  .dpad .left { grid-area: 2 / 1; border-radius: 8px 0 0 8px; } .dpad .right { grid-area: 2 / 3; border-radius: 0 8px 8px 0; }
+  .dpad .hub { grid-area: 2 / 2; }
+  .stick { position: relative; width: 120px; height: 120px; border-radius: 50%; background: var(--ctl); border: 1px solid var(--ctl-line); }
+  .knob {
+    position: absolute; left: 50%; top: 50%; width: 52px; height: 52px; margin: -26px 0 0 -26px;
+    border-radius: 50%; background: var(--ctl-on); border: 1px solid var(--ctl-line);
+  }
+  body.touch.hide-controls .controls { display: none; }
+  @media (orientation: landscape) {
+    body.touch #stage { flex: 1; aspect-ratio: auto; max-height: none; }
+    body.touch .controls { position: fixed; inset: 0; display: block; padding: 0; pointer-events: none; z-index: 1;
+      --ctl: rgba(255, 255, 255, 0.12); --ctl-on: rgba(255, 255, 255, 0.45); --ctl-line: rgba(255, 255, 255, 0.28); --ctl-text: #fff; }
+    body.touch .cluster { position: absolute; top: 8px; bottom: 40px; justify-content: space-between; pointer-events: auto; opacity: 0.75; }
+    body.touch .cluster.left { left: calc(10px + env(safe-area-inset-left)); }
+    body.touch .cluster.right { right: calc(10px + env(safe-area-inset-right)); }
+    body.touch .cluster.mid { top: auto; bottom: 40px; left: 50%; transform: translateX(-50%); }
+    body.touch .dpad { width: 105px; height: 105px; grid-template-columns: repeat(3, 35px); grid-template-rows: repeat(3, 35px); }
+    body.touch .stick { width: 105px; height: 105px; }
+    body.touch .face { grid-template-columns: repeat(3, 44px); grid-template-rows: repeat(3, 44px); }
+  }
 </style>
 </head>
 <body>
 <div id="stage"><canvas id="canvas" tabindex="0"></canvas></div>
-<div id="bar"><span id="status">Loading…</span><span id="stats"></span></div>
+<div id="touch" class="controls" aria-hidden="true">
+  <div class="cluster left">
+    <div class="shoulders"><div class="ctl shoulder" data-btn="256">L2</div><div class="ctl shoulder" data-btn="1024">L1</div></div>
+    <div class="dpad" data-dpad>
+      <span class="up" data-dir="16">▲</span><span class="left" data-dir="128">◀</span><span class="hub"></span>
+      <span class="right" data-dir="32">▶</span><span class="down" data-dir="64">▼</span>
+    </div>
+    <div class="stick" data-stick><div class="knob" id="knob"></div></div>
+  </div>
+  <div class="cluster mid">
+    <div class="ctl small" data-btn="1">Select</div>
+    <div class="ctl small" data-btn="8">Start</div>
+  </div>
+  <div class="cluster right">
+    <div class="shoulders"><div class="ctl shoulder" data-btn="2048">R1</div><div class="ctl shoulder" data-btn="512">R2</div></div>
+    <div class="face">
+      <div class="ctl tri" data-btn="4096">△</div>
+      <div class="ctl sq" data-btn="32768">□</div>
+      <div class="ctl ci" data-btn="8192">○</div>
+      <div class="ctl cr" data-btn="16384">✕</div>
+    </div>
+  </div>
+</div>
+<div id="bar"><span id="status">Loading…</span><span id="stats"></span><button id="controls-toggle" type="button" hidden>Hide controls</button></div>
 <div id="overlay"><div id="panel"><p id="help" hidden></p><button id="start" disabled>Loading…</button></div></div>
 <script>
 const statusEl = document.getElementById('status');
@@ -29,8 +102,94 @@ const statsEl = document.getElementById('stats');
 const canvas = document.getElementById('canvas');
 const params = new URLSearchParams(location.search);
 
+function missingFeatures() {
+  const header = [0, 97, 115, 109, 1, 0, 0, 0, 1, 4, 1, 96, 0, 0, 3, 2, 1, 0, 10];
+  const accepts = (body) => {
+    try {
+      return WebAssembly.validate(new Uint8Array(header.concat([body.length + 2, 1, body.length], body)));
+    } catch (e) {
+      return false;
+    }
+  };
+  const missing = [];
+  if (!window.crossOriginIsolated) missing.push('cross-origin isolation (COOP and COEP headers)');
+  if (typeof WebAssembly.Suspending !== 'function') missing.push('WebAssembly JSPI');
+  if (!accepts([0, 0x1F, 0x40, 0, 0x0B, 0x0B])) missing.push('WebAssembly exception handling (try_table)');
+  if (!accepts([0, 0x12, 0, 0x0B])) missing.push('WebAssembly tail calls');
+  if (!accepts([0, 0xFD, 0x0C].concat(new Array(16).fill(0), [0x1A, 0x0B]))) missing.push('WebAssembly SIMD');
+  return missing;
+}
+const missing = missingFeatures();
+
+const touchRoot = document.getElementById('touch'), knob = document.getElementById('knob');
+let touchPad = { buttons: 0, x: 0, y: 0, stick: false };
+const fingers = new Map();
+if (matchMedia('(pointer: coarse)').matches || params.has('touch')) document.body.classList.add('touch');
+function circleOf(el) {
+  const r = el.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2, r: r.width / 2 };
+}
+function onTouch(e) {
+  e.preventDefault();
+  const seen = new Set();
+  let buttons = 0, sx = 0, sy = 0, stick = false;
+  for (const t of e.touches) {
+    seen.add(t.identifier);
+    let f = fingers.get(t.identifier);
+    if (!f) {
+      const start = document.elementFromPoint(t.clientX, t.clientY);
+      const region = start && start.closest('[data-stick],[data-dpad]');
+      f = region ? { kind: region.hasAttribute('data-stick') ? 'stick' : 'dpad', el: region } : { kind: 'button' };
+      fingers.set(t.identifier, f);
+    }
+    if (f.kind === 'stick') {
+      const c = circleOf(f.el);
+      let dx = (t.clientX - c.x) / c.r, dy = (t.clientY - c.y) / c.r;
+      const len = Math.hypot(dx, dy);
+      if (len > 1) { dx /= len; dy /= len; }
+      sx = dx; sy = dy; stick = true;
+      knob.style.transform = 'translate(' + (dx * c.r * 0.6) + 'px,' + (dy * c.r * 0.6) + 'px)';
+    } else if (f.kind === 'dpad') {
+      const d = circleOf(f.el), ox = t.clientX - d.x, oy = t.clientY - d.y;
+      if (Math.hypot(ox, oy) > d.r * 0.2) {
+        const angle = Math.atan2(oy, ox) * 180 / Math.PI;
+        if (angle > -67.5 && angle < 67.5) buttons |= 0x20;
+        if (angle > 22.5 && angle < 157.5) buttons |= 0x40;
+        if (angle > 112.5 || angle < -112.5) buttons |= 0x80;
+        if (angle > -157.5 && angle < -22.5) buttons |= 0x10;
+      }
+    } else {
+      const over = document.elementFromPoint(t.clientX, t.clientY);
+      const button = over && over.closest('[data-btn]');
+      if (button && touchRoot.contains(button)) buttons |= Number(button.dataset.btn);
+    }
+  }
+  for (const id of [...fingers.keys()]) if (!seen.has(id)) fingers.delete(id);
+  if (!stick) knob.style.transform = '';
+  touchPad = { buttons, x: sx, y: sy, stick };
+  touchRoot.querySelectorAll('[data-btn]').forEach((el) => el.classList.toggle('on', (buttons & Number(el.dataset.btn)) !== 0));
+  touchRoot.querySelectorAll('[data-dir]').forEach((el) => el.classList.toggle('on', (buttons & Number(el.dataset.dir)) !== 0));
+}
+for (const type of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) touchRoot.addEventListener(type, onTouch, { passive: false });
+
+const controlsButton = document.getElementById('controls-toggle');
+let hideControls = false;
+try { hideControls = localStorage.getItem('ps2web-hide-controls') === '1'; } catch (e) {}
+function updateControls() {
+  const touch = document.body.classList.contains('touch');
+  document.body.classList.toggle('hide-controls', hideControls);
+  controlsButton.hidden = !touch;
+  controlsButton.textContent = hideControls ? 'Show controls' : 'Hide controls';
+  fitCanvas();
+}
+controlsButton.addEventListener('click', () => {
+  hideControls = !hideControls;
+  try { localStorage.setItem('ps2web-hide-controls', hideControls ? '1' : '0'); } catch (e) {}
+  updateControls();
+});
+
 function fitCanvas() {
-  const ratio = window.devicePixelRatio || 1;
+  const ratio = Math.min(window.devicePixelRatio || 1, 2);
   const width = Math.max(1, Math.round(canvas.clientWidth * ratio));
   const height = Math.max(1, Math.round(canvas.clientHeight * ratio));
   if (canvas.width !== width || canvas.height !== height) {
@@ -99,11 +258,16 @@ const axis = (v) => Math.max(0, Math.min(255, Math.round((v + 1) * 127.5)));
 let lastPad = -1;
 function pollInput() {
   let buttons = 0, lx = 128, ly = 128, rx = 128, ry = 128;
+  buttons |= touchPad.buttons;
   for (const k of keys) if (k in keyMap) buttons |= 1 << keyMap[k];
   if (keys.has('KeyJ')) lx = 0;
   if (keys.has('KeyL')) lx = 255;
   if (keys.has('KeyI')) ly = 0;
   if (keys.has('KeyK')) ly = 255;
+  if (touchPad.stick) {
+    lx = axis(touchPad.x);
+    ly = axis(touchPad.y);
+  }
   for (const pad of navigator.getGamepads ? navigator.getGamepads() : []) {
     if (!pad) continue;
     for (const [index, bit] of padButtons) if (pad.buttons[index] && pad.buttons[index].pressed) buttons |= 1 << bit;
@@ -211,10 +375,7 @@ var Module = {
   setStatus: (text) => { if (text && !Module.gpuInfo) statusEl.textContent = text; },
   onRuntimeInitialized: () => {
     const start = document.getElementById('start');
-    if (!crossOriginIsolated) {
-      start.textContent = 'This page needs cross-origin isolation (COOP and COEP headers)';
-      return;
-    }
+    if (missing.length) return;
     start.disabled = false;
     start.textContent = 'Start';
   },
@@ -224,7 +385,7 @@ var Module = {
     Promise.all([fetch(Module.discUrl, { method: 'HEAD' }), chooseGpu().catch((e) => 'GPU check failed: ' + e)]).then(([r, gpu]) => {
       Module.discSize = Number(r.headers.get('content-length')) || 0;
       Module.gpuInfo = gpu;
-      if (Module.gpuHelp) {
+      if (Module.gpuHelp && !missing.length) {
         const help = document.getElementById('help');
         help.textContent = Module.gpuHelp;
         help.hidden = false;
@@ -254,6 +415,14 @@ var Module = {
   },
   noInitialRun: true,
 };
+
+updateControls();
+if (missing.length) {
+  const help = document.getElementById('help');
+  help.textContent = 'This browser cannot run the game yet. It lacks ' + missing.join(', ') + '. A current Chrome or Edge has everything it needs.';
+  help.hidden = false;
+  document.getElementById('start').textContent = 'Unsupported browser';
+}
 
 document.getElementById('start').addEventListener('click', async () => {
   document.getElementById('overlay').remove();
