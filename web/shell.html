@@ -228,7 +228,7 @@ function fitCanvas() {
   if (canvas.width !== width || canvas.height !== height) {
     canvas.width = width;
     canvas.height = height;
-    if (Module.calledRun && Module._ps2web_resize) Module._ps2web_resize(width, height);
+    if (Module.running && Module._ps2web_resize) Module._ps2web_resize(width, height);
   }
 }
 window.addEventListener('resize', fitCanvas);
@@ -515,6 +515,7 @@ document.getElementById('start').addEventListener('click', async () => {
   fitCanvas();
   await startAudio();
   statusEl.textContent = 'Running ' + Module.arguments[2] + ', ' + Module.gpuInfo;
+  Module.running = true;
   Module.callMain(Module.arguments);
 });
 </script>
