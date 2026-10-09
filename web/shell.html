@@ -88,7 +88,8 @@ async function startAudio() {
 const keys = new Set();
 const keyMap = { ArrowUp: 4, ArrowRight: 5, ArrowDown: 6, ArrowLeft: 7, KeyZ: 14, KeyX: 13, KeyA: 15, KeyS: 12,
                  KeyQ: 10, KeyW: 11, Digit1: 8, Digit2: 9, Enter: 3, Backspace: 0 };
-window.addEventListener('keydown', (e) => { if (e.code in keyMap) { keys.add(e.code); e.preventDefault(); } });
+const stickKeys = new Set(['KeyI', 'KeyJ', 'KeyK', 'KeyL']);
+window.addEventListener('keydown', (e) => { if (e.code in keyMap || stickKeys.has(e.code)) { keys.add(e.code); e.preventDefault(); } });
 window.addEventListener('keyup', (e) => { keys.delete(e.code); });
 const padButtons = [[0, 14], [1, 13], [2, 15], [3, 12], [4, 10], [5, 11], [6, 8], [7, 9], [8, 0], [9, 3], [10, 1], [11, 2],
                     [12, 4], [13, 6], [14, 7], [15, 5]];
@@ -96,11 +97,11 @@ const axis = (v) => Math.max(0, Math.min(255, Math.round((v + 1) * 127.5)));
 let lastPad = -1;
 function pollInput() {
   let buttons = 0, lx = 128, ly = 128, rx = 128, ry = 128;
-  for (const k of keys) buttons |= 1 << keyMap[k];
-  if (keys.has('ArrowLeft')) lx = 0;
-  if (keys.has('ArrowRight')) lx = 255;
-  if (keys.has('ArrowUp')) ly = 0;
-  if (keys.has('ArrowDown')) ly = 255;
+  for (const k of keys) if (k in keyMap) buttons |= 1 << keyMap[k];
+  if (keys.has('KeyJ')) lx = 0;
+  if (keys.has('KeyL')) lx = 255;
+  if (keys.has('KeyI')) ly = 0;
+  if (keys.has('KeyK')) ly = 255;
   for (const pad of navigator.getGamepads ? navigator.getGamepads() : []) {
     if (!pad) continue;
     for (const [index, bit] of padButtons) if (pad.buttons[index] && pad.buttons[index].pressed) buttons |= 1 << bit;
@@ -119,14 +120,21 @@ function pollInput() {
   }
 }
 
-// Some browsers cannot show a canvas drawn by another GPU (hybrid laptops on Linux), so each adapter draws a few test frames first.
+// some browsers cannot show a canvas drawn by another GPU (hybrid laptops on Linux), so each adapter draws a few test frames first
 async function canPresent(power) {
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: power });
   if (!adapter) return null;
   const device = await adapter.requestDevice();
   let failed = false;
-  device.lost.then(() => { failed = true; });
-  device.onuncapturederror = () => { failed = true; };
+  device.lost.then((info) => {
+    if (info.reason === 'destroyed') return;
+    failed = true;
+    console.warn('[gpu check] ' + power + ' device lost: ' + info.message);
+  });
+  device.onuncapturederror = (e) => {
+    failed = true;
+    console.warn('[gpu check] ' + power + ': ' + e.error.message);
+  };
   const probe = document.createElement('canvas');
   probe.width = probe.height = 64;
   probe.style.cssText = 'position:fixed;left:0;top:0;width:2px;height:2px;opacity:0.01;pointer-events:none';
@@ -143,6 +151,7 @@ async function canPresent(power) {
     }
   } catch (e) {
     failed = true;
+    console.warn('[gpu check] ' + power + ': ' + e);
   }
   probe.remove();
   const name = [adapter.info.vendor, adapter.info.architecture].filter(Boolean).join(' ') || power;
@@ -152,6 +161,10 @@ async function canPresent(power) {
 
 async function chooseGpu() {
   if (!navigator.gpu) return 'WebGPU unavailable, software renderer';
+  if (navigator.userAgent.includes('Firefox/')) {
+    Module.presentCopy = true;
+    return 'Firefox, frames copied to the page';
+  }
   const forced = params.get('gpu');
   if (forced !== 'low') {
     const name = await canPresent('high-performance');
