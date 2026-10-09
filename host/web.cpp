@@ -42,6 +42,17 @@ EM_JS(void, ps2web_fetch, (const char *url, double offset, int size, void *out, 
         });
 });
 
+EM_JS(int, ps2web_save_program, (const char *name, const std::uint8_t *code, int size), {
+    try {
+        const xhr = new XMLHttpRequest();
+        xhr.open('PUT', 'vu1/' + UTF8ToString(name), false);
+        xhr.send(HEAPU8.slice(code, code + size));
+        return xhr.status;
+    } catch (e) {
+        return 0;
+    }
+});
+
 EM_JS(double, ps2web_disc_size, (), { return Module.discSize || 0; });
 EM_JS(char *, ps2web_disc_url, (), { return stringToNewUTF8(new URL(Module.discUrl, location.href).href); });
 EM_JS(void, ps2web_frame_done, (), { if (Module.onFrame) Module.onFrame(); });
@@ -234,6 +245,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_frames() { return static_cast<doub
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_primitives() { return static_cast<double>(ps2::primitives_drawn()); }
 extern "C" EMSCRIPTEN_KEEPALIVE void *ps2web_audio_ring() { return &g_audio; }
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_audio_queued_ms() { return audio_queued_ms(); }
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_vu_interpreted() { return static_cast<double>(ps2::vu1_interpreted_calls()); }
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_idle_ms(int which) {
     if (which == 2) return ps2::vu_thread_idle_ms();
     return which ? g_render_idle.load() : g_emulation_idle.load();
@@ -253,6 +265,13 @@ int main(int argc, char **argv) {
     g_disc_size = static_cast<std::uint64_t>(ps2web_disc_size());
     g_disc_url = ps2web_disc_url();
     ps2::g_options.on_vblank = on_vblank;
+    ps2::g_options.on_vu_program = [](const std::string &name, const std::uint8_t *code, std::size_t size) {
+        static bool unsupported = false;
+        if (unsupported) return;
+        const int status = ps2web_save_program(name.c_str(), code, static_cast<int>(size));
+        if (status == 200 || status == 201) std::fprintf(stderr, "[web] saved VU1 program %s\n", name.c_str());
+        else unsupported = true;
+    };
     ps2::set_audio_sink(push_audio);
     register_generated_code();
     register_generated_vu();

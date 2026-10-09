@@ -8,6 +8,7 @@
 #include "ps2/vu.hpp"
 #include "ps2/vu_ops.hpp"
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace ps2::vu {
 
@@ -661,6 +663,10 @@ std::uint32_t itop() { return g_itop; }
 
 ProgramFn lookup(std::uint32_t address);
 
+std::atomic<std::uint64_t> g_interpreted_calls{0};
+
+std::uint64_t interpreted_calls() { return g_interpreted_calls.load(std::memory_order_relaxed); }
+
 void interpret(int unit, std::uint32_t pc) {
     static const bool interpret_only = std::getenv("PS2_VU_INTERPRET") != nullptr;
     static const bool count = std::getenv("PS2_VU_COUNT") != nullptr;
@@ -673,6 +679,7 @@ void interpret(int unit, std::uint32_t pc) {
             return;
         }
     }
+    if (unit == 1) g_interpreted_calls.fetch_add(1, std::memory_order_relaxed);
     if (count && unit == 1) {
         ++misses[pc];
         if (++interpreted % 5000 == 0) {
@@ -693,9 +700,14 @@ ProgramFn lookup(std::uint32_t address) {
     const auto it = g_programs.find(key);
     e.function = it == g_programs.end() ? nullptr : it->second;
     static const char *record = std::getenv("PS2_VU_RECORD");
-    if (!e.function && record) {
+    if (!e.function && (record || g_options.on_vu_program)) {
         char name[64];
         std::snprintf(name, sizeof name, "%016llX_%04X.bin", static_cast<unsigned long long>(key), address & 16383u);
+        if (g_options.on_vu_program) {
+            static std::unordered_set<std::string> reported;
+            if (reported.insert(name).second) g_options.on_vu_program(name, g_vu1_code, 16384);
+            return e.function;
+        }
         const std::filesystem::path path = std::filesystem::path(record) / name;
         if (!std::filesystem::exists(path)) {
             std::filesystem::create_directories(record);

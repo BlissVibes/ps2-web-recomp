@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Serves a web build and a disc image with HTTP range requests.
 
-usage: serve.py <build dir> <disc image> [port]
+usage: serve.py <build dir> <disc image> [port] [--record <dir for unrecorded VU1 programs>]
 """
 
 import http.server
@@ -10,6 +10,11 @@ import re
 import shutil
 import sys
 
+RECORD = None
+if '--record' in sys.argv:
+    at = sys.argv.index('--record')
+    RECORD = os.path.abspath(sys.argv[at + 1])
+    del sys.argv[at:at + 2]
 BUILD = os.path.abspath(sys.argv[1])
 DISC = os.path.abspath(sys.argv[2])
 PORT = int(sys.argv[3]) if len(sys.argv) > 3 else 8620
@@ -83,6 +88,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 left -= len(chunk)
+
+    def do_PUT(self):
+        match = re.match(r'^/vu1/([0-9A-F]{16}_[0-9A-F]{4}\.bin)$', self.path.split('?', 1)[0])
+        length = int(self.headers.get('Content-Length', '0'))
+        if not RECORD or not match or length != 16384:
+            self.send_error(501 if not RECORD else 400)
+            return
+        data = self.rfile.read(length)
+        target = os.path.join(RECORD, match.group(1))
+        if not os.path.exists(target):
+            os.makedirs(RECORD, exist_ok=True)
+            with open(target, 'wb') as f:
+                f.write(data)
+            print('recorded', match.group(1), flush=True)
+        self.send_response(201)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
 
     def log_message(self, fmt, *args):
         pass

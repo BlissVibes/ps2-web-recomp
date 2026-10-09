@@ -292,6 +292,7 @@ void start_vu_thread() { gs::queue::vu().start(32u << 20); }
 std::atomic<double> g_vu_idle_ms{0.0};
 
 double vu_thread_idle_ms() { return g_vu_idle_ms.load(); }
+std::uint64_t vu1_interpreted_calls() { return vu::interpreted_calls(); }
 
 void run_vu_thread() {
     gs::queue::role() = gs::queue::Role::Vu;

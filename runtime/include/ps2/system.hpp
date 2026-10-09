@@ -36,6 +36,7 @@ struct Options {
     std::uint32_t frame_every = 60;
     std::vector<Press> presses;
     std::function<void()> on_vblank;
+    std::function<void(const std::string &name, const std::uint8_t *code, std::size_t size)> on_vu_program;
 };
 
 extern Options g_options;
@@ -89,6 +90,7 @@ void start_render_thread();
 void start_vu_thread();
 void run_vu_thread();
 double vu_thread_idle_ms();
+std::uint64_t vu1_interpreted_calls();
 void post_present();
 bool render_pending(bool surface, const std::function<void(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height)> &copy);
 void wait_render_work(int timeout_ms);
