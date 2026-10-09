@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <stdexcept>
+#include <string>
 #include <functional>
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +23,8 @@
 namespace ps2::gs {
 
 State g_state;
+
+void serve_state(const void *payload);
 
 namespace {
 
@@ -865,6 +869,7 @@ bool render_pending(const std::function<void(const DisplayRegs &)> &on_present) 
             presented = true;
             break;
         }
+        case queue::kState: serve_state(payload); break;
         case queue::kDownload: {
             std::uintptr_t target;
             std::memcpy(&target, payload, sizeof target);
@@ -921,8 +926,12 @@ void stats() {
 
 namespace ps2::gs {
 
-void state(ps2::state::Stream &s) {
-    s.tag("gs");
+namespace {
+
+std::atomic<std::uint32_t> g_state_done{0};
+std::string g_state_error;
+
+void render_state(ps2::state::Stream &s) {
     flush_and_wait();
     s.pod(g_state);
     s.pod(g_pmode);
@@ -946,7 +955,7 @@ void state(ps2::state::Stream &s) {
     s.pod(g_odd_field);
     s.pod(g_transfer);
     s.pod(g_carry);
-    s.pod(g_carried);
+    s.size(g_carried);
     std::vector<std::uint32_t> vram, clut;
     std::uint32_t scale = 1;
 #ifdef PS2_GPU
@@ -970,6 +979,34 @@ void state(ps2::state::Stream &s) {
         gpu::write_state(vram, scale, clut);
     }
 #endif
+}
+
+}
+
+void serve_state(const void *payload) {
+    std::uintptr_t target;
+    std::memcpy(&target, payload, sizeof target);
+    try {
+        render_state(*reinterpret_cast<ps2::state::Stream *>(target));
+    } catch (const std::exception &e) {
+        g_state_error = e.what();
+    }
+    g_state_done.fetch_add(1);
+    queue::notify(g_state_done);
+}
+
+void state(ps2::state::Stream &s) {
+    s.tag("gs");
+    if (!queue::active()) {
+        render_state(s);
+        return;
+    }
+    g_state_error.clear();
+    const std::uint32_t seen = g_state_done.load();
+    const std::uintptr_t target = reinterpret_cast<std::uintptr_t>(&s);
+    queue::post(queue::kState, 0, 0, &target, sizeof target);
+    while (g_state_done.load() == seen) queue::wait(g_state_done, seen);
+    if (!g_state_error.empty()) throw std::runtime_error(g_state_error);
 }
 
 }

@@ -508,6 +508,7 @@ var Module = {
   canvas,
   arguments: ['/game/core.elf'].concat(params.has('arg') ? ['--arg', params.get('arg')] : [], params.getAll('press').flatMap((p) => p.split(',').flatMap((x) => ['--press', x]))),
   discUrl: params.get('disc') || 'disc.iso',
+  stateUrl: params.get('state'),
   noSurface: params.has('nosurface'),
   noCard: params.has('nocard'),
   presentCopy: params.has('copy'),

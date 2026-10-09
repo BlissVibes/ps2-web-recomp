@@ -208,13 +208,22 @@ bool halted() { return g_halted; }
 namespace {
 
 constexpr char kStateMagic[8] = {'P', 'S', '2', 'S', 'T', 'A', 'T', 'E'};
-constexpr std::uint32_t kStateVersion = 1;
+constexpr std::uint32_t kStateVersion = 2;
 
 std::function<void()> event_action(int id) {
     if (id == hw::kEventVblank) return vblank;
     if (id == hw::kEventVblankEnd + 100) return [] { iop::vblank(false); };
     if (id >= hw::kEventCount) return kernel::alarm_action(id - hw::kEventCount);
     return hw::event_action(id);
+}
+
+std::atomic<std::uint32_t> g_vu_fence{0};
+
+void sync_vu_thread() {
+    if (!gs::queue::vu_active()) return;
+    const std::uint32_t seen = g_vu_fence.load();
+    gs::queue::vu().post(gs::queue::kVuFence, 0, 0, nullptr, 0);
+    while (g_vu_fence.load() == seen) gs::queue::wait(g_vu_fence, seen);
 }
 
 void machine_state(state::Stream &s) {
@@ -242,11 +251,12 @@ void machine_state(state::Stream &s) {
     kernel::state(s);
     hw::state(s);
     dmac::state(s);
+    sync_vu_thread();
     vif::state(s);
     vu::state(s);
-    gif::state(s);
     ipu::state(s);
     gs::state(s);
+    gif::state(s);
     iop::state(s);
     sif::state(s);
     s.tag("end");
@@ -269,20 +279,27 @@ bool save_state(const std::string &path) {
     }
 }
 
-bool load_state(const std::string &path) {
+bool load_state(const std::uint8_t *data, std::size_t size) {
     try {
-        std::ifstream in(path, std::ios::binary);
-        if (!in) throw std::runtime_error("cannot open " + path);
-        const std::vector<std::uint8_t> data{std::istreambuf_iterator<char>(in), {}};
-        state::Reader r(data.data(), data.size());
+        state::Reader r(data, size);
         machine_state(r);
         g_resumed = true;
-        std::fprintf(stderr, "[state] loaded frame %llu from %s\n", static_cast<unsigned long long>(g_frames), path.c_str());
+        std::fprintf(stderr, "[state] loaded frame %llu\n", static_cast<unsigned long long>(g_frames));
         return true;
     } catch (const std::exception &e) {
         std::fprintf(stderr, "[state] cannot load: %s\n", e.what());
         return false;
     }
+}
+
+bool load_state(const std::string &path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        std::fprintf(stderr, "[state] cannot open %s\n", path.c_str());
+        return false;
+    }
+    const std::vector<std::uint8_t> data{std::istreambuf_iterator<char>(in), {}};
+    return load_state(data.data(), data.size());
 }
 
 std::uint64_t frame_count() { return g_frames; }
@@ -421,6 +438,10 @@ void run_vu_thread() {
             case gs::queue::kVuReset:
                 vif::reset_vu_side();
                 vu::reset();
+                break;
+            case gs::queue::kVuFence:
+                g_vu_fence.fetch_add(1);
+                gs::queue::notify(g_vu_fence);
                 break;
             default: gs::queue::render().post(static_cast<gs::queue::Type>(h.type), h.arg0, h.arg1, payload, h.bytes); break;
             }

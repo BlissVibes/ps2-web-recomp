@@ -54,6 +54,31 @@ EM_JS(int, ps2web_save_program, (const char *name, const std::uint8_t *code, int
 });
 
 EM_JS(double, ps2web_disc_size, (), { return Module.discSize || 0; });
+EM_JS(char *, ps2web_state_url, (), { return Module.stateUrl ? stringToNewUTF8(new URL(Module.stateUrl, location.href).href) : 0; });
+EM_JS(double, ps2web_url_size, (const char *url), {
+    try {
+        const xhr = new XMLHttpRequest();
+        xhr.open('HEAD', UTF8ToString(url), false);
+        xhr.send();
+        return xhr.status === 200 ? Number(xhr.getResponseHeader('Content-Length') || 0) : 0;
+    } catch (e) {
+        return 0;
+    }
+});
+EM_JS(double, ps2web_url_read, (const char *url, std::uint8_t *out, double size), {
+    try {
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', UTF8ToString(url), false);
+        xhr.responseType = 'arraybuffer';
+        xhr.send();
+        if (xhr.status !== 200) return 0;
+        const bytes = new Uint8Array(xhr.response);
+        HEAPU8.set(bytes.subarray(0, size), out);
+        return bytes.length;
+    } catch (e) {
+        return 0;
+    }
+});
 EM_JS(char *, ps2web_disc_url, (), { return stringToNewUTF8(new URL(Module.discUrl, location.href).href); });
 EM_JS(void, ps2web_frame_done, (), { if (Module.onFrame) Module.onFrame(); });
 EM_JS(void, ps2web_blit, (const std::uint32_t *rgba, int width, int height), {
@@ -111,6 +136,7 @@ AudioRing g_audio;
 Slot g_slots[kSlots];
 std::uint64_t g_disc_size = 0, g_use_clock = 0, g_last_chunk = ~0ull, g_run = 0;
 char *g_disc_url = nullptr;
+char *g_state_url = nullptr;
 
 Slot *find_slot(std::uint64_t index) {
     for (Slot &s : g_slots)
@@ -232,6 +258,14 @@ void *emulate(void *data) {
         return nullptr;
     }
     ps2::boot(entry, launch.args);
+    if (g_state_url) {
+        const double size = ps2web_url_size(g_state_url);
+        std::vector<std::uint8_t> data(static_cast<std::size_t>(size));
+        if (size <= 0 || ps2web_url_read(g_state_url, data.data(), size) != size || !ps2::load_state(data.data(), data.size())) {
+            std::fprintf(stderr, "[web] cannot load the state %s\n", g_state_url);
+            return nullptr;
+        }
+    }
     ps2::run();
     return nullptr;
 }
@@ -286,6 +320,7 @@ int main(int argc, char **argv) {
     }
     g_disc_size = static_cast<std::uint64_t>(ps2web_disc_size());
     g_disc_url = ps2web_disc_url();
+    g_state_url = ps2web_state_url();
     ps2::g_options.on_vblank = on_vblank;
     ps2::g_options.on_vu_program = [](const std::string &name, const std::uint8_t *code, std::size_t size) {
         static bool unsupported = false;

@@ -73,6 +73,7 @@ int run();
 void halt(const std::string &reason);
 bool save_state(const std::string &path);
 bool load_state(const std::string &path);
+bool load_state(const std::uint8_t *data, std::size_t size);
 bool halted();
 std::uint64_t frame_count();
 

@@ -690,9 +690,9 @@ namespace ps2::ipu {
 void state(ps2::state::Stream &s) {
     s.tag("ipu");
     s.vec(g_in);
-    s.pod(g_bit);
+    s.size(g_bit);
     s.vec(g_out);
-    s.pod(g_out_pos);
+    s.size(g_out_pos);
     s.pod(g_ctrl);
     s.pod(g_result);
     s.pod(g_command);

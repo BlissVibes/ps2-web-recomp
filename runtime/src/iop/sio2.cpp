@@ -386,7 +386,7 @@ void state(ps2::state::Stream &s) {
     s.deque(g_out);
     s.pod(g_pads);
     s.pod(g_dma);
-    s.pod(g_card.address);
+    s.size(g_card.address);
     s.pod(g_card.term);
 }
 

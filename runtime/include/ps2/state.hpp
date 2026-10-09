@@ -27,6 +27,12 @@ public:
         bytes(&v, sizeof v);
     }
 
+    void size(std::size_t &v) {
+        std::uint64_t wide = v;
+        pod(wide);
+        v = static_cast<std::size_t>(wide);
+    }
+
     void tag(const char *name) {
         char text[8] = {};
         std::strncpy(text, name, sizeof text);
