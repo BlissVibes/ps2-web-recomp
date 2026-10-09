@@ -12,8 +12,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 extern const char kGsShader[];
 extern const char kBlitShader[];
@@ -32,7 +34,7 @@ const char *const kEntryPoints[kPipelines] = {"upload", "copy_read", "copy_write
 constexpr std::uint32_t kParamStride = 256;
 constexpr std::uint32_t kClutSlots = 2048;
 constexpr std::uint32_t kClutEntries = 512;
-constexpr std::uint32_t kPrimWords = 40;
+constexpr std::uint32_t kPrimWords = 28;
 constexpr std::uint32_t kSetupWords = 24;
 
 Mode g_mode = Mode::off;
@@ -209,6 +211,88 @@ void dispatch_linear(Pipeline p, std::uint32_t items, std::uint32_t param) {
     g_commands.push_back({p, std::min(groups, 1024u), (groups + 1023) / 1024, param});
 }
 
+constexpr std::uint32_t kCacheWords = 4u << 20;
+constexpr std::size_t kCacheMinBytes = 256;
+
+struct CacheEntry {
+    std::uint64_t key;
+    std::uint32_t offset, words;
+    std::size_t bytes;
+    std::uint64_t used;
+};
+
+WGPUBuffer g_cache = nullptr;
+std::vector<std::uint32_t> g_cache_copy;
+std::deque<CacheEntry> g_cache_ring;
+std::unordered_multimap<std::uint64_t, CacheEntry *> g_cache_index;
+std::unordered_map<std::uint64_t, std::uint32_t> g_cache_seen;
+std::uint32_t g_cache_head = 0;
+std::uint64_t g_serial = 1;
+
+std::uint64_t content_key(const std::uint8_t *p, std::size_t n) {
+    std::uint64_t h = static_cast<std::uint64_t>(n) * 0x9E3779B97F4A7C15ull;
+    const auto mix = [&h](std::uint64_t v) {
+        h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+        h *= 0xBF58476D1CE4E5B9ull;
+    };
+    const std::size_t step = std::max<std::size_t>(8, (n / 64) & ~static_cast<std::size_t>(7));
+    std::uint64_t v;
+    for (std::size_t i = 0; i + 8 <= n; i += step) {
+        std::memcpy(&v, p + i, 8);
+        mix(v);
+    }
+    v = 0;
+    std::memcpy(&v, p + n - std::min<std::size_t>(n, 8), std::min<std::size_t>(n, 8));
+    mix(v);
+    return h;
+}
+
+bool cache_find(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, std::uint32_t &offset) {
+    const auto [first, last] = g_cache_index.equal_range(key);
+    for (auto it = first; it != last; ++it) {
+        CacheEntry &e = *it->second;
+        if (e.bytes != n || std::memcmp(g_cache_copy.data() + e.offset, bytes, n) != 0) continue;
+        e.used = g_serial;
+        offset = e.offset;
+        return true;
+    }
+    return false;
+}
+
+bool cache_insert(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, std::uint32_t &offset) {
+    const auto words = static_cast<std::uint32_t>((n + 3) / 4 + 1);
+    if (words > kCacheWords / 4) return false;
+    const auto evict_front = [] {
+        CacheEntry &front = g_cache_ring.front();
+        if (front.used == g_serial) return false;
+        const auto [first, last] = g_cache_index.equal_range(front.key);
+        for (auto it = first; it != last; ++it)
+            if (it->second == &front) {
+                g_cache_index.erase(it);
+                break;
+            }
+        g_cache_ring.pop_front();
+        return true;
+    };
+    if (g_cache_head + words > kCacheWords) {
+        while (!g_cache_ring.empty() && g_cache_ring.front().offset >= g_cache_head)
+            if (!evict_front()) return false;
+        g_cache_head = 0;
+    }
+    while (!g_cache_ring.empty() && g_cache_ring.front().offset < g_cache_head + words)
+        if (!evict_front()) return false;
+    offset = g_cache_head;
+    std::uint32_t *to = g_cache_copy.data() + offset;
+    to[words - 1] = 0;
+    to[words - 2] = 0;
+    std::memcpy(to, bytes, n);
+    wgpuQueueWriteBuffer(g_queue, g_cache, static_cast<std::uint64_t>(offset) * 4, to, static_cast<std::uint64_t>(words) * 4);
+    g_cache_ring.push_back({key, offset, words, n, g_serial});
+    g_cache_index.emplace(key, &g_cache_ring.back());
+    g_cache_head += words;
+    return true;
+}
+
 std::uint32_t arena_append(const void *bytes, std::size_t size) {
     const std::uint32_t offset = static_cast<std::uint32_t>(g_arena.size());
     const std::size_t words = (size + 3) / 4 + 1;
@@ -305,28 +389,31 @@ void flush_batch() {
     for (std::uint32_t t : g_touched) total += g_tile_count[t];
     const std::uint32_t tiles = static_cast<std::uint32_t>(g_touched.size());
     const std::uint32_t tile_offset = static_cast<std::uint32_t>(g_arena.size());
-    const std::uint32_t list_offset = tile_offset + tiles * 4;
-    g_arena.grow(tiles * 4 + total);
-    std::uint32_t cursor = list_offset;
+    const std::uint32_t list_offset = tile_offset + tiles * 2 + 2;
+    const std::uint32_t list_words = (total + 1) / 2;
+    std::uint32_t *grown = g_arena.grow(tiles * 2 + 2 + list_words);
+    if (list_words) grown[tiles * 2 + 2 + list_words - 1] = 0;
+    std::uint32_t cursor = 0;
     for (std::uint32_t i = 0; i < tiles; ++i) {
         const std::uint32_t t = g_touched[i];
-        std::uint32_t *rec = g_arena.data() + tile_offset + i * 4;
-        rec[3] = 0;
-        rec[0] = (t % static_cast<std::uint32_t>(g_tiles_per_row)) | ((t / static_cast<std::uint32_t>(g_tiles_per_row)) << 16);
-        rec[1] = cursor;
-        rec[2] = g_tile_count[t];
+        grown[i * 2] = (t % static_cast<std::uint32_t>(g_tiles_per_row)) | ((t / static_cast<std::uint32_t>(g_tiles_per_row)) << 16);
+        grown[i * 2 + 1] = cursor;
         g_tile_fill[t] = cursor;
         cursor += g_tile_count[t];
     }
-    std::uint32_t *arena = g_arena.data();
-    for (std::uint32_t i = 0; i < prims; ++i)
+    grown[tiles * 2] = 0;
+    grown[tiles * 2 + 1] = cursor;
+    auto *halves = reinterpret_cast<unsigned char *>(grown + tiles * 2 + 2);
+    for (std::uint32_t i = 0; i < prims; ++i) {
+        const auto index = static_cast<std::uint16_t>(i);
         for (std::uint32_t k = g_span_start[i]; k < g_span_start[i + 1]; ++k) {
             const Span &sp = g_spans[k];
             std::uint32_t t = static_cast<std::uint32_t>(sp.ty * g_tiles_per_row + sp.tx0);
-            for (int tx = sp.tx0; tx <= sp.tx1; ++tx, ++t) arena[g_tile_fill[t]++] = i;
+            for (int tx = sp.tx0; tx <= sp.tx1; ++tx, ++t) std::memcpy(halves + 2u * g_tile_fill[t]++, &index, 2);
         }
+    }
     for (std::uint32_t t : g_touched) g_tile_count[t] = 0;
-    const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles});
+    const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset});
     g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
     b.prims.clear();
     b.setups.clear();
@@ -400,8 +487,15 @@ std::uint64_t queue_upload(const std::uint8_t *bytes, std::size_t size, std::uin
     if (!pixels) return 0;
     const std::uint64_t used = lead_bits + static_cast<std::uint64_t>(pixels) * im.bpp;
     PreOp op;
-    const std::uint32_t offset = arena_append(bytes, static_cast<std::size_t>((used + 7) / 8));
-    const std::uint32_t rec[11] = {im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.done, pixels, offset, lead_bits, im.bpp};
+    const auto n = static_cast<std::size_t>((used + 7) / 8);
+    std::uint32_t offset = 0, source = 0;
+    if (n >= kCacheMinBytes) {
+        const std::uint64_t key = content_key(bytes, n);
+        if (cache_find(key, bytes, n, offset) || (++g_cache_seen[key] >= 2 && cache_insert(key, bytes, n, offset))) source = 0x80000000u;
+        if (g_cache_seen.size() > 65536) g_cache_seen.clear();
+    }
+    if (!source) offset = arena_append(bytes, n);
+    const std::uint32_t rec[11] = {im.dbp, im.dbw, im.dpsm, im.dsax, im.dsay, im.rrw, im.done, pixels, offset, lead_bits, im.bpp | source};
     std::memcpy(op.rec, rec, sizeof rec);
     const std::uint32_t first = im.done / im.rrw, last = (im.done + pixels - 1) / im.rrw;
     op.range = region(im.dbp, im.dbw, im.dpsm, static_cast<int>(im.dsax), static_cast<int>(im.dsay + first), static_cast<int>(im.dsax + im.rrw - 1),
@@ -466,9 +560,9 @@ WGPUBuffer make_buffer(std::uint64_t size, WGPUBufferUsage usage) {
 
 void rebuild_group() {
     if (g_group) wgpuBindGroupRelease(g_group);
-    WGPUBindGroupEntry e[6] = {};
-    WGPUBuffer buffers[6] = {g_vram, g_tables, g_params, g_data, g_clut, g_scratch};
-    for (int i = 0; i < 6; ++i) {
+    WGPUBindGroupEntry e[7] = {};
+    WGPUBuffer buffers[7] = {g_vram, g_tables, g_params, g_data, g_clut, g_scratch, g_cache};
+    for (int i = 0; i < 7; ++i) {
         e[i] = WGPU_BIND_GROUP_ENTRY_INIT;
         e[i].binding = static_cast<std::uint32_t>(i);
         e[i].buffer = buffers[i];
@@ -476,7 +570,7 @@ void rebuild_group() {
     }
     WGPUBindGroupDescriptor d = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     d.layout = g_layout;
-    d.entryCount = 6;
+    d.entryCount = 7;
     d.entries = e;
     g_group = wgpuDeviceCreateBindGroup(g_device, &d);
 }
@@ -586,6 +680,7 @@ void submit(WGPUTextureView present_view = nullptr) {
     wgpuDevicePoll(g_device, false, nullptr);
 #endif
     g_commands.clear();
+    ++g_serial;
     g_param_records.clear();
     g_arena.clear();
     g_clut_loads = 0;
@@ -663,11 +758,13 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) 
     return flags;
 }
 
-void attrs(std::uint32_t *slot, const Vertex &v, bool fst, const Vertex *color) {
+void attrs(std::uint32_t *rec, int n, const Vertex &v, bool fst, const Vertex *color) {
     const Vertex &c = color ? *color : v;
-    const float a[8] = {static_cast<float>(c.r), static_cast<float>(c.g), static_cast<float>(c.b), static_cast<float>(c.a),
-                        fst ? static_cast<float>(v.u) : v.s, fst ? static_cast<float>(v.v) : v.t, fst ? 1.0f : v.q, static_cast<float>(v.f)};
-    for (int i = 0; i < 8; ++i) slot[i] = f2u(a[i]);
+    rec[12 + n] = c.r | (static_cast<std::uint32_t>(c.g) << 8) | (static_cast<std::uint32_t>(c.b) << 16) | (static_cast<std::uint32_t>(c.a) << 24);
+    rec[15 + n * 3] = f2u(fst ? static_cast<float>(v.u) : v.s);
+    rec[16 + n * 3] = f2u(fst ? static_cast<float>(v.v) : v.t);
+    rec[17 + n * 3] = f2u(fst ? 1.0f : v.q);
+    rec[11] |= static_cast<std::uint32_t>(v.f) << (8 * n);
 }
 
 }
@@ -754,6 +851,8 @@ bool init(Mode m) {
     wgpuQueueWriteBuffer(g_queue, g_tables, 0, tables.data(), tables.size() * 4);
     g_clut = make_buffer(static_cast<std::uint64_t>(kClutSlots) * kClutEntries * 4, WGPUBufferUsage_Storage);
     g_scratch = make_buffer((static_cast<std::uint64_t>(g_copy_words) + 2ull * g_field_words) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
+    g_cache = make_buffer(static_cast<std::uint64_t>(kCacheWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+    g_cache_copy.assign(kCacheWords, 0);
     g_readback = make_buffer(static_cast<std::uint64_t>(g_copy_words) * 4, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     if (g_timestamps) {
         WGPUQuerySetDescriptor qd = WGPU_QUERY_SET_DESCRIPTOR_INIT;
@@ -764,10 +863,11 @@ bool init(Mode m) {
         g_query_read = make_buffer(16, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     }
 
-    WGPUBindGroupLayoutEntry le[6] = {};
-    const WGPUBufferBindingType types[6] = {WGPUBufferBindingType_Storage, WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Uniform,
-                                            WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Storage, WGPUBufferBindingType_Storage};
-    for (int i = 0; i < 6; ++i) {
+    WGPUBindGroupLayoutEntry le[7] = {};
+    const WGPUBufferBindingType types[7] = {WGPUBufferBindingType_Storage, WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Uniform,
+                                            WGPUBufferBindingType_ReadOnlyStorage, WGPUBufferBindingType_Storage, WGPUBufferBindingType_Storage,
+                                            WGPUBufferBindingType_ReadOnlyStorage};
+    for (int i = 0; i < 7; ++i) {
         le[i] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
         le[i].binding = static_cast<std::uint32_t>(i);
         le[i].visibility = WGPUShaderStage_Compute;
@@ -776,7 +876,7 @@ bool init(Mode m) {
         le[i].buffer.minBindingSize = i == 2 ? kParamStride : 0;
     }
     WGPUBindGroupLayoutDescriptor ld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
-    ld.entryCount = 6;
+    ld.entryCount = 7;
     ld.entries = le;
     g_layout = wgpuDeviceCreateBindGroupLayout(g_device, &ld);
     WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
@@ -839,10 +939,10 @@ void draw(const State &st, const Vertex *v, int count) {
         const float xy[6] = {x0, y0, x1, y1, x2, y2};
         for (int i = 0; i < 6; ++i) rec[4 + i] = f2u(xy[i]);
         rec[10] = f2u(1.0f / area);
-        for (int i = 0; i < 3; ++i) attrs(rec + 12 + i * 8, v[i], fst, iip ? nullptr : &v[2]);
-        rec[36] = v[0].z;
-        rec[37] = f2u(static_cast<float>(static_cast<std::int64_t>(v[1].z) - static_cast<std::int64_t>(v[0].z)));
-        rec[38] = f2u(static_cast<float>(static_cast<std::int64_t>(v[2].z) - static_cast<std::int64_t>(v[0].z)));
+        for (int i = 0; i < 3; ++i) attrs(rec, i, v[i], fst, iip ? nullptr : &v[2]);
+        rec[24] = v[0].z;
+        rec[25] = f2u(static_cast<float>(static_cast<std::int64_t>(v[1].z) - static_cast<std::int64_t>(v[0].z)));
+        rec[26] = f2u(static_cast<float>(static_cast<std::int64_t>(v[2].z) - static_cast<std::int64_t>(v[0].z)));
         break;
     }
     case 6: {
@@ -856,9 +956,9 @@ void draw(const State &st, const Vertex *v, int count) {
         rec[5] = f2u(y0);
         rec[6] = f2u(x1 - x0);
         rec[7] = f2u(y1 - y0);
-        attrs(rec + 12, v[0], fst, nullptr);
-        attrs(rec + 20, v[1], fst, nullptr);
-        rec[36] = v[1].z;
+        attrs(rec, 0, v[0], fst, nullptr);
+        attrs(rec, 1, v[1], fst, nullptr);
+        rec[24] = v[1].z;
         break;
     }
     case 1: case 2: {
@@ -874,10 +974,10 @@ void draw(const State &st, const Vertex *v, int count) {
         rec[6] = f2u(x1);
         rec[7] = f2u(y1);
         rec[8] = static_cast<std::uint32_t>(steps);
-        attrs(rec + 12, v[0], fst, iip ? nullptr : &v[1]);
-        attrs(rec + 20, v[1], fst, nullptr);
-        rec[36] = v[0].z;
-        rec[37] = f2u(static_cast<float>(static_cast<std::int64_t>(v[1].z) - static_cast<std::int64_t>(v[0].z)));
+        attrs(rec, 0, v[0], fst, iip ? nullptr : &v[1]);
+        attrs(rec, 1, v[1], fst, nullptr);
+        rec[24] = v[0].z;
+        rec[25] = f2u(static_cast<float>(static_cast<std::int64_t>(v[1].z) - static_cast<std::int64_t>(v[0].z)));
         break;
     }
     case 0: {
@@ -888,8 +988,8 @@ void draw(const State &st, const Vertex *v, int count) {
         rec[1] = 3;
         rec[4] = static_cast<std::uint32_t>(x);
         rec[5] = static_cast<std::uint32_t>(y);
-        attrs(rec + 12, v[0], fst, nullptr);
-        rec[36] = v[0].z;
+        attrs(rec, 0, v[0], fst, nullptr);
+        rec[24] = v[0].z;
         break;
     }
     default:

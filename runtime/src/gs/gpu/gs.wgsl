@@ -8,6 +8,7 @@ struct Params {
 @group(0) @binding(3) var<storage, read> data: array<u32>;
 @group(0) @binding(4) var<storage, read_write> clut: array<u32>;
 @group(0) @binding(5) var<storage, read_write> scratch: array<u32>;
+@group(0) @binding(6) var<storage, read> cache: array<u32>;
 
 override SCALE: u32 = 1u;
 
@@ -261,6 +262,20 @@ fn bits_at(offset: u32, bit: u32, count: u32) -> u32 {
     return v & ((1u << count) - 1u);
 }
 
+fn cache_bits_at(offset: u32, bit: u32, count: u32) -> u32 {
+    let w = offset + bit / 32u;
+    let s = bit % 32u;
+    var v = cache[w] >> s;
+    if (s + count > 32u) {
+        v = v | (cache[w + 1u] << (32u - s));
+    }
+    if (count == 32u) {
+        return v;
+    }
+    return v & ((1u << count) - 1u);
+}
+
+
 @compute @workgroup_size(64)
 fn upload(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x + gid.y * 64u * 1024u;
@@ -284,8 +299,13 @@ fn upload(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = data[r + 6u] + k;
     let x = (data[r + 3u] + p % rrw) & 0x7FFu;
     let y = (data[r + 4u] + p / rrw) & 0x7FFu;
-    let bpp = data[r + 10u];
-    let v = bits_at(data[r + 8u], data[r + 9u] + k * bpp, bpp);
+    let bpp = data[r + 10u] & 0xFFu;
+    var v = 0u;
+    if ((data[r + 10u] & 0x80000000u) != 0u) {
+        v = cache_bits_at(data[r + 8u], data[r + 9u] + k * bpp, bpp);
+    } else {
+        v = bits_at(data[r + 8u], data[r + 9u] + k * bpp, bpp);
+    }
     write_pixel(data[r + 2u], data[r], data[r + 1u], x, y, v);
 }
 
@@ -893,7 +913,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
     }
 }
 
-const PRIM_WORDS: u32 = 40u;
+const PRIM_WORDS: u32 = 28u;
 const SETUP_WORDS: u32 = 24u;
 
 fn fat(i: u32) -> f32 {
@@ -901,15 +921,16 @@ fn fat(i: u32) -> f32 {
 }
 
 fn vertex_attr(p: u32, n: u32) -> vec4<f32> {
-    return vec4<f32>(fat(p + 12u + n * 8u), fat(p + 13u + n * 8u), fat(p + 14u + n * 8u), fat(p + 15u + n * 8u));
+    let c = data[p + 12u + n];
+    return vec4<f32>(f32(c & 0xFFu), f32((c >> 8u) & 0xFFu), f32((c >> 16u) & 0xFFu), f32(c >> 24u));
 }
 
 fn vertex_tex(p: u32, n: u32) -> vec4<f32> {
-    return vec4<f32>(fat(p + 16u + n * 8u), fat(p + 17u + n * 8u), fat(p + 18u + n * 8u), fat(p + 19u + n * 8u));
+    return vec4<f32>(fat(p + 15u + n * 3u), fat(p + 16u + n * 3u), fat(p + 17u + n * 3u), f32((data[p + 11u] >> (n * 8u)) & 0xFFu));
 }
 
 fn z_at(p: u32, d: f32) -> u32 {
-    let z0 = data[p + 36u];
+    let z0 = data[p + 24u];
     let step = floor(d);
     if (step >= 0.0) {
         return z0 + u32(min(step, f32(0xFFFFFFFFu - z0)));
@@ -937,7 +958,7 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             }
             let c = vertex_attr(p, 0u) * w0 + vertex_attr(p, 1u) * w1 + vertex_attr(p, 2u) * w2;
             let t = vertex_tex(p, 0u) * w0 + vertex_tex(p, 1u) * w1 + vertex_tex(p, 2u) * w2;
-            at = Attr(c.x, c.y, c.z, c.w, t.x, t.y, t.z, t.w, z_at(p, fat(p + 37u) * w1 + fat(p + 38u) * w2));
+            at = Attr(c.x, c.y, c.z, c.w, t.x, t.y, t.z, t.w, z_at(p, fat(p + 25u) * w1 + fat(p + 26u) * w2));
         }
         case 1u {
             let x0 = fat(p + 4u);
@@ -958,7 +979,7 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
                 ty = (py - y0) / dy;
             }
             let c = vertex_attr(p, 1u);
-            at = Attr(c.x, c.y, c.z, c.w, a.x + (b.x - a.x) * tx, a.y + (b.y - a.y) * ty, b.z, b.w, data[p + 36u]);
+            at = Attr(c.x, c.y, c.z, c.w, a.x + (b.x - a.x) * tx, a.y + (b.y - a.y) * ty, b.z, b.w, data[p + 24u]);
         }
         case 2u {
             let x0 = fat(p + 4u);
@@ -997,7 +1018,7 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             }
             let c = vertex_attr(p, 0u) * (1.0 - t) + vertex_attr(p, 1u) * t;
             let tex = vertex_tex(p, 0u) * (1.0 - t) + vertex_tex(p, 1u) * t;
-            at = Attr(c.x, c.y, c.z, c.w, tex.x, tex.y, tex.z, tex.w, z_at(p, fat(p + 37u) * t));
+            at = Attr(c.x, c.y, c.z, c.w, tex.x, tex.y, tex.z, tex.w, z_at(p, fat(p + 25u) * t));
         }
         default {
             if (x != i32(data[p + 4u]) || y != i32(data[p + 5u])) {
@@ -1005,7 +1026,7 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             }
             let c = vertex_attr(p, 0u);
             let t = vertex_tex(p, 0u);
-            at = Attr(c.x, c.y, c.z, c.w, t.x, t.y, t.z, t.w, data[p + 36u]);
+            at = Attr(c.x, c.y, c.z, c.w, t.x, t.y, t.z, t.w, data[p + 24u]);
         }
     }
     plot(s, x, y, k, at);
@@ -1022,10 +1043,11 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(16, 16)
 fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let tile = prm(0u) + (wid.x + wid.y * 1024u) * 4u;
-    if (wid.x + wid.y * 1024u >= prm(3u)) {
+    let index = wid.x + wid.y * 1024u;
+    if (index >= prm(3u)) {
         return;
     }
+    let tile = prm(0u) + index * 2u;
     let origin = data[tile];
     let sx = (origin & 0xFFFFu) * 16u + lid.x;
     let sy = (origin >> 16u) * 16u + lid.y;
@@ -1034,14 +1056,16 @@ fn raster(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) l
     let k = (sy % SCALE) * SCALE + sx % SCALE;
     let px = f32(x) + f32(sx % SCALE) / f32(SCALE);
     let py = f32(y) + f32(sy % SCALE) / f32(SCALE);
-    let list = data[tile + 1u];
-    let count = data[tile + 2u];
+    let first = data[tile + 1u];
+    let count = data[tile + 3u] - first;
+    let lists = prm(4u);
     let prims = prm(1u);
     let setups = prm(2u);
     var last_setup = 0xFFFFFFFFu;
     var s: Setup;
     for (var i = 0u; i < count; i = i + 1u) {
-        let p = prims + data[list + i] * PRIM_WORDS;
+        let h = first + i;
+        let p = prims + ((data[lists + (h >> 1u)] >> ((h & 1u) * 16u)) & 0xFFFFu) * PRIM_WORDS;
         let si = data[p];
         if (si != last_setup) {
             s = load_setup(setups + si * SETUP_WORDS);
