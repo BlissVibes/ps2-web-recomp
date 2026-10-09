@@ -125,7 +125,7 @@ struct Batch {
     std::uint64_t key = ~0ull;
     int minx = 1 << 30, miny = 1 << 30, maxx = -1, maxy = -1;
     std::uint32_t fbp = 0, fbw = 0, fpsm = 0, zbp = 0, zpsm = 0;
-    bool zte = false;
+    bool zte = false, zwrite = false;
     int rx0 = 0, ry0 = 0, rx1 = -2, ry1 = -2;
     Range fb_range, z_range;
 } g_batch;
@@ -777,6 +777,55 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) 
     return flags;
 }
 
+bool texel_range(const std::uint32_t *setup, const Vertex *v, int count, std::uint32_t prim, bool fst, Range &out) {
+    const int tw = 1 << (setup[15] & 0xFFu), th = 1 << (setup[15] >> 8);
+    float u0 = 1e30f, v0 = 1e30f, u1 = -1e30f, v1 = -1e30f;
+    for (int i = 0; i < count; ++i) {
+        float u, t;
+        if (fst) {
+            u = static_cast<float>(v[i].u) / 16.0f;
+            t = static_cast<float>(v[i].v) / 16.0f;
+        } else {
+            const float q = prim == 6 ? v[count - 1].q : v[i].q;
+            if (!(q > 0.0f) || !(v[0].q > 0.0f) || !(v[count - 1].q > 0.0f)) return false;
+            u = v[i].s / q * static_cast<float>(tw);
+            t = v[i].t / q * static_cast<float>(th);
+        }
+        if (!std::isfinite(u) || !std::isfinite(t)) return false;
+        u0 = std::min(u0, u);
+        u1 = std::max(u1, u);
+        v0 = std::min(v0, t);
+        v1 = std::max(v1, t);
+    }
+    const auto axis = [](std::uint32_t mode, float lo, float hi, int size, std::uint32_t clamp, int &a, int &b) {
+        a = static_cast<int>(std::floor(lo)) - 1;
+        b = static_cast<int>(std::ceil(hi)) + 1;
+        switch (mode) {
+        case 0:
+            if (a < 0 || b >= size) {
+                a = 0;
+                b = size - 1;
+            }
+            return true;
+        case 1:
+            a = std::clamp(a, 0, size - 1);
+            b = std::clamp(b, 0, size - 1);
+            return true;
+        case 2: {
+            const int minv = static_cast<int>(clamp & 0x3FFu), maxv = static_cast<int>(clamp >> 16);
+            a = std::clamp(a, minv, std::max(minv, maxv));
+            b = std::clamp(b, minv, std::max(minv, maxv));
+            return true;
+        }
+        default: return false;
+        }
+    };
+    int ua, ub, va, vb;
+    if (!axis((setup[7] >> 24) & 3u, u0, u1, tw, setup[18], ua, ub) || !axis((setup[7] >> 26) & 3u, v0, v1, th, setup[19], va, vb)) return false;
+    out = region(setup[12], setup[13], setup[14], std::max(ua, 0), std::max(va, 0), std::max(ub, 0), std::max(vb, 0));
+    return true;
+}
+
 void attrs(std::uint32_t *rec, int n, const Vertex &v, bool fst, const Vertex *color) {
     const Vertex &c = color ? *color : v;
     rec[12 + n] = c.r | (static_cast<std::uint32_t>(c.g) << 8) | (static_cast<std::uint32_t>(c.b) << 16) | (static_cast<std::uint32_t>(c.a) << 24);
@@ -1047,7 +1096,9 @@ void draw(const State &st, const Vertex *v, int count) {
     if (flags & 2u) {
         if (!b.prims.empty()) {
             batch_ranges();
-            if (tex.overlaps(b.fb_range.lo, b.fb_range.hi) || (b.zte && tex.overlaps(b.z_range.lo, b.z_range.hi))) emit_all();
+            const auto written = [&](const Range &t) { return t.overlaps(b.fb_range.lo, b.fb_range.hi) || (b.zwrite && t.overlaps(b.z_range.lo, b.z_range.hi)); };
+            Range used;
+            if (written(tex) && (!texel_range(setup, v, count, prim, fst, used) || written(used))) emit_all();
         }
     }
     if (b.prims.empty()) {
@@ -1058,9 +1109,11 @@ void draw(const State &st, const Vertex *v, int count) {
         b.zbp = setup[5];
         b.zpsm = setup[6];
         b.zte = false;
+        b.zwrite = false;
         b.rx1 = -2;
     }
     b.zte = b.zte || zte;
+    b.zwrite = b.zwrite || (zte && !(flags & 32u));
     const std::size_t setups = b.setups.size() / kSetupWords;
     std::uint32_t setup_index;
     if (setups && std::memcmp(b.setups.data() + (setups - 1) * kSetupWords, setup, kSetupWords * 4) == 0) {
