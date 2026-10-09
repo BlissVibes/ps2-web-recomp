@@ -21,7 +21,7 @@ namespace {
 int usage() {
     std::fprintf(stderr,
                  "usage: ps2run <elf> [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
-                 "              [--disc image.iso] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
+                 "              [--disc image.iso] [--memcard card.ps2] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
                  "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n]\n"
                  "              [--press frame:button[+button][:frames]]... [--window]\n");
     return 2;
@@ -46,6 +46,7 @@ int main(int argc, char **argv) {
         else if (a == "--trace-io") ps2::g_options.trace_io = true;
         else if (a == "--trace-threads") ps2::g_options.trace_threads = true;
         else if (a == "--disc" && i + 1 < argc) ps2::g_options.disc_path = argv[++i];
+        else if (a == "--memcard" && i + 1 < argc) ps2::g_options.memcard_path = argv[++i];
         else if (a == "--trace-iop") ps2::g_options.trace_iop_modules = true;
         else if (a == "--trace-iop-hle") ps2::g_options.trace_iop_hle = true;
         else if (a == "--frames-dir" && i + 1 < argc) ps2::g_options.frames_dir = argv[++i];

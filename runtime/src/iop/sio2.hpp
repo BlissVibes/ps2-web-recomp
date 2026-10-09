@@ -10,5 +10,6 @@ void write(std::uint32_t a, std::uint32_t v);
 void arm_dma(int channel, std::uint32_t madr, std::uint32_t block_words, std::uint32_t blocks);
 void set_buttons(int pad, std::uint16_t pressed_mask);
 void set_axis(int pad, int axis, std::uint8_t value);
+void flush_cards();
 
 }

@@ -950,7 +950,8 @@ void install_heaplib() {
 
 void install_misc() {
     register_hle_library("secrman", 0x0101);
-    for (std::uint32_t i : {4u, 5u, 6u}) def("secrman", i, "secrman", [](Cpu &c) { c.r[2] = 0; });
+    for (std::uint32_t i : {4u, 5u}) def("secrman", i, "secrman", [](Cpu &c) { c.r[2] = 0; });
+    def("secrman", 6, "SecrAuthCard", [](Cpu &c) { c.r[2] = 1; });
 }
 
 }

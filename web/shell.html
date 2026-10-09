@@ -112,11 +112,76 @@
     <option value="3">1920×1536</option>
   </select>
   <button id="controls-toggle" type="button" hidden>Hide controls</button>
+  <button id="export-card" type="button" title="Download the memory card in slot 1 as a .ps2 file">Export card</button>
+  <button id="import-card" type="button" title="Put a .ps2 memory card file in slot 1">Import card</button>
+  <input id="import-file" type="file" accept=".ps2" hidden>
   <button id="fullscreen" type="button" title="Fullscreen (F or double click)">Fullscreen</button></div>
 <button id="exit-fullscreen" type="button">Exit fullscreen</button>
 <div id="overlay"><div id="panel"><p id="help" hidden></p><button id="start" disabled>Loading…</button></div></div>
 <script>
 const statusEl = document.getElementById('status');
+const CARD_DIR = '/memcard', CARD_FILE = '/memcard/Mcd001.ps2', CARD_BYTES = 8650752;
+let noteTimer = 0, noteRestore = '';
+function note(text) {
+  if (!noteTimer) noteRestore = statusEl.textContent;
+  clearTimeout(noteTimer);
+  statusEl.textContent = text;
+  noteTimer = setTimeout(() => {
+    statusEl.textContent = noteRestore;
+    noteTimer = 0;
+  }, 5000);
+}
+let cardTimer = 0;
+function storeCard(then) {
+  clearTimeout(cardTimer);
+  cardTimer = setTimeout(() => {
+    try {
+      FS.syncfs(false, (err) => {
+        if (err) console.warn('memory card: could not write browser storage', err);
+        if (then) then();
+      });
+    } catch (e) {
+      if (then) then();
+    }
+  }, 300);
+}
+document.getElementById('export-card').addEventListener('click', () => {
+  let data = null;
+  try { data = FS.readFile(CARD_FILE); } catch (e) {}
+  if (!data) {
+    note('Nothing saved on the memory card yet');
+    return;
+  }
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(new Blob([data], { type: 'application/octet-stream' }));
+  link.download = 'Mcd001.ps2';
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+});
+const importInput = document.getElementById('import-file');
+document.getElementById('import-card').addEventListener('click', () => importInput.click());
+importInput.addEventListener('change', async () => {
+  const file = importInput.files[0];
+  importInput.value = '';
+  if (!file) return;
+  if (file.size !== CARD_BYTES) {
+    note('That is not an 8 MB PS2 memory card image (' + CARD_BYTES + ' bytes)');
+    return;
+  }
+  const data = new Uint8Array(await file.arrayBuffer());
+  if (new TextDecoder().decode(data.subarray(0, 28)) !== 'Sony PS2 Memory Card Format ') {
+    note('That file is not a formatted PS2 memory card');
+    return;
+  }
+  if (!confirm('Replace the memory card in slot 1 with ' + file.name + '? The page reloads to use it.')) return;
+  try {
+    FS.writeFile(CARD_FILE, data);
+  } catch (e) {
+    note('Import failed: ' + e.message);
+    return;
+  }
+  storeCard(() => location.reload());
+});
 const statsEl = document.getElementById('stats');
 const canvas = document.getElementById('canvas');
 const params = new URLSearchParams(location.search);
@@ -444,6 +509,7 @@ var Module = {
   arguments: ['/game/core.elf', '--arg', params.get('arg') || 'cdrom0:\\CORE.GT4;1'].concat(params.getAll('press').flatMap((p) => p.split(',').flatMap((x) => ['--press', x]))),
   discUrl: params.get('disc') || 'disc.iso',
   noSurface: params.has('nosurface'),
+  noCard: params.has('nocard'),
   presentCopy: params.has('copy'),
   print: (text) => console.log(text),
   printErr: (text) => console.log(text),
@@ -459,6 +525,19 @@ var Module = {
     start.textContent = 'Start';
   },
   preRun: [() => {
+    if (!Module.noCard) {
+      try {
+        FS.mkdir(CARD_DIR);
+        FS.mount(IDBFS, {}, CARD_DIR);
+        Module.addRunDependency('card');
+        FS.syncfs(true, (err) => {
+          if (err) console.warn('memory card: could not read browser storage', err);
+          Module.removeRunDependency('card');
+        });
+      } catch (e) {
+        console.warn('memory card: browser storage is not available', e);
+      }
+    }
     for (const [key, value] of params) if (key.startsWith('PS2_')) Module.ENV[key] = value;
     Module.ENV.PS2_SCALE = scale;
     Module.addRunDependency('disc');
@@ -475,6 +554,7 @@ var Module = {
     });
   }],
   audioQueuedMs: () => Module._ps2web_audio_queued_ms(),
+  ps2CardSaved: () => storeCard(),
   onFrame: () => {
     pollInput();
     ++frames;

@@ -37,6 +37,8 @@ struct Options {
     std::vector<Press> presses;
     std::function<void()> on_vblank;
     std::function<void(const std::string &name, const std::uint8_t *code, std::size_t size)> on_vu_program;
+    std::string memcard_path;
+    std::function<void()> on_memcard_saved;
 };
 
 extern Options g_options;

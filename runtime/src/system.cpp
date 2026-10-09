@@ -124,6 +124,7 @@ void vblank() {
     time_frames();
     apply_presses();
     if (g_options.on_vblank) g_options.on_vblank();
+    iop::sio2::flush_cards();
     if (g_options.trace_iop_modules && g_frames % 25 == 0) std::fprintf(stderr, "[frame] %llu prims %llu\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(gs::primitives_drawn()));
     if (!g_options.frames_dir.empty() && g_options.frame_every && g_frames % g_options.frame_every == 0) dump_frame();
     hw::vblank_start();

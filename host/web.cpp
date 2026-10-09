@@ -282,6 +282,10 @@ int main(int argc, char **argv) {
         if (status == 200 || status == 201) std::fprintf(stderr, "[web] saved VU1 program %s\n", name.c_str());
         else unsupported = true;
     };
+    if (!EM_ASM_INT({ return Module.noCard ? 1 : 0; })) {
+        ps2::g_options.memcard_path = "/memcard/Mcd001.ps2";
+        ps2::g_options.on_memcard_saved = [] { MAIN_THREAD_ASYNC_EM_ASM({ if (Module.ps2CardSaved) Module.ps2CardSaved(); }); };
+    }
     ps2::set_audio_sink(push_audio);
     register_generated_code();
     register_generated_vu();
