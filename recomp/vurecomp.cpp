@@ -559,18 +559,7 @@ std::string generate(const Program &p, std::string &name) {
         const std::uint32_t next = (pc + 8u) & kMask;
         if (!in.count(next)) o += std::format("    vu::interpret(1, {}u);\n    return;\n", next);
     }
-    std::set<std::uint32_t> targets;
-    for (std::uint32_t pc : pcs) {
-        const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
-        if (hi & 0x80000000u) continue;
-        const std::uint32_t op = lo >> 25;
-        if (op == 0x21 || op == 0x25) targets.insert((pc + 16u) & kMask);
-        if (op == 0x08 && ((lo >> 11) & 15u) == 0) targets.insert(((((lo >> 10) & 0x7800u) | (lo & 0x7FFu)) * 8u) & kMask);
-    }
-    o += "dispatch:\n    switch (jpc) {\n";
-    for (std::uint32_t pc : pcs)
-        if (targets.count(pc)) o += std::format("    case {}u: goto {};\n", pc, label(pc));
-    o += "    default: vu::interpret(1, jpc); return;\n    }\n}\n\n";
+    o += "dispatch:\n    vu::interpret(1, jpc);\n    return;\n}\n\n";
     return local_vi(o);
 }
 
