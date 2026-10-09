@@ -180,6 +180,41 @@ void send_mbx(Cpu &c, int id, std::uint32_t message, bool from_interrupt) {
     }
 }
 
+struct HardTimer {
+    std::uint32_t compare = 0, handler = 0, common = 0, source = 1, prescale = 1;
+    bool running = false;
+    std::uint64_t generation = 0;
+};
+std::map<std::uint32_t, HardTimer> g_hard_timers;
+
+std::uint64_t timer_cycles(const HardTimer &t, std::uint32_t ticks) {
+    const std::uint64_t per_tick = (t.source & 4u) ? 2343u : std::max<std::uint32_t>(t.prescale, 1u);
+    return std::max<std::uint64_t>(static_cast<std::uint64_t>(ticks) * per_tick, 1u);
+}
+
+void arm_hard_timer(std::uint32_t id);
+
+void fire_hard_timer(std::uint32_t id, std::uint64_t generation) {
+    auto it = g_hard_timers.find(id);
+    if (it == g_hard_timers.end() || !it->second.running || it->second.generation != generation || !it->second.handler) return;
+    const std::uint32_t next = call_guest(it->second.handler, it->second.common);
+    it = g_hard_timers.find(id);
+    if (it == g_hard_timers.end() || !it->second.running || it->second.generation != generation) return;
+    if (!next) {
+        it->second.running = false;
+        return;
+    }
+    it->second.compare = next;
+    arm_hard_timer(id);
+}
+
+void arm_hard_timer(std::uint32_t id) {
+    HardTimer &t = g_hard_timers[id];
+    const std::uint64_t generation = ++t.generation;
+    if (!t.running || !t.handler || !t.compare) return;
+    schedule(now() + timer_cycles(t, t.compare), [id, generation]() { fire_hard_timer(id, generation); });
+}
+
 void fire_alarm(std::uint64_t key) {
     auto it = g_alarms.find(key);
     if (it == g_alarms.end() || !it->second.active) return;
@@ -432,6 +467,7 @@ void install_thbase() {
         c.r[2] = 0;
     });
     def("thbase", 41, "GetSystemStatusFlag", [](Cpu &c) { c.r[2] = 0; });
+    def("thbase", 43, "GetSystemTimeLow", [](Cpu &c) { c.r[2] = static_cast<std::uint32_t>(now()); });
 }
 
 void install_thsemap() {
@@ -752,6 +788,27 @@ void install_sysclib() {
         const auto pos = s.find(n);
         c.r[2] = pos == std::string::npos ? 0u : arg(c, 0) + static_cast<std::uint32_t>(pos);
     });
+    def("sysclib", 35, "strtok", [](Cpu &c) {
+        static std::uint32_t saved = 0;
+        std::uint32_t p = arg(c, 0) ? arg(c, 0) : saved;
+        const std::string delim = ram_string(arg(c, 1), 256);
+        const auto is_delim = [&delim](std::uint8_t ch) { return ch && delim.find(static_cast<char>(ch)) != std::string::npos; };
+        while (p && is_delim(read8(p))) ++p;
+        if (!p || !read8(p)) {
+            saved = 0;
+            c.r[2] = 0;
+            return;
+        }
+        const std::uint32_t token = p;
+        while (read8(p) && !is_delim(read8(p))) ++p;
+        if (read8(p)) {
+            write8(p, 0);
+            saved = p + 1;
+        } else {
+            saved = p;
+        }
+        c.r[2] = token;
+    });
     def("sysclib", 36, "strtol", [](Cpu &c) {
         const std::string s = ram_string(arg(c, 0), 256);
         char *end = nullptr;
@@ -894,6 +951,31 @@ void install_timrman() {
     def("timrman", 9, "SetTimerCounter", [](Cpu &c) { c.r[2] = 0; });
     def("timrman", 11, "SetTimerCompare", [](Cpu &c) { c.r[2] = 0; });
     def("timrman", 16, "GetHardTimerIntrCode", [](Cpu &c) { c.r[2] = 14; });
+    def("timrman", 20, "SetTimerHandler", [](Cpu &c) {
+        HardTimer &t = g_hard_timers[arg(c, 0)];
+        t.compare = arg(c, 1);
+        t.handler = arg(c, 2);
+        t.common = arg(c, 3);
+        if (t.running) arm_hard_timer(arg(c, 0));
+        c.r[2] = 0;
+    });
+    def("timrman", 22, "SetupHardTimer", [](Cpu &c) {
+        HardTimer &t = g_hard_timers[arg(c, 0)];
+        t.source = arg(c, 1);
+        t.prescale = arg(c, 3);
+        c.r[2] = 0;
+    });
+    def("timrman", 23, "StartHardTimer", [](Cpu &c) {
+        g_hard_timers[arg(c, 0)].running = true;
+        arm_hard_timer(arg(c, 0));
+        c.r[2] = 0;
+    });
+    def("timrman", 24, "StopHardTimer", [](Cpu &c) {
+        HardTimer &t = g_hard_timers[arg(c, 0)];
+        t.running = false;
+        ++t.generation;
+        c.r[2] = 0;
+    });
 }
 
 std::uint32_t dma_register(std::uint32_t ch, std::uint32_t reg) {
