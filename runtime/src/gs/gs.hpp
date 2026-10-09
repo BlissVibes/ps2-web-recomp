@@ -43,6 +43,7 @@ struct State {
 };
 
 extern State g_state;
+extern std::uint32_t g_setup_generation;
 std::uint8_t *memory();
 
 void init();

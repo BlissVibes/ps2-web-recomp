@@ -126,7 +126,18 @@ struct Batch {
     int minx = 1 << 30, miny = 1 << 30, maxx = -1, maxy = -1;
     std::uint32_t fbp = 0, fbw = 0, fpsm = 0, zbp = 0, zpsm = 0;
     bool zte = false;
+    int rx0 = 0, ry0 = 0, rx1 = -2, ry1 = -2;
+    Range fb_range, z_range;
 } g_batch;
+
+struct SetupCache {
+    std::uint32_t generation = ~0u, clut = ~0u;
+    std::uint64_t attr = ~0ull;
+    std::uint32_t setup[kSetupWords] = {};
+    std::uint32_t flags = 0;
+    std::uint64_t key = 0;
+    Range tex;
+} g_setup_cache;
 
 struct PreOp {
     bool clut = false;
@@ -424,15 +435,23 @@ void flush_batch() {
     b.maxx = b.maxy = -1;
 }
 
+void batch_ranges() {
+    Batch &b = g_batch;
+    if (b.rx0 == b.minx && b.ry0 == b.miny && b.rx1 == b.maxx && b.ry1 == b.maxy) return;
+    b.rx0 = b.minx;
+    b.ry0 = b.miny;
+    b.rx1 = b.maxx;
+    b.ry1 = b.maxy;
+    b.fb_range = region(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy);
+    b.z_range = region(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy);
+}
+
 bool batch_conflict(const Range &r, bool clut) {
-    const Batch &b = g_batch;
+    Batch &b = g_batch;
     if (b.prims.empty()) return false;
-    const Range fb = region(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy);
-    if (fb.overlaps(r.lo, r.hi)) return true;
-    if (b.zte) {
-        const Range z = region(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy);
-        if (z.overlaps(r.lo, r.hi)) return true;
-    }
+    batch_ranges();
+    if (b.fb_range.overlaps(r.lo, r.hi)) return true;
+    if (b.zte && b.z_range.overlaps(r.lo, r.hi)) return true;
     if (!clut)
         for (const Range &t : g_batch_reads)
             if (t.overlaps(r.lo, r.hi)) return true;
@@ -914,8 +933,23 @@ void draw(const State &st, const Vertex *v, int count) {
     if (!(st.prmodecont & 1u)) attr = (st.prim & 7u) | (st.prmode & ~7ull);
     const std::uint32_t prim = static_cast<std::uint32_t>(st.prim) & 7u;
     const Context &c = st.ctx[(attr >> 9) & 1u];
-    std::uint32_t setup[kSetupWords];
-    const std::uint32_t flags = make_setup(st, attr, setup);
+    SetupCache &cache = g_setup_cache;
+    if (cache.generation != g_setup_generation || cache.attr != attr || cache.clut != g_clut_slot) {
+        cache.generation = g_setup_generation;
+        cache.attr = attr;
+        cache.clut = g_clut_slot;
+        const std::uint32_t *w = cache.setup;
+        cache.flags = make_setup(st, attr, cache.setup);
+        cache.key = static_cast<std::uint64_t>(w[1]) | (static_cast<std::uint64_t>(w[2]) << 14) | (static_cast<std::uint64_t>(w[3]) << 20) |
+                    (static_cast<std::uint64_t>(w[5]) << 26) | (static_cast<std::uint64_t>(w[6]) << 40);
+        if (cache.flags & 2u) {
+            const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
+            const int tex_w = std::max(1 << tw, static_cast<int>(w[18] >> 16) + 1), tex_h = std::max(1 << th, static_cast<int>(w[19] >> 16) + 1);
+            cache.tex = region(w[12], w[13], w[14], 0, 0, tex_w - 1, tex_h - 1);
+        }
+    }
+    const std::uint32_t *setup = cache.setup;
+    const std::uint32_t flags = cache.flags;
     const bool fst = flags & 16u, iip = flags & 1u;
     const int ofx = static_cast<int>(c.xyoffset & 0xFFFFu), ofy = static_cast<int>((c.xyoffset >> 32) & 0xFFFFu);
     const int scax0 = static_cast<int>(setup[10] & 0xFFFFu), scax1 = static_cast<int>(setup[10] >> 16);
@@ -1007,22 +1041,13 @@ void draw(const State &st, const Vertex *v, int count) {
 
     Batch &b = g_batch;
     const bool zte = flags & 512u;
-    const std::uint64_t key = static_cast<std::uint64_t>(setup[1]) | (static_cast<std::uint64_t>(setup[2]) << 14) | (static_cast<std::uint64_t>(setup[3]) << 20) |
-                              (static_cast<std::uint64_t>(setup[5]) << 26) | (static_cast<std::uint64_t>(setup[6]) << 40);
+    const std::uint64_t key = cache.key;
     if (b.key != ~0ull && b.key != key) emit_all();
-    Range tex;
+    const Range &tex = cache.tex;
     if (flags & 2u) {
-        const std::uint32_t tw = setup[15] & 0xFFu, th = setup[15] >> 8;
-        const int w = std::max(1 << tw, static_cast<int>(setup[18] >> 16) + 1), h = std::max(1 << th, static_cast<int>(setup[19] >> 16) + 1);
-        tex = region(setup[12], setup[13], setup[14], 0, 0, w - 1, h - 1);
         if (!b.prims.empty()) {
-            const Range fb = region(b.fbp, b.fbw, b.fpsm, b.minx, b.miny, b.maxx, b.maxy);
-            bool hazard = tex.overlaps(fb.lo, fb.hi);
-            if (!hazard && b.zte) {
-                const Range z = region(b.zbp, b.fbw, b.zpsm, b.minx, b.miny, b.maxx, b.maxy);
-                hazard = tex.overlaps(z.lo, z.hi);
-            }
-            if (hazard) emit_all();
+            batch_ranges();
+            if (tex.overlaps(b.fb_range.lo, b.fb_range.hi) || (b.zte && tex.overlaps(b.z_range.lo, b.z_range.hi))) emit_all();
         }
     }
     if (b.prims.empty()) {
@@ -1033,11 +1058,12 @@ void draw(const State &st, const Vertex *v, int count) {
         b.zbp = setup[5];
         b.zpsm = setup[6];
         b.zte = false;
+        b.rx1 = -2;
     }
     b.zte = b.zte || zte;
     const std::size_t setups = b.setups.size() / kSetupWords;
     std::uint32_t setup_index;
-    if (setups && std::memcmp(b.setups.data() + (setups - 1) * kSetupWords, setup, sizeof setup) == 0) {
+    if (setups && std::memcmp(b.setups.data() + (setups - 1) * kSetupWords, setup, kSetupWords * 4) == 0) {
         setup_index = static_cast<std::uint32_t>(setups - 1);
     } else {
         setup_index = static_cast<std::uint32_t>(setups);

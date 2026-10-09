@@ -23,6 +23,7 @@
 namespace ps2::gs {
 
 State g_state;
+std::uint32_t g_setup_generation = 0;
 
 void serve_state(const void *payload);
 
@@ -367,6 +368,7 @@ void render_reset() {
     init();
     std::memset(&g_state, 0, sizeof g_state);
     std::memset(g_memory, 0, sizeof g_memory);
+    ++g_setup_generation;
     g_transfer = Transfer{};
     g_primitives = 0;
     raster::reset();
@@ -435,6 +437,8 @@ void vertex(std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint8_t f, b
 void write(std::uint32_t reg, std::uint64_t value) {
     State &s = g_state;
     ++g_writes[reg & 127u];
+    constexpr std::uint64_t kVertexRegs = (1ull << 0x01) | (1ull << 0x02) | (1ull << 0x03) | (1ull << 0x04) | (1ull << 0x05) | (1ull << 0x0A) | (1ull << 0x0C) | (1ull << 0x0D);
+    if (reg >= 64 || !((kVertexRegs >> reg) & 1u)) ++g_setup_generation;
     static const char *seq = std::getenv("PS2_TRACE_GSSEQ");
     if (seq) {
         static std::uint64_t n = 0, start = std::strtoull(seq, nullptr, 10);
@@ -934,6 +938,7 @@ std::string g_state_error;
 void render_state(ps2::state::Stream &s) {
     flush_and_wait();
     s.pod(g_state);
+    ++g_setup_generation;
     s.pod(g_pmode);
     s.pod(g_smode1);
     s.pod(g_smode2);
