@@ -13,6 +13,7 @@
   #bar { display: flex; gap: 16px; align-items: center; padding: 6px 12px; background: #141418; border-top: 1px solid #222; }
   #status { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #stats { font-variant-numeric: tabular-nums; color: #9ad; }
+  select { background: #2a3a55; color: #fff; border: 0; padding: 5px 8px; border-radius: 4px; }
   button { background: #2a3a55; color: #fff; border: 0; padding: 6px 14px; border-radius: 4px; cursor: pointer; }
   #overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,.6); padding: 16px; }
   #panel { display: flex; flex-direction: column; align-items: center; gap: 14px; max-width: 520px; text-align: center; }
@@ -94,7 +95,13 @@
     </div>
   </div>
 </div>
-<div id="bar"><span id="status">Loading…</span><span id="stats"></span><button id="controls-toggle" type="button" hidden>Hide controls</button></div>
+<div id="bar"><span id="status">Loading…</span><span id="stats"></span>
+  <select id="scale" aria-label="Resolution" title="Internal resolution, the page reloads to apply it">
+    <option value="1">640×512</option>
+    <option value="2">1280×1024</option>
+    <option value="3">1920×1536</option>
+  </select>
+  <button id="controls-toggle" type="button" hidden>Hide controls</button></div>
 <div id="overlay"><div id="panel"><p id="help" hidden></p><button id="start" disabled>Loading…</button></div></div>
 <script>
 const statusEl = document.getElementById('status');
@@ -171,6 +178,20 @@ function onTouch(e) {
   touchRoot.querySelectorAll('[data-dir]').forEach((el) => el.classList.toggle('on', (buttons & Number(el.dataset.dir)) !== 0));
 }
 for (const type of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) touchRoot.addEventListener(type, onTouch, { passive: false });
+
+const scaleSelect = document.getElementById('scale');
+let scale = params.get('PS2_SCALE');
+if (!scale) {
+  try { scale = localStorage.getItem('ps2web-scale'); } catch (e) {}
+}
+scale = ['1', '2', '3'].includes(scale) ? scale : '1';
+scaleSelect.value = scale;
+scaleSelect.addEventListener('change', () => {
+  try { localStorage.setItem('ps2web-scale', scaleSelect.value); } catch (e) {}
+  const url = new URL(location.href);
+  url.searchParams.delete('PS2_SCALE');
+  location.href = url.href;
+});
 
 const controlsButton = document.getElementById('controls-toggle');
 let hideControls = false;
@@ -385,6 +406,7 @@ var Module = {
   },
   preRun: [() => {
     for (const [key, value] of params) if (key.startsWith('PS2_')) Module.ENV[key] = value;
+    Module.ENV.PS2_SCALE = scale;
     Module.addRunDependency('disc');
     Promise.all([fetch(Module.discUrl, { method: 'HEAD' }), chooseGpu().catch((e) => 'GPU check failed: ' + e)]).then(([r, gpu]) => {
       Module.discSize = Number(r.headers.get('content-length')) || 0;

@@ -756,9 +756,10 @@ bool display(const DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uint32
 #ifdef PS2_GPU
     if (gpu_on()) {
         const gpu::DisplaySource src{fbp * 32, fbw, psm, dbx, dby, width, height, halved};
-        if (!cpu_raster()) return gpu::display(src, rgba);
+        if (!cpu_raster()) return gpu::display(src, rgba, width, height);
         static const bool compare = std::getenv("PS2_GS_COMPARE") != nullptr;
-        if (compare) g_gpu_frame.clear(), gpu::display(src, g_gpu_frame);
+        std::uint32_t gw = 0, gh = 0;
+        if (compare) g_gpu_frame.clear(), gpu::display(src, g_gpu_frame, gw, gh);
     }
 #endif
     rgba.resize(static_cast<std::size_t>(width) * height);

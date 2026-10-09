@@ -32,7 +32,7 @@ void local_copy(const State &s);
 void load_clut(std::uint64_t tex0, std::uint64_t texclut);
 void flush();
 void download(std::uint8_t *memory);
-bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba);
+bool display(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 bool display_async(const DisplaySource &src, std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 bool attach_surface(const SurfaceTarget &target);
 void resize_surface(std::uint32_t width, std::uint32_t height);
