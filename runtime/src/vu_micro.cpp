@@ -640,11 +640,43 @@ void run_fast(int n, std::uint32_t address);
 std::unordered_map<std::uint64_t, ProgramFn> g_programs;
 std::uint32_t g_generation[2] = {1, 1};
 
+struct Candidate {
+    std::vector<std::uint32_t> runs;
+    std::vector<std::uint8_t> code;
+    ProgramFn function = nullptr;
+    ProgramFn jit = nullptr;
+};
+
 struct EntryCache {
     std::uint32_t generation = 0;
     ProgramFn function = nullptr;
     ProgramFn jit = nullptr;
+    std::vector<Candidate> candidates;
+    std::uint32_t next = 0;
 };
+
+bool candidate_matches(const Candidate &c) {
+    const std::uint8_t *code = c.code.data();
+    for (std::size_t i = 0; i < c.runs.size(); i += 2) {
+        if (std::memcmp(g_vu1_code + c.runs[i], code, c.runs[i + 1]) != 0) return false;
+        code += c.runs[i + 1];
+    }
+    return true;
+}
+
+Candidate make_candidate(std::vector<std::uint32_t> pcs) {
+    std::sort(pcs.begin(), pcs.end());
+    Candidate c;
+    for (std::uint32_t pc : pcs) {
+        if (!c.runs.empty() && c.runs[c.runs.size() - 2] + c.runs.back() == pc) c.runs.back() += 8;
+        else {
+            c.runs.push_back(pc);
+            c.runs.push_back(8);
+        }
+        c.code.insert(c.code.end(), g_vu1_code + pc, g_vu1_code + pc + 8);
+    }
+    return c;
+}
 std::unordered_map<std::uint64_t, ProgramFn> g_jit_programs;
 std::vector<std::uint32_t> *g_kick_log = nullptr;
 std::int64_t *g_capture = nullptr;
@@ -760,6 +792,12 @@ ProgramFn lookup(std::uint32_t address) {
     EntryCache &e = g_entries[(address & 16383u) >> 3];
     if (e.generation == g_generation[1]) return e.function;
     e.generation = g_generation[1];
+    for (const Candidate &c : e.candidates)
+        if (candidate_matches(c)) {
+            e.function = c.function;
+            e.jit = c.jit;
+            return e.function;
+        }
     const std::vector<std::uint32_t> pcs = reachable(g_vu1_code, 16383u, address);
     const std::uint64_t key = program_key(g_vu1_code, pcs, address & 16383u);
     const auto it = g_programs.find(key);
@@ -768,6 +806,11 @@ ProgramFn lookup(std::uint32_t address) {
     const int jit_mode = jit::mode();
     if (jit_mode == 2 || (jit_mode >= 1 && !e.function)) e.function = jit_program(key, address);
     else if (jit_mode == 3) e.jit = jit_program(key, address);
+    Candidate c = make_candidate(pcs);
+    c.function = e.function;
+    c.jit = e.jit;
+    if (e.candidates.size() < 8) e.candidates.push_back(std::move(c));
+    else e.candidates[e.next++ % 8] = std::move(c);
     static const char *record = std::getenv("PS2_VU_RECORD");
     if (!e.function && (record || g_options.on_vu_program)) {
         char name[64];
