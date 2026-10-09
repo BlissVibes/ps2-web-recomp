@@ -686,9 +686,9 @@ void submit(WGPUTextureView present_view = nullptr) {
     g_clut_loads = 0;
 }
 
-void read_back(WGPUBuffer source, std::uint64_t bytes, void *out) {
+void read_back(WGPUBuffer source, std::uint64_t bytes, void *out, std::uint64_t offset = 0) {
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, nullptr);
-    wgpuCommandEncoderCopyBufferToBuffer(enc, source, 0, g_readback, 0, bytes);
+    wgpuCommandEncoderCopyBufferToBuffer(enc, source, offset, g_readback, 0, bytes);
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
     wgpuQueueSubmit(g_queue, 1, &cmd);
     wgpuCommandBufferRelease(cmd);
@@ -849,7 +849,7 @@ bool init(Mode m) {
     swizzle_tables(tables);
     g_tables = make_buffer(tables.size() * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
     wgpuQueueWriteBuffer(g_queue, g_tables, 0, tables.data(), tables.size() * 4);
-    g_clut = make_buffer(static_cast<std::uint64_t>(kClutSlots) * kClutEntries * 4, WGPUBufferUsage_Storage);
+    g_clut = make_buffer(static_cast<std::uint64_t>(kClutSlots) * kClutEntries * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
     g_scratch = make_buffer((static_cast<std::uint64_t>(g_copy_words) + 2ull * g_field_words) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
     g_cache = make_buffer(static_cast<std::uint64_t>(kCacheWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
     g_cache_copy.assign(kCacheWords, 0);
@@ -1159,6 +1159,32 @@ void download(std::uint8_t *memory) {
     dispatch_linear(kResolve, kMemorySize / 4, push_params({}));
     submit();
     read_back(g_scratch, kMemorySize, memory);
+}
+
+void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vector<std::uint32_t> &clut) {
+    flush_all();
+    submit();
+    scale = g_scale;
+    vram.resize(static_cast<std::size_t>(kMemorySize / 4) * g_scale * g_scale);
+    read_back(g_vram, vram.size() * 4, vram.data());
+    clut.resize(kClutEntries);
+    read_back(g_clut, kClutEntries * 4, clut.data(), static_cast<std::uint64_t>(g_clut_slot) * kClutEntries * 4);
+}
+
+void write_state(const std::vector<std::uint32_t> &vram, std::uint32_t scale, const std::vector<std::uint32_t> &clut) {
+    wait_idle();
+    const std::size_t words = kMemorySize / 4;
+    const std::uint32_t from = scale * scale, to = g_scale * g_scale;
+    if (from == to && vram.size() == words * to) {
+        wgpuQueueWriteBuffer(g_queue, g_vram, 0, vram.data(), vram.size() * 4);
+    } else {
+        std::vector<std::uint32_t> layers(words * to);
+        for (std::size_t w = 0; w < words; ++w)
+            for (std::uint32_t k = 0; k < to; ++k) layers[w * to + k] = vram[w * from];
+        wgpuQueueWriteBuffer(g_queue, g_vram, 0, layers.data(), layers.size() * 4);
+    }
+    if (clut.size() >= kClutEntries) wgpuQueueWriteBuffer(g_queue, g_clut, static_cast<std::uint64_t>(g_clut_slot) * kClutEntries * 4, clut.data(), kClutEntries * 4);
+    wait_idle();
 }
 
 void stats() {

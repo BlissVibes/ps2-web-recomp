@@ -6,7 +6,13 @@
 #include <string>
 #include <vector>
 
+namespace ps2::state {
+class Stream;
+}
+
 namespace ps2::iop {
+
+void state(ps2::state::Stream &s);
 
 inline constexpr std::uint32_t kRamSize = 2u << 20;
 inline constexpr std::uint32_t kClockDivider = 8;

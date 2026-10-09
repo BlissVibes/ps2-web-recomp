@@ -6,7 +6,10 @@
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
 
+#include "ps2/state.hpp"
+
 #include <algorithm>
+#include <stdexcept>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -826,6 +829,41 @@ std::uint32_t eret(Cpu &c) {
 
 void set_interrupts(Cpu &c, bool enabled) {
     c.cop0[12] = enabled ? (c.cop0[12] | 0x10000u) : (c.cop0[12] & ~0x10000u);
+}
+
+}
+
+namespace ps2::kernel {
+
+std::function<void()> alarm_action(int id) {
+    return [id]() { fire_alarm(id); };
+}
+
+void state(ps2::state::Stream &s) {
+    s.tag("eekern");
+    if (s.saving() && (g_in_handler || !g_guest_calls.empty())) throw std::runtime_error("the EE is inside an interrupt handler");
+    s.map(g_threads);
+    s.map(g_semas, [&s](Semaphore &v) {
+        s.pod(v.count);
+        s.pod(v.max);
+        s.pod(v.init);
+        s.pod(v.attr);
+        s.pod(v.option);
+        s.deque(v.waiters);
+    });
+    s.vec(g_intc_handlers);
+    s.vec(g_dmac_handlers);
+    s.map(g_alarms);
+    s.pod(g_current);
+    s.pod(g_next_handler);
+    s.pod(g_order);
+    s.pod(g_reschedule);
+    s.vec(g_pending_alarms);
+    s.pod(g_vsync_flag);
+    s.pod(g_vsync_data);
+    s.pod(g_osd_config);
+    s.pod(g_boot_argc);
+    s.pod(g_boot_argv);
 }
 
 }

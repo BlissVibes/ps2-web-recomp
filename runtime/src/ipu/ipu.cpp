@@ -4,6 +4,8 @@
 #include "../dmac.hpp"
 #include "../hw.hpp"
 
+#include "ps2/state.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -679,6 +681,36 @@ void stats() {
     std::fprintf(stderr, " stalls %llu out %llu qwords, busy %d decoding %d cmd 0x%08X in %zu bytes bit %zu out %zu\n",
                  static_cast<unsigned long long>(g_stalls), static_cast<unsigned long long>(g_out_qwords), g_busy, g_decoding, g_command,
                  g_in.size(), g_bit, g_out.size() - g_out_pos);
+}
+
+}
+
+namespace ps2::ipu {
+
+void state(ps2::state::Stream &s) {
+    s.tag("ipu");
+    s.vec(g_in);
+    s.pod(g_bit);
+    s.vec(g_out);
+    s.pod(g_out_pos);
+    s.pod(g_ctrl);
+    s.pod(g_result);
+    s.pod(g_command);
+    s.pod(g_last);
+    s.pod(g_busy);
+    s.pod(g_decoding);
+    s.pod(g_interrupt);
+    s.pod(g_starved);
+    s.pod(g_phase);
+    s.pod(g_qsc);
+    s.pod(g_count);
+    s.pod(g_first);
+    s.pod(g_intra_iq);
+    s.pod(g_nonintra_iq);
+    s.pod(g_vqclut);
+    s.pod(g_th0);
+    s.pod(g_th1);
+    s.pod(g_dc);
 }
 
 }

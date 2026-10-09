@@ -2,7 +2,13 @@
 
 #include <cstdint>
 
+namespace ps2::state {
+class Stream;
+}
+
 namespace ps2::ipu {
+
+void state(ps2::state::Stream &s);
 
 void reset();
 std::uint32_t read32(std::uint32_t a);

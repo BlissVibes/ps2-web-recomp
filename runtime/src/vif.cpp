@@ -6,6 +6,8 @@
 #include "hw.hpp"
 #include "vu_micro.hpp"
 
+#include "ps2/state.hpp"
+
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -344,6 +346,35 @@ void write(int unit, std::uint32_t reg, std::uint32_t value) {
         if (reg >= 0x100 && reg < 0x140) u.row[(reg - 0x100) >> 4] = value;
         else if (reg >= 0x140 && reg < 0x180) u.col[(reg - 0x140) >> 4] = value;
         break;
+    }
+}
+
+}
+
+namespace ps2::vif {
+
+void state(ps2::state::Stream &s) {
+    s.tag("vif");
+    for (Unit *u : {&g_units[0], &g_units[1], &g_vu_side}) {
+        s.pod(u->stat);
+        s.pod(u->err);
+        s.pod(u->mark);
+        s.pod(u->cycle);
+        s.pod(u->mode);
+        s.pod(u->num);
+        s.pod(u->mask);
+        s.pod(u->code);
+        s.pod(u->itops);
+        s.pod(u->base);
+        s.pod(u->ofst);
+        s.pod(u->tops);
+        s.pod(u->itop);
+        s.pod(u->top);
+        s.pod(u->row);
+        s.pod(u->col);
+        s.pod(u->dbf);
+        s.pod(u->stalled);
+        s.vec(u->pending);
     }
 }
 

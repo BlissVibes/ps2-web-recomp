@@ -3,6 +3,8 @@
 
 #include "ps2/disc.hpp"
 
+#include "ps2/state.hpp"
+
 #include <algorithm>
 #include <cstdio>
 #include <map>
@@ -166,6 +168,21 @@ void install_io() {
     });
     for (std::uint32_t i : {9u, 10u, 11u, 12u, 13u, 14u, 15u, 17u, 20u, 21u, 25u, 27u, 31u})
         def("ioman", i, "ioman", [](Cpu &c) { c.r[2] = static_cast<std::uint32_t>(-1); });
+}
+
+}
+
+namespace ps2::iop::io {
+
+void state(ps2::state::Stream &s) {
+    s.tag("iopio");
+    s.map(g_files, [&s](File &f) {
+        s.pod(f.sector);
+        s.pod(f.size);
+        s.pod(f.position);
+        s.vec(f.memory);
+        s.pod(f.in_memory);
+    });
 }
 
 }

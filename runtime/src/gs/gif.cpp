@@ -3,6 +3,8 @@
 #include "gs.hpp"
 #include "queue.hpp"
 
+#include "ps2/state.hpp"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -189,6 +191,18 @@ std::uint32_t read(std::uint32_t a) {
 
 void write(std::uint32_t a, std::uint32_t v) {
     if ((a & 0xF0u) == 0x00u && (v & 1u)) reset();
+}
+
+}
+
+namespace ps2::gif {
+
+void state(ps2::state::Stream &s) {
+    s.tag("gif");
+    s.pod(g_paths);
+    s.pod(g_stat);
+    s.pod(g_tags);
+    s.pod(g_scan);
 }
 
 }

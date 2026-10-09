@@ -2,6 +2,8 @@
 
 #include "ps2/disc.hpp"
 
+#include "ps2/state.hpp"
+
 #include <algorithm>
 #include <cstdio>
 #include <ctime>
@@ -58,22 +60,13 @@ std::vector<std::uint8_t> read_disc_file(const std::string &path) {
     return data;
 }
 
-bool cd_read(std::uint32_t lsn, std::uint32_t sectors, std::uint32_t buffer, std::uint32_t mode, std::function<void()> done);
-
 namespace {
-
-std::function<void()> g_ee_done;
 
 bool start_read(std::uint32_t lsn, std::uint32_t sectors, std::uint32_t buffer, std::uint32_t, bool) {
     if (g_cd.busy) return false;
     g_cd.busy = true;
     g_cd.error = 0;
-    schedule(now() + read_cycles(sectors), [lsn, sectors, buffer]() {
-        std::vector<std::uint8_t> data(static_cast<std::size_t>(sectors) * disc::kSector);
-        disc::read(lsn, sectors, data.data());
-        for (std::size_t i = 0; i < data.size(); ++i) write8(buffer + static_cast<std::uint32_t>(i), data[i]);
-        finish_read();
-    });
+    schedule(now() + read_cycles(sectors), Job{kJobCdRead, lsn, sectors, buffer});
     return true;
 }
 
@@ -81,6 +74,12 @@ bool start_read(std::uint32_t lsn, std::uint32_t sectors, std::uint32_t buffer, 
 
 void install_cdvd() {
     g_cd = CdState{};
+    register_job(kJobCdRead, [](const Job &j) {
+        std::vector<std::uint8_t> data(static_cast<std::size_t>(j.b) * disc::kSector);
+        disc::read(j.a, j.b, data.data());
+        for (std::size_t i = 0; i < data.size(); ++i) write8(j.c + static_cast<std::uint32_t>(i), data[i]);
+        finish_read();
+    });
     register_hle_library("cdvdman", 0x0101);
     def("cdvdman", 4, "sceCdInit", [](Cpu &c) { c.r[2] = 1; });
     def("cdvdman", 5, "sceCdStandby", [](Cpu &c) { c.r[2] = 1; });
@@ -155,17 +154,6 @@ void install_cdvd() {
 
 bool cd_busy() { return g_cd.busy; }
 
-bool cd_read(std::uint32_t lsn, std::uint32_t sectors, std::uint32_t buffer, std::uint32_t mode, std::function<void()> done) {
-    if (!start_read(lsn, sectors, buffer, mode, false)) return false;
-    g_ee_done = std::move(done);
-    schedule(now() + read_cycles(sectors) + 1, []() {
-        auto d = std::move(g_ee_done);
-        g_ee_done = nullptr;
-        if (d) d();
-    });
-    return true;
-}
-
 }
 
 std::int32_t load_module(const std::string &path, const std::string &args, std::function<void(int, int)> done) {
@@ -177,6 +165,18 @@ std::int32_t load_module(const std::string &path, const std::string &args, std::
         std::fprintf(stderr, "[iop] cannot read module %s\n", path.c_str());
     }
     return load_module_buffer(data, path, args, std::move(done));
+}
+
+}
+
+namespace ps2::iop::kernel {
+
+void cdvd_state(ps2::state::Stream &s) {
+    s.tag("cdvd");
+    s.pod(g_cd.busy);
+    s.pod(g_cd.callback);
+    s.pod(g_cd.error);
+    s.vec(g_cd.sync_waiters);
 }
 
 }

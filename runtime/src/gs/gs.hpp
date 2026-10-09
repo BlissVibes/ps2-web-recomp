@@ -6,6 +6,10 @@
 #include <functional>
 #include <vector>
 
+namespace ps2::state {
+class Stream;
+}
+
 namespace ps2::gs {
 
 inline constexpr std::uint32_t kMemorySize = 4u << 20;
@@ -42,6 +46,7 @@ extern State g_state;
 std::uint8_t *memory();
 
 void init();
+void state(ps2::state::Stream &s);
 void reset();
 void write(std::uint32_t reg, std::uint64_t value);
 void signal(std::uint32_t reg, std::uint64_t value);

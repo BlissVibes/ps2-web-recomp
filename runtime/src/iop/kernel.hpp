@@ -8,7 +8,16 @@
 #include <string>
 #include <vector>
 
+namespace ps2::state {
+class Stream;
+}
+
 namespace ps2::iop::kernel {
+
+void state(ps2::state::Stream &s);
+void libs_state(ps2::state::Stream &s);
+void cdvd_state(ps2::state::Stream &s);
+void cdvdfsv_state(ps2::state::Stream &s);
 
 enum Status { kRun = 1, kReady = 2, kWait = 4, kSuspend = 8, kWaitSuspend = 12, kDormant = 16 };
 enum WaitKind { kWaitNone, kWaitSleep, kWaitDelay, kWaitSema, kWaitEvent, kWaitMbx, kWaitFpl, kWaitVblank, kWaitRpc, kWaitHle };
@@ -41,6 +50,29 @@ bool switch_pending();
 std::uint64_t now();
 std::uint64_t usec_to_cycles(std::uint64_t usec);
 void schedule(std::uint64_t at, std::function<void()> action);
+
+enum JobKind : std::uint32_t {
+    kJobNone,
+    kJobHardTimer,
+    kJobAlarm,
+    kJobDeleteThread,
+    kJobDelayWake,
+    kJobSpuTick,
+    kJobDmaDone,
+    kJobCdRead,
+    kJobFsvRead,
+    kJobFsvComplete,
+    kJobFsvIopRead,
+    kJobSifDmaCallback,
+    kJobCount
+};
+struct Job {
+    std::uint32_t kind = kJobNone;
+    std::uint32_t a = 0, b = 0, c = 0, d = 0;
+};
+using JobHandler = void (*)(const Job &);
+void register_job(std::uint32_t kind, JobHandler handler);
+void schedule(std::uint64_t at, const Job &job);
 
 Thread *current();
 Thread *thread(int id);

@@ -3,8 +3,16 @@
 #include "ps2/cpu.hpp"
 
 #include <cstdint>
+#include <functional>
+
+namespace ps2::state {
+class Stream;
+}
 
 namespace ps2::kernel {
+
+void state(ps2::state::Stream &s);
+std::function<void()> alarm_action(int id);
 
 void reset();
 void start_main_thread(std::uint32_t entry, std::uint32_t gp, std::uint32_t argc, std::uint32_t argv);

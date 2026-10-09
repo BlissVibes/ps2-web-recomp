@@ -3,7 +3,13 @@
 #include <cstdint>
 #include <string>
 
+namespace ps2::state {
+class Stream;
+}
+
 namespace ps2::iop::io {
+
+void state(ps2::state::Stream &s);
 
 int open(const std::string &path, std::uint32_t flags);
 int close(int fd);

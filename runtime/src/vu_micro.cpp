@@ -9,6 +9,8 @@
 #include "ps2/vu.hpp"
 #include "ps2/vu_ops.hpp"
 
+#include "ps2/state.hpp"
+
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -907,3 +909,22 @@ void vcallms(Cpu &, std::uint32_t address) { vu::run(0, address); }
 }
 
 __attribute__((weak)) void register_generated_vu() {}
+
+namespace ps2::vu {
+
+void state(ps2::state::Stream &s) {
+    s.tag("vu");
+    s.pod(g_vu1);
+    s.pod(g_top);
+    s.pod(g_itop);
+    s.bytes(g_vu0_code, sizeof g_vu0_code);
+    s.bytes(g_vu0_mem, sizeof g_vu0_mem);
+    s.bytes(g_vu1_code, sizeof g_vu1_code);
+    s.bytes(g_vu1_mem, sizeof g_vu1_mem);
+    if (s.loading()) {
+        code_changed(0);
+        code_changed(1);
+    }
+}
+
+}

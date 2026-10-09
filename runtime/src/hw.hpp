@@ -3,6 +3,11 @@
 #include "ps2/cpu.hpp"
 
 #include <cstdint>
+#include <functional>
+
+namespace ps2::state {
+class Stream;
+}
 
 namespace ps2 {
 
@@ -14,6 +19,9 @@ extern std::uint8_t g_vu1_mem[16384];
 std::uint32_t physical(std::uint32_t a);
 
 namespace hw {
+
+void state(ps2::state::Stream &s);
+std::function<void()> event_action(int id);
 
 enum Event {
     kEventVblank,

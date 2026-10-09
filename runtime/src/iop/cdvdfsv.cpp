@@ -4,6 +4,8 @@
 #include "ps2/disc.hpp"
 #include "ps2/memory.hpp"
 
+#include "ps2/state.hpp"
+
 #include <cstdio>
 #include <ctime>
 #include <vector>
@@ -32,6 +34,19 @@ void read_to_ee(std::uint32_t sector, std::uint32_t count, std::uint32_t dst) {
 }
 
 void install_cdvdfsv() {
+    g_streaming = false;
+    g_stream_pos = 0;
+    register_job(kJobFsvRead, [](const Job &j) {
+        read_to_ee(j.a, j.b, j.c);
+        sif::complete_call(0x80000595u);
+    });
+    register_job(kJobFsvComplete, [](const Job &) { sif::complete_call(0x80000595u); });
+    register_job(kJobFsvIopRead, [](const Job &j) {
+        std::vector<std::uint8_t> data(static_cast<std::size_t>(j.b) * disc::kSector);
+        disc::read(j.a, j.b, data.data());
+        for (std::size_t i = 0; i < data.size(); ++i) write8(j.c + static_cast<std::uint32_t>(i), data[i]);
+        sif::complete_call(0x80000595u);
+    });
     sif::register_hle_server(0x80000592u, [](std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t ret, std::uint32_t ret_size) {
         if (ret_size >= 16) set_ee32(ret + 12, 0xFF);
         return true;
@@ -77,15 +92,12 @@ void install_cdvdfsv() {
         switch (method) {
         case 0x01:
             if (ret_size >= 4) set_ee32(ret, 0);
-            schedule(now() + delay(count), [sector, count, dst]() {
-                read_to_ee(sector, count, dst);
-                sif::complete_call(0x80000595u);
-            });
+            schedule(now() + delay(count), Job{kJobFsvRead, sector, count, dst});
             return false;
         case 0x04: set_ee32(ret, 1); return true;
         case 0x05: return true;
         case 0x08:
-            schedule(now() + delay(0), []() { sif::complete_call(0x80000595u); });
+            schedule(now() + delay(0), Job{kJobFsvComplete});
             return false;
         case 0x09: {
             const std::uint32_t cmd = ee32(args + 12);
@@ -95,10 +107,7 @@ void install_cdvdfsv() {
                 const std::uint32_t pos = g_stream_pos;
                 g_stream_pos += count;
                 set_ee32(ret, count);
-                schedule(now() + delay(count), [pos, count, dst]() {
-                    read_to_ee(pos, count, dst);
-                    sif::complete_call(0x80000595u);
-                });
+                schedule(now() + delay(count), Job{kJobFsvRead, pos, count, dst});
                 return false;
             }
             case 3: g_streaming = false; set_ee32(ret, 1); return true;
@@ -110,12 +119,7 @@ void install_cdvdfsv() {
         }
         case 0x0D:
             if (ret_size >= 4) set_ee32(ret, 0);
-            schedule(now() + delay(count), [sector, count, dst]() {
-                std::vector<std::uint8_t> data(static_cast<std::size_t>(count) * disc::kSector);
-                disc::read(sector, count, data.data());
-                for (std::size_t i = 0; i < data.size(); ++i) write8(dst + static_cast<std::uint32_t>(i), data[i]);
-                sif::complete_call(0x80000595u);
-            });
+            schedule(now() + delay(count), Job{kJobFsvIopRead, sector, count, dst});
             return false;
         case 0x0E: set_ee32(ret, 2); return true;
         default:
@@ -145,6 +149,16 @@ void install_cdvdfsv() {
     };
     sif::register_hle_server(0x8000059Au, ready);
     sif::register_hle_server(0x8000059Cu, ready);
+}
+
+}
+
+namespace ps2::iop::kernel {
+
+void cdvdfsv_state(ps2::state::Stream &s) {
+    s.tag("cdvdfsv");
+    s.pod(g_streaming);
+    s.pod(g_stream_pos);
 }
 
 }

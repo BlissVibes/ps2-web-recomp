@@ -10,6 +10,8 @@
 #include "ps2/system.hpp"
 #include "vif.hpp"
 
+#include "ps2/state.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -374,6 +376,22 @@ void write(std::uint32_t a, std::uint32_t v) {
         }
         return;
     }
+}
+
+}
+
+namespace ps2::dmac {
+
+void state(ps2::state::Stream &s) {
+    s.tag("dmac");
+    s.pod(g_ch);
+    s.pod(g_ctrl);
+    s.pod(g_pcr);
+    s.pod(g_sqwc);
+    s.pod(g_rbsr);
+    s.pod(g_rbor);
+    s.pod(g_stadr);
+    s.pod(g_enable);
 }
 
 }

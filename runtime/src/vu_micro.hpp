@@ -4,7 +4,13 @@
 
 #include <cstdint>
 
+namespace ps2::state {
+class Stream;
+}
+
 namespace ps2::vu {
+
+void state(ps2::state::Stream &s);
 
 void reset();
 void run(int unit, std::uint32_t address);

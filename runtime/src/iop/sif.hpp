@@ -3,7 +3,13 @@
 #include <cstdint>
 #include <functional>
 
+namespace ps2::state {
+class Stream;
+}
+
 namespace ps2::sif {
+
+void state(ps2::state::Stream &s);
 
 using HleServer = std::function<bool(std::uint32_t method, std::uint32_t args, std::uint32_t args_size, std::uint32_t ret, std::uint32_t ret_size)>;
 

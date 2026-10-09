@@ -39,6 +39,8 @@ struct Options {
     std::function<void(const std::string &name, const std::uint8_t *code, std::size_t size)> on_vu_program;
     std::string memcard_path;
     std::function<void()> on_memcard_saved;
+    std::string save_state_path;
+    std::uint64_t save_state_frame = 0;
 };
 
 extern Options g_options;
@@ -69,6 +71,8 @@ bool load_elf(const std::string &path, std::uint32_t &entry);
 void boot(std::uint32_t entry, const std::vector<std::string> &args);
 int run();
 void halt(const std::string &reason);
+bool save_state(const std::string &path);
+bool load_state(const std::string &path);
 bool halted();
 std::uint64_t frame_count();
 

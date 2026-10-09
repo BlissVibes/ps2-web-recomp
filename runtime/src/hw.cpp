@@ -11,6 +11,8 @@
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
 
+#include "ps2/state.hpp"
+
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -273,6 +275,26 @@ void write128(std::uint32_t a, const Reg128 &v) {
     if (a >= 0x10006000u && a < 0x10007000u) { gif::transfer(3, bytes, 1); return; }
     if (a >= 0x10007010u && a < 0x10007020u) { ipu::write_fifo(bytes); return; }
     report("write128", a, v.d[0]);
+}
+
+}
+
+namespace ps2::hw {
+
+std::function<void()> event_action(int id) {
+    if (id == kEventVblankEnd) return [] { intc_raise(3); };
+    if (id >= kEventTimer0 && id <= kEventTimer3) return [n = id - kEventTimer0] { timer_event(n); };
+    return [] {};
+}
+
+void state(ps2::state::Stream &s) {
+    s.tag("eehw");
+    s.pod(g_intc_stat);
+    s.pod(g_intc_mask);
+    s.pod(g_dmac_stat);
+    s.map(g_regs);
+    s.pod(g_crt);
+    s.pod(g_timers);
 }
 
 }

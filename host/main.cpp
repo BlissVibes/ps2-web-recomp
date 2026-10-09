@@ -23,7 +23,8 @@ int usage() {
                  "usage: ps2run <elf> [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
                  "              [--disc image.iso] [--memcard card.ps2] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
                  "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n]\n"
-                 "              [--press frame:button[+button][:frames]]... [--window]\n");
+                 "              [--press frame:button[+button][:frames]]... [--window]\n"
+                 "              [--save-state frame:file] [--load-state file]\n");
     return 2;
 }
 
@@ -33,6 +34,7 @@ int main(int argc, char **argv) {
     if (argc < 2) return usage();
     std::vector<std::string> args{argv[1]};
     [[maybe_unused]] bool window = false;
+    std::string load_path;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--arg" && i + 1 < argc) args.push_back(argv[++i]);
@@ -59,6 +61,14 @@ int main(int argc, char **argv) {
         else if (a == "--window") window = true;
 #endif
         else if (a == "--frame-every" && i + 1 < argc) ps2::g_options.frame_every = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        else if (a == "--save-state" && i + 1 < argc) {
+            const std::string spec = argv[++i];
+            const auto colon = spec.find(':');
+            if (colon == std::string::npos) return usage();
+            ps2::g_options.save_state_frame = std::strtoull(spec.substr(0, colon).c_str(), nullptr, 10);
+            ps2::g_options.save_state_path = spec.substr(colon + 1);
+        }
+        else if (a == "--load-state" && i + 1 < argc) load_path = argv[++i];
         else return usage();
     }
 
@@ -73,6 +83,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     ps2::boot(entry, args);
+    if (!load_path.empty() && !ps2::load_state(load_path)) return 1;
 #ifdef PS2_PROFILE
     const char *profile = std::getenv("PS2_PROFILE");
     const char *profile_from = std::getenv("PS2_PROFILE_FROM");

@@ -7,8 +7,11 @@
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
 
+#include "ps2/state.hpp"
+
 #include <cstdio>
 #include <deque>
+#include <stdexcept>
 #include <map>
 #include <vector>
 
@@ -73,6 +76,7 @@ std::uint32_t g_sreg[32] = {};
 std::map<std::uint32_t, int> g_iop_clients;
 std::uint32_t g_iop_rpc_id = 1;
 std::uint32_t g_loop_stub = 0, g_finish_stub = 0;
+std::uint32_t g_iop_dma_id = 1, g_ee_dma_id = 1;
 
 template <typename T>
 T ee_read(std::uint32_t a) {
@@ -315,6 +319,7 @@ void rpc_finish(iop::Cpu &c) {
 }
 
 void install_iop_side() {
+    iop::kernel::register_job(iop::kernel::kJobSifDmaCallback, [](const iop::kernel::Job &j) { iop::kernel::call_guest(j.a, j.b); });
     g_loop_stub = iop::kernel::hle_stub(rpc_loop);
     g_finish_stub = iop::kernel::hle_stub(rpc_finish);
 
@@ -334,9 +339,8 @@ void install_iop_side() {
             }
             std::memcpy(g_ram + (dst & (kRamSize - 1)), iop::ram_ptr(src), std::min(size, kRamSize - (dst & (kRamSize - 1))));
         }
-        static std::uint32_t id = 1;
-        c.r[2] = id++;
-        if (callback) iop::kernel::schedule(iop::kernel::now() + 32, [callback, data]() { iop::kernel::call_guest(callback, data); });
+        c.r[2] = g_iop_dma_id++;
+        if (callback) iop::kernel::schedule(iop::kernel::now() + 32, iop::kernel::Job{iop::kernel::kJobSifDmaCallback, callback, data});
     };
     def("sifman", 7, "sceSifSetDma", [set_dma](iop::Cpu &c) { set_dma(c, 0, 0); });
     def("sifman", 8, "sceSifDmaStat", [](iop::Cpu &c) { c.r[2] = static_cast<std::uint32_t>(-1); });
@@ -650,6 +654,10 @@ void reset() {
     g_cmd_handlers.clear();
     g_iop_clients.clear();
     std::memset(g_sreg, 0, sizeof g_sreg);
+    g_iop_dma_id = g_ee_dma_id = 1;
+    g_iop_rpc_id = 1;
+    g_fileio_async = false;
+    g_fileio_result = 0;
 }
 
 std::uint32_t get_reg(std::uint32_t reg) {
@@ -670,7 +678,6 @@ void set_reg(std::uint32_t reg, std::uint32_t value) {
 }
 
 std::uint32_t set_dma(std::uint32_t transfers, std::uint32_t count) {
-    static std::uint32_t id = 1;
     if (!count) count = 1;
     for (std::uint32_t i = 0; i < count; ++i) {
         const std::uint32_t base = transfers + i * 16;
@@ -682,7 +689,7 @@ std::uint32_t set_dma(std::uint32_t transfers, std::uint32_t count) {
         else if (dst == kCmdBuffer) command(src, size);
         else std::memcpy(iop::ram_ptr(dst), g_ram + src, std::min(size, iop::kRamSize - (iop::phys(dst) & (iop::kRamSize - 1))));
     }
-    return id++;
+    return g_ee_dma_id++;
 }
 
 void packet_processed() {
@@ -760,6 +767,59 @@ void install_sif() {
     sif::install_iop_side();
     sif::install_servers();
     install_cdvdfsv();
+}
+
+}
+
+namespace ps2::sif {
+
+void state(ps2::state::Stream &s) {
+    s.tag("sif");
+    s.pod(g_mainaddr);
+    s.pod(g_msflag);
+    s.pod(g_smflag);
+    s.pod(g_ee_recv);
+    s.pod(g_data_addr);
+    s.pod(g_processed);
+    s.deque(g_outgoing, [&s](std::vector<std::uint8_t> &packet) { s.vec(packet); });
+    std::map<std::uint32_t, Server> servers;
+    if (s.saving()) servers = g_servers;
+    s.map(servers, [&s](Server &server) {
+        s.pod(server.hle);
+        s.pod(server.sd);
+        s.pod(server.func);
+        s.pod(server.buf);
+        s.pod(server.queue);
+    });
+    if (s.loading()) {
+        for (auto &[id, server] : servers) {
+            if (!server.hle) continue;
+            const auto it = g_servers.find(id);
+            if (it == g_servers.end() || !it->second.hle) throw std::runtime_error("an HLE RPC server is missing");
+            server.invoke = it->second.invoke;
+        }
+        g_servers = std::move(servers);
+    }
+    s.map(g_binds);
+    s.map(g_held_calls);
+    s.map(g_requests, [&s](std::deque<Request> &queue) {
+        s.deque(queue, [&s](Request &r) {
+            s.pod(r.call);
+            s.pod(r.size);
+            s.vec(r.data);
+        });
+    });
+    s.map(g_queue_threads);
+    s.map(g_cmd_handlers);
+    s.pod(g_sreg);
+    s.map(g_iop_clients);
+    s.pod(g_iop_rpc_id);
+    s.pod(g_loop_stub);
+    s.pod(g_finish_stub);
+    s.pod(g_iop_dma_id);
+    s.pod(g_ee_dma_id);
+    s.pod(g_fileio_async);
+    s.pod(g_fileio_result);
 }
 
 }

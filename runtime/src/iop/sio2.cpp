@@ -4,6 +4,8 @@
 #include "iop.hpp"
 #include "ps2/system.hpp"
 
+#include "ps2/state.hpp"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -367,6 +369,25 @@ void set_buttons(int pad, std::uint16_t pressed_mask) {
 
 void set_axis(int pad, int axis, std::uint8_t value) {
     if (pad >= 0 && pad < 2 && axis >= 0 && axis < 4) g_pads[pad].axes[axis] = value;
+}
+
+}
+
+namespace ps2::iop::sio2 {
+
+void state(ps2::state::Stream &s) {
+    s.tag("sio2");
+    s.pod(g_send3);
+    s.pod(g_ctrl1);
+    s.pod(g_ctrl2);
+    s.pod(g_index);
+    s.pod(g_stat);
+    s.deque(g_in);
+    s.deque(g_out);
+    s.pod(g_pads);
+    s.pod(g_dma);
+    s.pod(g_card.address);
+    s.pod(g_card.term);
 }
 
 }

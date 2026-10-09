@@ -4,6 +4,8 @@
 #include "iop.hpp"
 #include "kernel.hpp"
 
+#include "ps2/state.hpp"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -55,7 +57,7 @@ struct Voice {
 
 struct Transfer {
     std::uint32_t madr = 0, bytes = 0;
-    std::function<void()> done;
+    int channel = -1;
 };
 
 struct Core {
@@ -210,9 +212,9 @@ void feed_input(int core) {
         t.madr += chunk;
         t.bytes -= chunk;
         if (!t.bytes) {
-            auto done = std::move(t.done);
+            const int channel = t.channel;
             k.transfers.pop_front();
-            if (done) kernel::schedule(kernel::now() + 32, std::move(done));
+            if (channel >= 0) kernel::schedule(kernel::now() + 32, kernel::Job{kernel::kJobDmaDone, static_cast<std::uint32_t>(channel)});
         }
     }
 }
@@ -263,14 +265,14 @@ void tick() {
     feed_input(0);
     feed_input(1);
     g_next_tick += kBatch * kCyclesPerSample;
-    kernel::schedule(g_next_tick, tick);
+    kernel::schedule(g_next_tick, kernel::Job{kernel::kJobSpuTick});
 }
 
 void keep_ticking() {
     if (g_tick_pending) return;
     g_tick_pending = true;
     g_next_tick = kernel::now() + kBatch * kCyclesPerSample;
-    kernel::schedule(g_next_tick, tick);
+    kernel::schedule(g_next_tick, kernel::Job{kernel::kJobSpuTick});
 }
 
 std::uint32_t set_hi(std::uint32_t address, std::uint32_t v) { return ((v & 0xFu) << 16) | (address & 0xFFFFu); }
@@ -442,6 +444,7 @@ void write_global(std::uint32_t off, std::uint32_t value) {
 }
 
 void reset() {
+    kernel::register_job(kernel::kJobSpuTick, [](const kernel::Job &) { tick(); });
     std::fill(g_ram.begin(), g_ram.end(), 0);
     for (Core &k : g_cores) k = Core{};
     g_spdif_out = g_spdif_mode = g_spdif_media = 0;
@@ -480,11 +483,11 @@ void write(std::uint32_t a, std::uint32_t v, unsigned size) {
     } else write_global(off, v);
 }
 
-void dma(int core, std::uint32_t madr, std::uint32_t words, bool to_spu, std::function<void()> done) {
+void dma(int core, std::uint32_t madr, std::uint32_t words, bool to_spu, int channel) {
     keep_ticking();
     Core &k = g_cores[core];
     if (to_spu && (k.admas & (1u << core))) {
-        k.transfers.push_back(Transfer{madr, words * 4, std::move(done)});
+        k.transfers.push_back(Transfer{madr, words * 4, channel});
         feed_input(core);
         return;
     }
@@ -497,7 +500,7 @@ void dma(int core, std::uint32_t madr, std::uint32_t words, bool to_spu, std::fu
         else std::memcpy(iop, spu, 2);
     }
     k.tsa = (k.tsa + halfwords) & kRamMask;
-    kernel::schedule(kernel::now() + 64 + words / 4, std::move(done));
+    if (channel >= 0) kernel::schedule(kernel::now() + 64 + words / 4, kernel::Job{kernel::kJobDmaDone, static_cast<std::uint32_t>(channel)});
 }
 
 void set_sink(std::function<void(const std::int16_t *, std::size_t)> sink) { g_sink = std::move(sink); }
@@ -522,6 +525,41 @@ void dump_audio(const char *path) {
     std::fwrite(header, 4, sizeof header / 4, f);
     std::fwrite(g_audio.data(), 2, g_audio.size(), f);
     std::fclose(f);
+}
+
+}
+
+namespace ps2::iop::spu2 {
+
+void state(ps2::state::Stream &s) {
+    s.tag("spu2");
+    s.vec(g_ram);
+    for (Core &k : g_cores) {
+        s.pod(k.voices);
+        s.pod(k.attr);
+        s.pod(k.admas);
+        s.pod(k.irqa);
+        s.pod(k.tsa);
+        s.pod(k.mvol);
+        s.pod(k.bvol);
+        s.pod(k.avol);
+        s.pod(k.evol);
+        s.pod(k.irq);
+        s.pod(k.input);
+        s.pod(k.input_read);
+        s.pod(k.input_count);
+        s.deque(k.transfers, [&s](Transfer &t) {
+            s.pod(t.madr);
+            s.pod(t.bytes);
+            s.pod(t.channel);
+        });
+        s.pod(k.regs);
+    }
+    s.pod(g_spdif_out);
+    s.pod(g_spdif_mode);
+    s.pod(g_spdif_media);
+    s.pod(g_next_tick);
+    s.pod(g_tick_pending);
 }
 
 }

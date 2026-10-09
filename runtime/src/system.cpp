@@ -14,6 +14,7 @@
 #include "kernel.hpp"
 #include "ps2/generated.hpp"
 #include "ps2/memory.hpp"
+#include "ps2/state.hpp"
 #include "ps2/system.hpp"
 
 #ifdef __EMSCRIPTEN__
@@ -29,6 +30,7 @@
 #include <fstream>
 #include <cstdlib>
 #include <iterator>
+#include <stdexcept>
 
 namespace ps2 {
 
@@ -52,6 +54,8 @@ bool g_halted = false;
 std::string g_halt_reason;
 std::uint64_t g_frames = 0;
 std::uint64_t g_iop_synced = 0;
+bool g_state_request = false;
+bool g_resumed = false;
 
 std::uint64_t next_event_time() {
     std::uint64_t t = UINT64_MAX;
@@ -133,6 +137,7 @@ void vblank() {
     schedule(hw::kEventVblankEnd + 100, now() + 18874u * 22u, [] { iop::vblank(false); });
     kernel::on_vblank_start();
     if (g_options.max_frames && g_frames >= g_options.max_frames) halt("frame limit reached");
+    if (g_options.save_state_frame && g_frames == g_options.save_state_frame) g_state_request = true;
     schedule(hw::kEventVblank, now() + frame_cycles(), vblank);
 }
 
@@ -189,7 +194,7 @@ void schedule(int event, std::uint64_t at, std::function<void()> action) {
 bool preempt(Cpu &c) {
     run_due_events();
     refill(c);
-    return g_halted || kernel::must_unwind();
+    return g_halted || g_state_request || kernel::must_unwind();
 }
 
 void halt(const std::string &reason) {
@@ -199,6 +204,86 @@ void halt(const std::string &reason) {
 }
 
 bool halted() { return g_halted; }
+
+namespace {
+
+constexpr char kStateMagic[8] = {'P', 'S', '2', 'S', 'T', 'A', 'T', 'E'};
+constexpr std::uint32_t kStateVersion = 1;
+
+std::function<void()> event_action(int id) {
+    if (id == hw::kEventVblank) return vblank;
+    if (id == hw::kEventVblankEnd + 100) return [] { iop::vblank(false); };
+    if (id >= hw::kEventCount) return kernel::alarm_action(id - hw::kEventCount);
+    return hw::event_action(id);
+}
+
+void machine_state(state::Stream &s) {
+    char magic[8];
+    std::memcpy(magic, kStateMagic, sizeof magic);
+    s.bytes(magic, sizeof magic);
+    std::uint32_t version = kStateVersion;
+    s.pod(version);
+    if (std::memcmp(magic, kStateMagic, sizeof magic) != 0) throw std::runtime_error("not a state file");
+    if (version != kStateVersion) throw std::runtime_error("state file from another version");
+    s.tag("ee");
+    s.pod(g_cpu);
+    s.bytes(g_ram, kRamSize);
+    s.bytes(g_spr, kScratchpadSize);
+    s.pod(g_base);
+    s.pod(g_given);
+    s.pod(g_frames);
+    s.pod(g_iop_synced);
+    s.pod(g_options.pal);
+    s.vec(g_events, [&s](Event &e) {
+        s.pod(e.id);
+        s.pod(e.at);
+        if (s.loading()) e.action = event_action(e.id);
+    });
+    kernel::state(s);
+    hw::state(s);
+    dmac::state(s);
+    vif::state(s);
+    vu::state(s);
+    gif::state(s);
+    ipu::state(s);
+    gs::state(s);
+    iop::state(s);
+    sif::state(s);
+    s.tag("end");
+}
+
+}
+
+bool save_state(const std::string &path) {
+    try {
+        state::Writer w;
+        machine_state(w);
+        std::ofstream out(path, std::ios::binary);
+        out.write(reinterpret_cast<const char *>(w.out.data()), static_cast<std::streamsize>(w.out.size()));
+        if (!out) throw std::runtime_error("cannot write " + path);
+        std::fprintf(stderr, "[state] saved frame %llu to %s (%zu KB)\n", static_cast<unsigned long long>(g_frames), path.c_str(), w.out.size() >> 10);
+        return true;
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "[state] cannot save: %s\n", e.what());
+        return false;
+    }
+}
+
+bool load_state(const std::string &path) {
+    try {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) throw std::runtime_error("cannot open " + path);
+        const std::vector<std::uint8_t> data{std::istreambuf_iterator<char>(in), {}};
+        state::Reader r(data.data(), data.size());
+        machine_state(r);
+        g_resumed = true;
+        std::fprintf(stderr, "[state] loaded frame %llu from %s\n", static_cast<unsigned long long>(g_frames), path.c_str());
+        return true;
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "[state] cannot load: %s\n", e.what());
+        return false;
+    }
+}
 
 std::uint64_t frame_count() { return g_frames; }
 
@@ -261,8 +346,12 @@ void boot(std::uint32_t entry, const std::vector<std::string> &args) {
 
 int run() {
     Cpu &c = g_cpu;
-    set_budget(c, kMaxSlice);
+    if (!g_resumed) set_budget(c, kMaxSlice);
     while (!g_halted) {
+        if (g_state_request) {
+            g_state_request = false;
+            save_state(g_options.save_state_path);
+        }
         c.pc &= ~kUnwind;
         run_due_events();
         kernel::service(c);

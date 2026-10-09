@@ -1,6 +1,11 @@
 #include "kernel.hpp"
 
 #include "hw.hpp"
+#include "io.hpp"
+#include "sio2.hpp"
+#include "spu2.hpp"
+
+#include "ps2/state.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -9,6 +14,7 @@
 #include <memory>
 #include <queue>
 #include <set>
+#include <stdexcept>
 
 namespace ps2::iop {
 
@@ -36,6 +42,7 @@ struct HleEntry {
 struct Event {
     std::uint64_t at;
     std::uint64_t seq;
+    Job job;
     std::function<void()> action;
     bool operator>(const Event &o) const { return at != o.at ? at > o.at : seq > o.seq; }
 };
@@ -243,7 +250,17 @@ std::uint64_t now() { return g_now; }
 std::uint64_t usec_to_cycles(std::uint64_t usec) { return usec * 36864u / 1000u; }
 
 void schedule(std::uint64_t at, std::function<void()> action) {
-    g_events.push(Event{at, ++g_event_seq, std::move(action)});
+    g_events.push(Event{at, ++g_event_seq, Job{}, std::move(action)});
+}
+
+namespace {
+JobHandler g_jobs[kJobCount] = {};
+}
+
+void register_job(std::uint32_t kind, JobHandler handler) { g_jobs[kind] = handler; }
+
+void schedule(std::uint64_t at, const Job &job) {
+    g_events.push(Event{at, ++g_event_seq, job, nullptr});
 }
 
 Thread *current() {
@@ -554,9 +571,10 @@ void run(std::uint64_t ee_cycles) {
         // A thread inside CpuSuspendIntr cannot be preempted: interrupt-side events wait for CpuResumeIntr.
         if (!g_suspended || !running || running->status != kRun) {
             while (!g_events.empty() && g_events.top().at <= g_now) {
-                auto action = g_events.top().action;
+                const Event event = g_events.top();
                 g_events.pop();
-                action();
+                if (event.job.kind) g_jobs[event.job.kind](event.job);
+                else event.action();
             }
             deliver_interrupts();
             if (g_switch) do_switch();
@@ -675,6 +693,100 @@ std::int32_t load_module_buffer(const std::vector<std::uint8_t> &data, const std
 void set_trace(bool modules_on, bool hle_on) {
     kernel::g_trace_modules = modules_on;
     kernel::g_trace_hle = hle_on;
+}
+
+}
+
+namespace ps2::iop::kernel {
+
+void state(ps2::state::Stream &s) {
+    s.tag("iopkern");
+    if (s.saving() && g_nesting) throw std::runtime_error("the IOP is inside a guest call");
+    s.map(g_threads, [&s](Thread &t) {
+        if (s.saving() && t.on_exit) throw std::runtime_error("an IOP module is still starting");
+        s.pod(t.id);
+        s.pod(t.status);
+        s.pod(t.priority);
+        s.pod(t.init_priority);
+        s.pod(t.entry);
+        s.pod(t.stack);
+        s.pod(t.stack_size);
+        s.pod(t.gp);
+        s.pod(t.attr);
+        s.pod(t.option);
+        s.pod(t.wakeups);
+        s.pod(t.wait);
+        s.pod(t.wait_id);
+        s.pod(t.order);
+        s.pod(t.context);
+        s.pod(t.rpc_queue);
+        s.pod(t.rpc_server);
+        s.pod(t.event_bits);
+        s.pod(t.event_mode);
+        s.pod(t.event_result);
+        s.pod(t.message_out);
+        s.pod(t.suspended);
+    });
+    s.map(g_modules, [&s](Module &m) {
+        s.pod(m.id);
+        s.str(m.name);
+        s.pod(m.base);
+        s.pod(m.size);
+        s.pod(m.entry);
+        s.pod(m.gp);
+    });
+    s.string_map(g_libraries, [&s](std::uint32_t &table) { s.pod(table); });
+    s.map(g_used);
+    s.map(g_interrupts);
+    std::vector<Event> events;
+    if (s.saving()) {
+        auto pending = g_events;
+        for (; !pending.empty(); pending.pop()) {
+            if (!pending.top().job.kind) throw std::runtime_error("an IOP event cannot be saved");
+            events.push_back(pending.top());
+        }
+    }
+    s.vec(events, [&s](Event &e) {
+        s.pod(e.at);
+        s.pod(e.seq);
+        s.pod(e.job);
+    });
+    if (s.loading()) {
+        while (!g_events.empty()) g_events.pop();
+        for (const Event &e : events) g_events.push(e);
+    }
+    s.pod(g_current);
+    s.pod(g_next_thread);
+    s.pod(g_next_module);
+    s.pod(g_order);
+    s.pod(g_switch);
+    s.pod(g_kernel_top);
+    s.pod(g_event_seq);
+    s.pod(g_now);
+    s.pod(g_target);
+    s.pod(g_ee_remainder);
+    s.pod(g_suspended);
+    s.pod(g_nested_done);
+    s.pod(g_return_stub);
+    s.pod(g_exit_stub);
+}
+
+}
+
+namespace ps2::iop {
+
+void state(ps2::state::Stream &s) {
+    s.tag("iop");
+    s.pod(g_cpu);
+    s.bytes(g_ram, kRamSize);
+    kernel::state(s);
+    kernel::libs_state(s);
+    kernel::cdvd_state(s);
+    kernel::cdvdfsv_state(s);
+    hw::state(s);
+    sio2::state(s);
+    spu2::state(s);
+    io::state(s);
 }
 
 }

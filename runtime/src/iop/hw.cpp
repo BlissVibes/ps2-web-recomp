@@ -5,6 +5,8 @@
 #include "sio2.hpp"
 #include "spu2.hpp"
 
+#include "ps2/state.hpp"
+
 #include <cstdio>
 #include <map>
 #include <set>
@@ -104,7 +106,7 @@ void start_dma(unsigned ch) {
     if (kernel::g_trace_modules) std::fprintf(stderr, "[iop-dma] start ch %u madr 0x%08X bcr 0x%08X chcr 0x%08X\n", ch, d.madr, d.bcr, d.chcr);
     const std::uint32_t words = (d.bcr & 0xFFFFu) * ((d.bcr >> 16) ? (d.bcr >> 16) : 1u);
     if (ch == 4 || ch == 7) {
-        spu2::dma(ch == 4 ? 0 : 1, d.madr, words, (d.chcr & 1u) != 0, [ch]() { dma_done(ch); });
+        spu2::dma(ch == 4 ? 0 : 1, d.madr, words, (d.chcr & 1u) != 0, static_cast<int>(ch));
         return;
     }
     if (ch == 11 || ch == 12) {
@@ -118,6 +120,7 @@ void start_dma(unsigned ch) {
 }
 
 void reset() {
+    kernel::register_job(kernel::kJobDmaDone, [](const kernel::Job &j) { dma_done(j.a); });
     g_istat = g_imask = g_dicr = g_dicr2 = 0;
     g_ictrl = 1;
     g_regs.clear();
@@ -264,6 +267,23 @@ void write(std::uint32_t a, std::uint32_t v, unsigned size) {
 
 std::uint16_t *spu2_ram() { return spu2::ram(); }
 
+}
+
+}
+
+namespace ps2::iop::hw {
+
+void state(ps2::state::Stream &s) {
+    s.tag("iophw");
+    s.pod(g_istat);
+    s.pod(g_imask);
+    s.pod(g_ictrl);
+    s.pod(g_dicr);
+    s.pod(g_dicr2);
+    s.map(g_regs);
+    s.pod(g_dma);
+    s.pod(g_ohci);
+    s.pod(g_scratchpad);
 }
 
 }

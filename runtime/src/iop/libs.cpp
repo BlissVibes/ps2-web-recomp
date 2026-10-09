@@ -2,6 +2,8 @@
 
 #include "hw.hpp"
 
+#include "ps2/state.hpp"
+
 #include <algorithm>
 #include <cstdio>
 #include <deque>
@@ -117,6 +119,9 @@ std::vector<int> g_vblank_start_waiters, g_vblank_end_waiters;
 std::map<std::uint64_t, Alarm> g_alarms;
 std::uint64_t g_next_alarm = 1;
 int g_next_object = 1;
+std::uint64_t g_rotate_order = 1ull << 40;
+std::uint32_t g_strtok_next = 0;
+std::uint32_t g_next_hard_timer = 1;
 
 void signal_sema(Cpu &c, int id, bool from_interrupt) {
     auto it = g_semas.find(id);
@@ -212,7 +217,7 @@ void arm_hard_timer(std::uint32_t id) {
     HardTimer &t = g_hard_timers[id];
     const std::uint64_t generation = ++t.generation;
     if (!t.running || !t.handler || !t.compare) return;
-    schedule(now() + timer_cycles(t, t.compare), [id, generation]() { fire_hard_timer(id, generation); });
+    schedule(now() + timer_cycles(t, t.compare), Job{kJobHardTimer, id, static_cast<std::uint32_t>(generation), static_cast<std::uint32_t>(generation >> 32)});
 }
 
 void fire_alarm(std::uint64_t key) {
@@ -224,7 +229,7 @@ void fire_alarm(std::uint64_t key) {
     if (again) {
         const std::uint64_t k = g_next_alarm++;
         g_alarms[k] = Alarm{a.handler, a.arg, true};
-        schedule(now() + again, [k]() { fire_alarm(k); });
+        schedule(now() + again, Job{kJobAlarm, static_cast<std::uint32_t>(k), static_cast<std::uint32_t>(k >> 32)});
     }
 }
 
@@ -331,7 +336,7 @@ void install_thbase() {
         Thread *t = current();
         const int id = t ? t->id : 0;
         exit_thread(c);
-        if (id) schedule(now() + 1, [id]() { delete_thread(id); });
+        if (id) schedule(now() + 1, Job{kJobDeleteThread, static_cast<std::uint32_t>(id)});
     });
     auto terminate = [](Cpu &c) {
         Thread *t = thread(static_cast<int>(arg(c, 0)));
@@ -358,9 +363,8 @@ void install_thbase() {
     def("thbase", 15, "iChangeThreadPriority", change_priority);
     auto rotate = [](Cpu &c) {
         Thread *t = current();
-        static std::uint64_t order = 1ull << 40;
         if (t && (arg(c, 0) == 0 || static_cast<int>(arg(c, 0)) == t->priority)) {
-            t->order = ++order;
+            t->order = ++g_rotate_order;
             reschedule();
         }
         c.r[2] = 0;
@@ -437,17 +441,14 @@ void install_thbase() {
         if (!t) return;
         const int id = t->id;
         block(c, kWaitDelay, 0);
-        schedule(now() + std::max<std::uint64_t>(1, usec_to_cycles(arg(c, 0))), [id]() {
-            Thread *th = thread(id);
-            if (th && th->wait == kWaitDelay) wake(*th, 0);
-        });
+        schedule(now() + std::max<std::uint64_t>(1, usec_to_cycles(arg(c, 0))), Job{kJobDelayWake, static_cast<std::uint32_t>(id)});
     });
     def("thbase", 34, "GetSystemTime", [](Cpu &c) { write_clock(arg(c, 0), now()); c.r[2] = 0; });
     auto set_alarm = [](Cpu &c) {
         const std::uint64_t delay = read_clock(arg(c, 0));
         const std::uint64_t key = g_next_alarm++;
         g_alarms[key] = Alarm{arg(c, 1), arg(c, 2), true};
-        schedule(now() + std::max<std::uint64_t>(1, delay), [key]() { fire_alarm(key); });
+        schedule(now() + std::max<std::uint64_t>(1, delay), Job{kJobAlarm, static_cast<std::uint32_t>(key), static_cast<std::uint32_t>(key >> 32)});
         c.r[2] = 0;
     };
     def("thbase", 35, "SetAlarm", set_alarm);
@@ -789,13 +790,12 @@ void install_sysclib() {
         c.r[2] = pos == std::string::npos ? 0u : arg(c, 0) + static_cast<std::uint32_t>(pos);
     });
     def("sysclib", 35, "strtok", [](Cpu &c) {
-        static std::uint32_t saved = 0;
-        std::uint32_t p = arg(c, 0) ? arg(c, 0) : saved;
+        std::uint32_t p = arg(c, 0) ? arg(c, 0) : g_strtok_next;
         const std::string delim = ram_string(arg(c, 1), 256);
         const auto is_delim = [&delim](std::uint8_t ch) { return ch && delim.find(static_cast<char>(ch)) != std::string::npos; };
         while (p && is_delim(read8(p))) ++p;
         if (!p || !read8(p)) {
-            saved = 0;
+            g_strtok_next = 0;
             c.r[2] = 0;
             return;
         }
@@ -803,9 +803,9 @@ void install_sysclib() {
         while (read8(p) && !is_delim(read8(p))) ++p;
         if (read8(p)) {
             write8(p, 0);
-            saved = p + 1;
+            g_strtok_next = p + 1;
         } else {
-            saved = p;
+            g_strtok_next = p;
         }
         c.r[2] = token;
     });
@@ -944,7 +944,7 @@ void install_vblank() {
 
 void install_timrman() {
     register_hle_library("timrman", 0x0101);
-    def("timrman", 4, "AllocHardTimer", [](Cpu &c) { static std::uint32_t next = 1; c.r[2] = next++; });
+    def("timrman", 4, "AllocHardTimer", [](Cpu &c) { c.r[2] = g_next_hard_timer++; });
     def("timrman", 5, "ReferHardTimer", [](Cpu &c) { c.r[2] = 1; });
     def("timrman", 6, "FreeHardTimer", [](Cpu &c) { c.r[2] = 0; });
     def("timrman", 7, "SetTimerMode", [](Cpu &c) { c.r[2] = 0; });
@@ -1058,7 +1058,19 @@ void install_libraries() {
     g_vblank_start_waiters.clear();
     g_vblank_end_waiters.clear();
     g_alarms.clear();
+    g_hard_timers.clear();
     g_next_object = 1;
+    g_next_alarm = 1;
+    g_rotate_order = 1ull << 40;
+    g_strtok_next = 0;
+    g_next_hard_timer = 1;
+    register_job(kJobHardTimer, [](const Job &j) { fire_hard_timer(j.a, j.b | (static_cast<std::uint64_t>(j.c) << 32)); });
+    register_job(kJobAlarm, [](const Job &j) { fire_alarm(j.a | (static_cast<std::uint64_t>(j.b) << 32)); });
+    register_job(kJobDeleteThread, [](const Job &j) { delete_thread(static_cast<int>(j.a)); });
+    register_job(kJobDelayWake, [](const Job &j) {
+        Thread *th = thread(static_cast<int>(j.a));
+        if (th && th->wait == kWaitDelay) wake(*th, 0);
+    });
     install_sysmem();
     install_loadcore();
     install_intrman();
@@ -1075,6 +1087,50 @@ void install_libraries() {
     install_dmacman();
     install_heaplib();
     install_misc();
+}
+
+void libs_state(ps2::state::Stream &s) {
+    s.tag("ioplibs");
+    s.map(g_semas, [&s](Sema &v) {
+        s.pod(v.count);
+        s.pod(v.max);
+        s.pod(v.attr);
+        s.pod(v.option);
+        s.deque(v.waiters);
+    });
+    s.map(g_events, [&s](EventFlag &v) {
+        s.pod(v.bits);
+        s.pod(v.attr);
+        s.pod(v.option);
+        s.deque(v.waiters);
+    });
+    s.map(g_mbxs, [&s](Mbx &v) {
+        s.pod(v.attr);
+        s.pod(v.option);
+        s.deque(v.messages);
+        s.deque(v.waiters);
+    });
+    s.map(g_fpls, [&s](Fpl &v) {
+        s.pod(v.attr);
+        s.pod(v.option);
+        s.pod(v.block_size);
+        s.pod(v.blocks);
+        s.pod(v.base);
+        s.vec(v.free);
+        s.deque(v.waiters);
+    });
+    s.map(g_heaps, [&s](std::set<std::uint32_t> &v) { s.set(v); });
+    s.vec(g_vblank_handlers);
+    s.vec(g_vblank_start_waiters);
+    s.vec(g_vblank_end_waiters);
+    s.map(g_alarms);
+    s.map(g_hard_timers);
+    s.pod(g_next_alarm);
+    s.pod(g_next_object);
+    s.pod(g_rotate_order);
+    s.pod(g_strtok_next);
+    s.pod(g_next_hard_timer);
+    s.pod(g_dma_direction);
 }
 
 }

@@ -2,7 +2,13 @@
 
 #include <cstdint>
 
+namespace ps2::state {
+class Stream;
+}
+
 namespace ps2::iop::hw {
+
+void state(ps2::state::Stream &s);
 
 void reset();
 void raise_interrupt(unsigned line);

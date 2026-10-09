@@ -8,6 +8,8 @@
 #include "gpu/gpu.hpp"
 #endif
 
+#include "ps2/state.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <functional>
@@ -913,6 +915,61 @@ void stats() {
     for (int r = 0; r < 128; ++r)
         if (g_writes[r]) std::fprintf(stderr, " %02X:%llu", r, static_cast<unsigned long long>(g_writes[r]));
     std::fprintf(stderr, "\n");
+}
+
+}
+
+namespace ps2::gs {
+
+void state(ps2::state::Stream &s) {
+    s.tag("gs");
+    flush_and_wait();
+    s.pod(g_state);
+    s.pod(g_pmode);
+    s.pod(g_smode1);
+    s.pod(g_smode2);
+    s.pod(g_srfsh);
+    s.pod(g_synch1);
+    s.pod(g_synch2);
+    s.pod(g_syncv);
+    s.pod(g_dispfb);
+    s.pod(g_display);
+    s.pod(g_extbuf);
+    s.pod(g_extdata);
+    s.pod(g_extwrite);
+    s.pod(g_bgcolor);
+    s.pod(g_csr);
+    s.pod(g_imr);
+    s.pod(g_busdir);
+    s.pod(g_siglblid);
+    s.pod(g_primitives);
+    s.pod(g_odd_field);
+    s.pod(g_transfer);
+    s.pod(g_carry);
+    s.pod(g_carried);
+    std::vector<std::uint32_t> vram, clut;
+    std::uint32_t scale = 1;
+#ifdef PS2_GPU
+    if (s.saving() && gpu_on()) {
+        gpu::download(g_memory);
+        gpu::read_state(vram, scale, clut);
+    }
+#endif
+    s.bytes(g_memory, kMemorySize);
+    s.pod(scale);
+    s.vec(vram);
+    s.vec(clut);
+#ifdef PS2_GPU
+    if (s.loading() && gpu_on()) {
+        if (vram.empty()) {
+            vram.resize(kMemorySize / 4);
+            std::memcpy(vram.data(), g_memory, kMemorySize);
+            clut.assign(g_state.clut, g_state.clut + 512);
+            scale = 1;
+        }
+        gpu::write_state(vram, scale, clut);
+    }
+#endif
 }
 
 }
