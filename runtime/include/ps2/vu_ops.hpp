@@ -251,7 +251,7 @@ struct FlagPipe {
     PS2_VU_INLINE std::uint32_t clip() const {
         for (unsigned k = 1; k <= 8; ++k) {
             const unsigned i = (ch - k) & 7u;
-            if (clip_ts[i] + 4u <= t) return clip_v[i];
+            if (clip_ts[i] + 3u <= t) return clip_v[i];
         }
         return clip_v[(ch - 8) & 7u];
     }
