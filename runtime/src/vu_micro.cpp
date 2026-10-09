@@ -2,6 +2,7 @@
 
 #include "gs/gif.hpp"
 #include "gs/queue.hpp"
+#include "vu_jit_web.hpp"
 #include "hw.hpp"
 #include "ps2/fpu.hpp"
 #include "ps2/system.hpp"
@@ -640,7 +641,19 @@ std::uint32_t g_generation[2] = {1, 1};
 struct EntryCache {
     std::uint32_t generation = 0;
     ProgramFn function = nullptr;
+    ProgramFn jit = nullptr;
 };
+std::unordered_map<std::uint64_t, ProgramFn> g_jit_programs;
+std::vector<std::uint32_t> *g_kick_log = nullptr;
+std::int64_t *g_capture = nullptr;
+
+ProgramFn jit_program(std::uint64_t key, std::uint32_t address) {
+    const auto it = g_jit_programs.find(key);
+    if (it != g_jit_programs.end()) return it->second;
+    const ProgramFn fn = jit::compile(g_vu1_code, address & 16383u);
+    g_jit_programs[key] = fn;
+    return fn;
+}
 EntryCache g_entries[2048];
 
 void code_changed(int unit) {
@@ -654,6 +667,7 @@ void register_programs(const Program *programs, std::uint32_t count) {
 }
 
 void kick(int unit, std::uint32_t address) {
+    if (g_kick_log && unit == 1) g_kick_log->push_back(address);
     Unit u = unit_of(unit);
     xgkick(u, address);
 }
@@ -667,7 +681,53 @@ std::atomic<std::uint64_t> g_interpreted_calls{0};
 
 std::uint64_t interpreted_calls() { return g_interpreted_calls.load(std::memory_order_relaxed); }
 
+void check_jit(ProgramFn compiled, ProgramFn jit) {
+    static std::uint64_t calls = 0, escapes = 0, mismatches = 0;
+    static std::uint8_t before_mem[16384], jit_mem[16384];
+    const Vu0Regs before = g_vu1;
+    std::memcpy(before_mem, g_vu1_mem, sizeof before_mem);
+    std::vector<std::uint32_t> jit_kicks, kicks;
+    jit::g_dry = true;
+    jit::g_escape = -1;
+    jit::g_kicks = &jit_kicks;
+    jit(g_vu1, g_vu1_mem);
+    jit::g_dry = false;
+    const std::int64_t jit_escape = jit::g_escape;
+    const Vu0Regs after = g_vu1;
+    std::memcpy(jit_mem, g_vu1_mem, sizeof jit_mem);
+    g_vu1 = before;
+    std::memcpy(g_vu1_mem, before_mem, sizeof before_mem);
+    std::int64_t escape = -1;
+    g_kick_log = &kicks;
+    g_capture = &escape;
+    compiled(g_vu1, g_vu1_mem);
+    g_capture = nullptr;
+    g_kick_log = nullptr;
+    ++calls;
+    if (escape >= 0) ++escapes;
+    if (escape != jit_escape || std::memcmp(&after, &g_vu1, sizeof after) != 0 || std::memcmp(jit_mem, g_vu1_mem, sizeof jit_mem) != 0 || kicks != jit_kicks) {
+        if (++mismatches <= 10) {
+            int vf = -1;
+            for (int i = 0; i < 32 && vf < 0; ++i)
+                if (std::memcmp(&after.vf[i], &g_vu1.vf[i], 16) != 0) vf = i;
+            std::fprintf(stderr, "[jit] mismatch at tpc 0x%X escape %lld/%lld: vf%d acc %d vi %d q/p/i/r %d flags %d mem %d kicks %zu/%zu\n", before.tpc, static_cast<long long>(jit_escape), static_cast<long long>(escape), vf,
+                         std::memcmp(&after.acc, &g_vu1.acc, 16) != 0, std::memcmp(after.vi, g_vu1.vi, sizeof after.vi) != 0,
+                         after.q != g_vu1.q || after.p != g_vu1.p || after.i != g_vu1.i || after.r != g_vu1.r,
+                         after.mac != g_vu1.mac || after.status != g_vu1.status || after.clip != g_vu1.clip,
+                         std::memcmp(jit_mem, g_vu1_mem, sizeof jit_mem) != 0, jit_kicks.size(), kicks.size());
+        }
+    }
+    if (calls % 2000 == 0)
+        std::fprintf(stderr, "[jit] checked %llu calls, %llu mismatches, %llu through the interpreter\n", static_cast<unsigned long long>(calls),
+                     static_cast<unsigned long long>(mismatches), static_cast<unsigned long long>(escapes));
+    if (escape >= 0) interpret(1, static_cast<std::uint32_t>(escape));
+}
+
 void interpret(int unit, std::uint32_t pc) {
+    if (unit == 1 && g_capture) {
+        *g_capture = pc;
+        return;
+    }
     static const bool interpret_only = std::getenv("PS2_VU_INTERPRET") != nullptr;
     static const bool count = std::getenv("PS2_VU_COUNT") != nullptr;
     static std::uint64_t compiled = 0, interpreted = 0;
@@ -675,7 +735,10 @@ void interpret(int unit, std::uint32_t pc) {
     if (unit == 1 && !interpret_only) {
         if (const ProgramFn fn = lookup(pc)) {
             ++compiled;
-            fn(g_vu1, g_vu1_mem);
+            const ProgramFn jit = g_entries[(pc & 16383u) >> 3].jit;
+            static std::uint64_t sampled = 0;
+            if (jit && jit != fn && ++sampled % 32 == 0) check_jit(fn, jit);
+            else fn(g_vu1, g_vu1_mem);
             return;
         }
     }
@@ -699,6 +762,10 @@ ProgramFn lookup(std::uint32_t address) {
     const std::uint64_t key = program_key(g_vu1_code, pcs, address & 16383u);
     const auto it = g_programs.find(key);
     e.function = it == g_programs.end() ? nullptr : it->second;
+    e.jit = nullptr;
+    const int jit_mode = jit::mode();
+    if (jit_mode == 2 || (jit_mode >= 1 && !e.function)) e.function = jit_program(key, address);
+    else if (jit_mode == 3) e.jit = jit_program(key, address);
     static const char *record = std::getenv("PS2_VU_RECORD");
     if (!e.function && (record || g_options.on_vu_program)) {
         char name[64];
