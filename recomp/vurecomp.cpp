@@ -587,6 +587,23 @@ int main(int argc, char **argv) {
         }
         programs.push_back(std::move(p));
     }
+    std::set<std::uint64_t> keys;
+    for (const Program &p : programs) keys.insert(p.key);
+    const std::size_t recorded = programs.size();
+    for (std::size_t i = 0; i < recorded; ++i) {
+        std::set<std::uint32_t> targets;
+        for (std::uint32_t pc : ps2::vu::reachable(programs[i].code.data(), kMask, programs[i].entry)) {
+            const std::uint32_t lo = word(programs[i].code, pc), hi = word(programs[i].code, pc + 4);
+            if (hi & 0x80000000u) continue;
+            const std::uint32_t op = lo >> 25;
+            if (op == 0x21 || op == 0x25) targets.insert((pc + 16u) & kMask);
+            if (op == 0x08 && ((lo >> 11) & 15u) == 0) targets.insert(((((lo >> 10) & 0x7800u) | (lo & 0x7FFu)) * 8u) & kMask);
+        }
+        for (std::uint32_t target : targets) {
+            const std::uint64_t key = ps2::vu::program_key(programs[i].code.data(), ps2::vu::reachable(programs[i].code.data(), kMask, target), target);
+            if (keys.insert(key).second) programs.push_back(Program{key, target, programs[i].code});
+        }
+    }
     std::sort(programs.begin(), programs.end(), [](const Program &a, const Program &b) { return a.key < b.key; });
     fs::create_directories(out_dir);
     for (const auto &e : fs::directory_iterator(out_dir))
@@ -610,6 +627,6 @@ int main(int argc, char **argv) {
     if (programs.empty()) table += "    {0, nullptr},\n";
     table += std::format("}};\n\n}}\n\nvoid register_generated_vu() {{ ps2::vu::register_programs(gen::kVuPrograms, {}u); }}\n", programs.size());
     std::ofstream(out_dir / "vu1_table.cpp") << table;
-    std::printf("%zu VU1 programs\n", programs.size());
+    std::printf("%zu VU1 programs, %zu of them jump targets\n", programs.size(), programs.size() - recorded);
     return 0;
 }
