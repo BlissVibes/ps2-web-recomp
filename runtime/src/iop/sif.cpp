@@ -4,12 +4,15 @@
 #include "iop.hpp"
 #include "io.hpp"
 #include "kernel.hpp"
+#include "ps2/disc.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
 
 #include "ps2/state.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <stdexcept>
 #include <map>
@@ -258,14 +261,28 @@ void command(std::uint32_t src, std::uint32_t size) {
 
 bool g_fileio_async = false;
 std::uint32_t g_fileio_result = 0;
+char g_loadfile_version[4] = {'3', '0', '0', '0'};
+
+void read_loadfile_version(const std::string &image_path) {
+    const auto entry = disc::find(image_path);
+    if (!entry || entry->directory) return;
+    std::vector<std::uint8_t> image((entry->size + disc::kSector - 1) / disc::kSector * disc::kSector);
+    if (image.empty() || !disc::read(entry->sector, static_cast<std::uint32_t>(image.size() / disc::kSector), image.data())) return;
+    static const char kTag[] = "PsIIloadfile";
+    const auto it = std::search(image.begin(), image.end(), kTag, kTag + sizeof kTag - 1);
+    if (image.end() - it < static_cast<std::ptrdiff_t>(sizeof kTag + 3)) return;
+    std::memcpy(g_loadfile_version, &*(it + sizeof kTag - 1), 4);
+    std::fprintf(stderr, "[sif] LOADFILE from %s reports %.4s\n", image_path.c_str(), g_loadfile_version);
+}
 
 void reboot(std::uint32_t src) {
     const std::uint8_t *packet = g_ram + (src & (kRamSize - 1));
     std::uint32_t args_size;
     std::memcpy(&args_size, packet + 16, 4);
-    const std::string path(reinterpret_cast<const char *>(packet + 24), std::min<std::uint32_t>(args_size, 80));
+    const std::string path(reinterpret_cast<const char *>(packet + 24), strnlen(reinterpret_cast<const char *>(packet + 24), std::min<std::uint32_t>(args_size, 80)));
     std::fprintf(stderr, "[sif] IOP reboot requested with \"%s\"\n", path.c_str());
     if (path.find("IOPRP") != std::string::npos) g_fileio_async = true;
+    if (const auto space = path.find(' '); space != std::string::npos) read_loadfile_version(path.substr(space + 1));
 }
 
 std::uint32_t arg(const iop::Cpu &c, int i) { return i < 4 ? c.r[4 + i] : iop::read32(c.r[29] + 16u + static_cast<std::uint32_t>(i - 4) * 4u); }
@@ -575,7 +592,7 @@ void install_servers() {
             return true;
         }
         if (method == 0xFF) {
-            std::memcpy(g_ram + ret, "3000", 4);
+            std::memcpy(g_ram + ret, g_loadfile_version, 4);
             return true;
         }
         std::fprintf(stderr, "[loadfile] method %u\n", method);
