@@ -128,6 +128,57 @@ std::vector<std::uint32_t> address_constants(const Image &image, const Program &
     return found;
 }
 
+std::uint32_t constant_in(const Image &image, const Program &p, std::uint32_t from, std::uint32_t reg) {
+    for (std::uint32_t pc = from - 4; from - pc <= 64 && p.is_code(pc); pc -= 4) {
+        const Insn low = decode(*image.word(pc), pc);
+        if ((low.op != Op::Addiu && low.op != Op::Ori) || low.rt() != reg || low.rs() != reg) continue;
+        for (std::uint32_t at = pc - 4; pc - at <= 64 && p.is_code(at); at -= 4) {
+            const Insn lui = decode(*image.word(at), at);
+            if (lui.op != Op::Lui || lui.rt() != reg) continue;
+            const std::uint32_t high = lui.uimm() << 16;
+            return low.op == Op::Addiu ? high + static_cast<std::uint32_t>(low.simm()) : high | low.uimm();
+        }
+        return 0;
+    }
+    return 0;
+}
+
+std::uint32_t scale_of(const Image &image, const Program &p, std::uint32_t from, std::uint32_t reg) {
+    for (std::uint32_t pc = from - 4; from - pc <= 64 && p.is_code(pc); pc -= 4) {
+        const Insn insn = decode(*image.word(pc), pc);
+        if (insn.op == Op::Sll && insn.rd() == reg) return std::clamp<std::uint32_t>(insn.sa(), 2, 6);
+    }
+    return 2;
+}
+
+std::vector<std::uint32_t> computed_branches(const Image &image, const Program &p) {
+    std::vector<std::uint32_t> found;
+    for (std::uint32_t pc = p.base; pc < p.end; pc += 4) {
+        if (!p.is_code(pc)) continue;
+        const Insn jr = decode(*image.word(pc), pc);
+        if (jr.op != Op::Jr || jr.rs() == 31) continue;
+        for (std::uint32_t at = pc - 4; pc - at <= 64 && p.is_code(at); at -= 4) {
+            const Insn add = decode(*image.word(at), at);
+            if ((add.op != Op::Addu && add.op != Op::Daddu) || add.rd() != jr.rs()) continue;
+            const std::uint32_t regs[2] = {add.rs(), add.rt()};
+            for (int i = 0; i < 2; ++i) {
+                const std::uint32_t table = constant_in(image, p, at, regs[i]);
+                if (!table || (table & 3u) || !image.word(table)) continue;
+                const std::uint32_t stride = 1u << scale_of(image, p, at, regs[i ^ 1]);
+                std::uint32_t last = table;
+                while (last < table + 64 * stride && image.word(last)) {
+                    const Flow f = flow(decode(*image.word(last), last).op);
+                    if (f == Flow::JumpRegister || f == Flow::Stop) break;
+                    last += 4;
+                }
+                for (std::uint32_t slot = table; slot <= last; slot += stride) found.push_back(slot);
+            }
+            break;
+        }
+    }
+    return found;
+}
+
 }
 
 Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entries) {
@@ -157,6 +208,8 @@ Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entr
 
     for (int round = 0; round < 8; ++round) {
         std::vector<std::uint32_t> candidates = address_constants(image, p);
+        const std::vector<std::uint32_t> branches = computed_branches(image, p);
+        candidates.insert(candidates.end(), branches.begin(), branches.end());
         for (const auto &segment : image.segments())
             for (std::size_t offset = 0; offset + 4 <= segment.bytes.size(); offset += 4)
                 candidates.push_back(*image.word(segment.address + static_cast<std::uint32_t>(offset)));
