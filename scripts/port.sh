@@ -104,8 +104,8 @@ if [ "$explore" = 1 ]; then
   fi
   for ((round = 1; round <= rounds; round++)); do
     ninja -C "$native" ps2run > "$native/ninja.log" 2>&1 || { tail -30 "$native/ninja.log"; exit 1; }
-    rm -f "$game/misses.txt"
-    PS2_GPU_LOW_POWER=1 PS2_VU_RECORD="$game/vu1" "$native/ps2run" "$elf" --disc "$iso" --misses "$game/misses.txt" \
+    rm -f "$game/misses.txt" "$game/explore.ps2"
+    PS2_GPU_LOW_POWER=1 PS2_VU_RECORD="$game/vu1" "$native/ps2run" "$elf" --disc "$iso" --misses "$game/misses.txt" --memcard "$game/explore.ps2" \
       --frames "$frames" "${presses[@]}" --frames-dir "$game/shots" --frame-every 300 > "$game/explore.log" 2>&1 || true
     reason=$(sed -n 's/^\[ee\] halted: //p' "$game/explore.log" | head -1)
     added=$(python3 -I - "$game/entries.txt" "$game/misses.txt" <<'EOF'
