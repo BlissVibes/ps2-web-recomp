@@ -57,6 +57,7 @@ void save_context(const Cpu &c, ThreadContext &t);
 void load_context(Cpu &c, const ThreadContext &t);
 
 std::uint64_t now();
+std::uint64_t hblank_cycles();
 void set_budget(Cpu &c, std::int64_t cycles);
 void schedule(int event, std::uint64_t at, std::function<void()> action);
 bool preempt(Cpu &c);

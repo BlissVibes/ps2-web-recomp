@@ -134,7 +134,7 @@ void vblank() {
     if (!g_options.frames_dir.empty() && g_options.frame_every && g_frames % g_options.frame_every == 0) dump_frame();
     hw::vblank_start();
     iop::vblank(true);
-    schedule(hw::kEventVblankEnd + 100, now() + 18874u * 22u, [] { iop::vblank(false); });
+    schedule(hw::kEventVblankEnd + 100, now() + hblank_cycles() * 22u, [] { iop::vblank(false); });
     kernel::on_vblank_start();
     if (g_options.max_frames && g_frames >= g_options.max_frames) halt("frame limit reached");
     if (g_options.save_state_frame && g_frames == g_options.save_state_frame) g_state_request = true;
@@ -179,6 +179,8 @@ void load_context(Cpu &c, const ThreadContext &t) {
 }
 
 std::uint64_t now() { return g_base + static_cast<std::uint64_t>(g_given - g_cpu.budget); }
+
+std::uint64_t hblank_cycles() { return frame_cycles() * 2u / (g_options.pal ? 625u : 525u); }
 
 void set_budget(Cpu &c, std::int64_t cycles) {
     g_base = now();

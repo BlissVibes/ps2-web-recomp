@@ -49,7 +49,7 @@ std::uint64_t timer_divider(const Timer &t) {
     case 0: return 2;
     case 1: return 32;
     case 2: return 512;
-    default: return 18874;
+    default: return hblank_cycles();
     }
 }
 
@@ -123,7 +123,7 @@ void reset() {
 void vblank_start() {
     intc_raise(2);
     gs::vblank(true);
-    schedule(kEventVblankEnd, now() + 18874u * 22u, [] { intc_raise(3); });
+    schedule(kEventVblankEnd, now() + hblank_cycles() * 22u, [] { intc_raise(3); });
 }
 
 std::uint32_t intc_pending() { return g_intc_stat & g_intc_mask; }
