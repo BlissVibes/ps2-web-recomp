@@ -1232,16 +1232,16 @@ void wait_idle() {
     wait_until(done);
 }
 
-void download(std::uint8_t *memory) {
+void download(std::uint8_t *memory, std::uint32_t offset, std::uint32_t bytes) {
     flush_all();
     if (g_scale == 1) {
         submit();
-        read_back(g_vram, kMemorySize, memory);
+        read_back(g_vram, bytes, memory + offset, offset);
         return;
     }
-    dispatch_linear(kResolve, kMemorySize / 4, push_params({}));
+    dispatch_linear(kResolve, bytes / 4, push_params({offset / 4}));
     submit();
-    read_back(g_scratch, kMemorySize, memory);
+    read_back(g_scratch, bytes, memory + offset, offset);
 }
 
 void read_state(std::vector<std::uint32_t> &vram, std::uint32_t &scale, std::vector<std::uint32_t> &clut) {

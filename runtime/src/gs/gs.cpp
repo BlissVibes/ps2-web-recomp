@@ -148,6 +148,21 @@ std::uint32_t bits_per_pixel(std::uint32_t psm) {
     }
 }
 
+#ifdef PS2_GPU
+void download_source(const State &s) {
+    const std::uint32_t sbp = static_cast<std::uint32_t>(s.bitbltbuf) & 0x3FFFu, sbw = static_cast<std::uint32_t>(s.bitbltbuf >> 16) & 0x3Fu;
+    const std::uint32_t spsm = static_cast<std::uint32_t>(s.bitbltbuf >> 24) & 0x3Fu;
+    const std::uint32_t x = static_cast<std::uint32_t>(s.trxpos) & 0x7FFu, y = static_cast<std::uint32_t>(s.trxpos >> 16) & 0x7FFu;
+    const std::uint32_t w = static_cast<std::uint32_t>(s.trxreg) & 0xFFFu, h = static_cast<std::uint32_t>(s.trxreg >> 32) & 0xFFFu;
+    const bool half = bits_per_pixel(spsm) == 16;
+    const std::uint32_t pw = spsm == PSMT8 || spsm == PSMT4 ? 128 : 64, ph = spsm == PSMT4 ? 128 : spsm == PSMT8 || half ? 64 : 32;
+    const std::uint32_t first = page_address(sbp, sbw, x, y, pw, ph);
+    const std::uint32_t end = page_address(sbp, sbw, x + w - 1, y + h - 1, pw, ph) + 8192;
+    if (!w || !h || x + w > 2048 || y + h > 2048 || end > kMemorySize) gpu::download(g_memory);
+    else gpu::download(g_memory, first, end - first);
+}
+#endif
+
 void transfer_pixel(std::uint32_t value) {
     const std::uint64_t buf = g_state.bitbltbuf, pos = g_state.trxpos, reg = g_state.trxreg;
     const std::uint32_t dbp = static_cast<std::uint32_t>(buf >> 32) & 0x3FFFu;
@@ -510,7 +525,7 @@ void write(std::uint32_t reg, std::uint64_t value) {
         if (gpu_on()) {
             if ((value & 3u) == 0) gpu::image_begin(s);
             else if ((value & 3u) == 2) gpu::local_copy(s);
-            else if ((value & 3u) == 1 && !cpu_raster()) gpu::download(g_memory);
+            else if ((value & 3u) == 1 && !cpu_raster()) download_source(s);
         }
 #endif
         if ((value & 3u) == 0) g_transfer.active = true;

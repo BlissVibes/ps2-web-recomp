@@ -1065,7 +1065,7 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
 
 @compute @workgroup_size(64)
 fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x + gid.y * 64u * 1024u;
+    let i = prm(0u) + gid.x + gid.y * 64u * 1024u;
     if (i >= 1048576u) {
         return;
     }

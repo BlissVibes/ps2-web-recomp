@@ -122,7 +122,10 @@ void run_normal(int ch) {
     } else if ((c.chcr & 1u) || ch == 2 || ch == 0 || ch == 9) {
         deliver(ch, c.madr, c.qwc);
     } else if (ch == 1) {
-        for (std::uint32_t i = 0; i < c.qwc; ++i) gs::read_image(target(c.madr + i * 16), 1);
+        for (std::uint32_t i = 0, n = 1; i < c.qwc; i += n, n = 1) {
+            while (i + n < c.qwc && target(c.madr + (i + n) * 16) == target(c.madr + i * 16) + n * 16) ++n;
+            gs::read_image(target(c.madr + i * 16), n);
+        }
     } else {
         std::fprintf(stderr, "[dma] channel %d reads from a device (not emulated)\n", ch);
     }
