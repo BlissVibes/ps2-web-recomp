@@ -18,6 +18,7 @@ struct Segment {
 class Image {
 public:
     static Image load(const std::string &path);
+    static Image raw(std::uint32_t address, std::vector<std::uint8_t> bytes, std::pair<std::uint32_t, std::uint32_t> text);
 
     std::uint32_t entry() const { return entry_; }
     const std::vector<Segment> &segments() const { return segments_; }

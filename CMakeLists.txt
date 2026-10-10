@@ -17,7 +17,8 @@ if(NOT EMSCRIPTEN)
         recomp/r5900.cpp
         recomp/elf.cpp
         recomp/analysis.cpp
-        recomp/codegen.cpp)
+        recomp/codegen.cpp
+        recomp/snr2.cpp)
     target_compile_options(eerecomp PRIVATE -Wall -Wextra)
 
     add_executable(vujit_dump recomp/vujit_dump.cpp runtime/src/vu_jit.cpp)

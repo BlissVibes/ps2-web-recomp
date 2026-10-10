@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -34,8 +35,6 @@ std::string offset(std::int32_t imm) {
     return "";
 }
 
-std::string address(const Insn &i) { return "(" + w(i.rs()) + offset(i.simm()) + ")"; }
-
 class Layout {
 public:
     Layout(const Program &p, std::uint32_t bits) : bits_(bits) {
@@ -55,8 +54,6 @@ private:
     std::uint32_t count_{};
 };
 
-std::string unit_name(std::uint32_t u) { return std::format("unit_{:04X}", u); }
-
 void write_if_changed(const fs::path &path, const std::string &text) {
     std::ifstream in(path, std::ios::binary);
     if (in) {
@@ -65,29 +62,69 @@ void write_if_changed(const fs::path &path, const std::string &text) {
     }
     std::ofstream(path, std::ios::binary) << text;
 }
-std::string table_name(std::uint32_t u) { return std::format("entries_{:04X}", u); }
+
+struct UnitRow {
+    std::uint32_t base;
+    std::uint32_t size;
+    std::string function;
+    std::string table;
+};
 
 class Generator {
 public:
-    Generator(const Image &image, Program &program, const CodegenOptions &options)
-        : image_(image), p_(program), options_(options), layout_(program, options.unit_bits) {}
+    Generator(const Translation &t, const CodegenOptions &options)
+        : image_(*t.image), p_(*t.program), links_(t.links), prefix_(t.prefix), relocatable_(t.relocatable), options_(options),
+          layout_(*t.program, options.unit_bits) {}
 
-    void run() {
+    std::vector<UnitRow> run() {
         add_required_entries();
         assign_ids();
-        fs::create_directories(options_.output);
-        write_header();
-        std::size_t written = 0;
+        std::vector<UnitRow> rows;
         for (std::uint32_t u = 0; u < layout_.count(); ++u)
             if (has_code_[u]) {
                 write_unit(u);
-                ++written;
+                rows.push_back({layout_.base_of(u), layout_.size(), unit_name(u), table_name(u)});
             }
-        write_table();
-        std::printf("%zu units written to %s\n", written, options_.output.c_str());
+        return rows;
     }
 
 private:
+    std::string unit_name(std::uint32_t u) const { return std::format("{}unit_{:04X}", prefix_, u); }
+    std::string table_name(std::uint32_t u) const { return std::format("{}entries_{:04X}", prefix_, u); }
+    std::string pc(std::uint32_t a) const { return relocatable_ ? std::format("(B + {})", hex(a)) : hex(a); }
+    std::string rebase() const { return relocatable_ ? "c.base = B; " : ""; }
+
+    const Link *link_at(std::uint32_t a) const {
+        if (!links_) return nullptr;
+        const auto it = links_->find(a);
+        return it == links_->end() ? nullptr : &it->second;
+    }
+
+    bool dynamic_jump(std::uint32_t a) const {
+        const Link *l = link_at(a);
+        return l && l->kind == Fix::Jump && (l->external || !relocatable_);
+    }
+
+    std::optional<std::string> field(const Insn &i) const {
+        const Link *l = link_at(i.pc);
+        if (!l || (l->kind != Fix::High && l->kind != Fix::Low)) return std::nullopt;
+        if (l->external || !relocatable_) return std::format("static_cast<std::uint32_t>(ld16({}))", pc(i.pc));
+        if (l->kind == Fix::High) return std::format("((B + {}) >> 16)", hex(l->value + 0x8000u));
+        return std::format("(B + {})", hex(i.uimm()));
+    }
+
+    std::string imm(const Insn &i) const {
+        if (const auto e = field(i)) return " + static_cast<std::uint32_t>(static_cast<std::int16_t>(" + *e + "))";
+        return offset(i.simm());
+    }
+
+    std::string address(const Insn &i) const { return "(" + w(i.rs()) + imm(i) + ")"; }
+
+    std::string uimm(const Insn &i) const {
+        if (const auto e = field(i)) return "(static_cast<std::uint64_t>(" + *e + ") & 0xFFFFull)";
+        return std::format("{}ull", i.uimm());
+    }
+
     Insn at(std::uint32_t a) const { return decode(*image_.word(a), a); }
 
     void add_required_entries() {
@@ -95,7 +132,7 @@ private:
             if (!p_.is_code(a)) continue;
             const Insn i = at(a);
             const Flow fl = flow(i.op);
-            if (fl == Flow::Branch || fl == Flow::BranchLikely || fl == Flow::Jump || i.op == Jal) {
+            if ((fl == Flow::Branch || fl == Flow::BranchLikely || fl == Flow::Jump || i.op == Jal) && !dynamic_jump(a)) {
                 const std::uint32_t t = i.branch_target_of();
                 if (p_.is_code(t) && layout_.unit_of(t) != layout_.unit_of(a)) p_.entries.insert(t);
             }
@@ -128,31 +165,6 @@ private:
 
     bool in_unit(std::uint32_t a) const { return a >= base_ && a < base_ + layout_.size(); }
 
-    void write_header() {
-        std::ostringstream out;
-        out << "#pragma once\n\n#include \"ps2/generated.hpp\"\n\nnamespace gen {\n";
-        for (std::uint32_t u = 0; u < layout_.count(); ++u) {
-            if (!has_code_[u]) continue;
-            out << "void " << unit_name(u) << "(ps2::Cpu &c, std::uint32_t entry, std::uint32_t depth);\n";
-            out << "extern const std::uint16_t " << table_name(u) << "[];\n";
-        }
-        out << "}\n";
-        write_if_changed(fs::path(options_.output) / "units.hpp", out.str());
-    }
-
-    void write_table() {
-        std::ostringstream out;
-        out << "#include \"units.hpp\"\n\nnamespace gen {\n\nconst ps2::UnitInfo kUnits[] = {\n";
-        std::size_t n = 0;
-        for (std::uint32_t u = 0; u < layout_.count(); ++u) {
-            if (!has_code_[u]) continue;
-            out << std::format("    {{{}, {}u, &{}, {}}},\n", hex(layout_.base_of(u)), layout_.size(), unit_name(u), table_name(u));
-            ++n;
-        }
-        out << "};\n\n}\n\nvoid register_generated_code() { ps2::register_units(gen::kUnits, " << n << "u); }\n";
-        write_if_changed(fs::path(options_.output) / "table.cpp", out.str());
-    }
-
     void write_unit(std::uint32_t u) {
         base_ = layout_.base_of(u);
         labels_.clear();
@@ -162,7 +174,7 @@ private:
             if (!p_.is_code(a)) continue;
             const Insn i = at(a);
             const Flow fl = flow(i.op);
-            if (fl == Flow::Branch || fl == Flow::BranchLikely || fl == Flow::Jump) {
+            if ((fl == Flow::Branch || fl == Flow::BranchLikely || fl == Flow::Jump) && !dynamic_jump(a)) {
                 const std::uint32_t t = i.branch_target_of();
                 if (in_unit(t) && p_.is_code(t)) labels_.insert(t);
             }
@@ -177,9 +189,10 @@ private:
         for (std::size_t k = 0; k < dense.size(); ++k) out_ << (k % 32 ? " " : "\n    ") << dense[k] << ",";
         out_ << "\n};\n\n";
         out_ << "void " << unit_name(u) << "(Cpu &c, std::uint32_t entry, std::uint32_t depth) {\n";
+        if (relocatable_) out_ << "    [[maybe_unused]] const std::uint32_t B = c.base;\n";
         out_ << "dispatch_entry:\n    switch (entry) {\n";
         for (const auto &[a, id] : ids_[u]) out_ << "    case " << id << "u: goto " << label(a) << ";\n";
-        out_ << "    default: bad_entry(c, " << hex(base_) << "); return;\n    }\n";
+        out_ << "    default: bad_entry(c, " << pc(base_) << "); return;\n    }\n";
 
         pending_ = 0;
         bool falls = false, skip = false;
@@ -199,7 +212,7 @@ private:
                 flush();
                 out_ << label(a) << ":\n";
             }
-            if (options_.probes.count(a)) line(std::format("probe(c, {});", hex(a)));
+            if (options_.probes.count(a)) line(std::format("probe(c, {});", pc(a)));
             const Insn i = at(a);
             const Flow fl = flow(i.op);
             if (fl == Flow::None) {
@@ -212,7 +225,7 @@ private:
                 falls = false;
             } else if (fl == Flow::Stop) {
                 flush();
-                line(std::format("stop(c, {}, \"{}\"); return;", hex(a), name(i.op)));
+                line(std::format("stop(c, {}, \"{}\"); return;", pc(a), name(i.op)));
                 falls = false;
             } else {
                 const Insn ds = p_.is_code(a + 4) ? at(a + 4) : Insn{a + 4, 0, Invalid};
@@ -244,28 +257,30 @@ private:
     void exit_to(std::uint32_t a) {
         flush();
         if (p_.is_code(a)) {
-            line(std::format("[[clang::musttail]] return {}(c, {}u, depth);", unit_name(layout_.unit_of(a)), id_of(a)));
+            line(std::format("{}[[clang::musttail]] return {}(c, {}u, depth);", rebase(), unit_name(layout_.unit_of(a)), id_of(a)));
         } else {
-            line(std::format("c.pc = {}; [[clang::musttail]] return dispatch(c, 0u, depth);", hex(a)));
+            line(std::format("c.pc = {}; [[clang::musttail]] return dispatch(c, 0u, depth);", pc(a)));
         }
     }
 
     std::string jump(std::uint32_t t, std::uint32_t from) {
-        std::string check = t <= from ? std::format("if (c.budget < 0 && preempt(c)) {{ c.pc = {} | kUnwind; return; }} ", hex(t)) : "";
+        std::string check = t <= from ? std::format("if (c.budget < 0 && preempt(c)) {{ c.pc = {} | kUnwind; return; }} ", pc(t)) : "";
         if (in_unit(t) && p_.is_code(t)) return check + "goto " + label(t) + ";";
         if (p_.is_code(t))
-            return check + std::format("[[clang::musttail]] return {}(c, {}u, depth);", unit_name(layout_.unit_of(t)), id_of(t));
-        return std::format("c.pc = {}; [[clang::musttail]] return dispatch(c, 0u, depth);", hex(t));
+            return check + std::format("{}[[clang::musttail]] return {}(c, {}u, depth);", rebase(), unit_name(layout_.unit_of(t)), id_of(t));
+        return std::format("c.pc = {}; [[clang::musttail]] return dispatch(c, 0u, depth);", pc(t));
     }
 
     std::string call_to(std::uint32_t t, std::uint32_t ret) {
         std::string invoke;
         if (p_.is_code(t))
-            invoke = std::format("if (depth < kMaxDepth) {}(c, {}u, depth + 1u); else {{ c.pc = {}; return; }}",
-                                 unit_name(layout_.unit_of(t)), id_of(t), hex(t));
+            invoke = relocatable_ ? std::format("if (depth < kMaxDepth) {{ c.base = B; {}(c, {}u, depth + 1u); }} else {{ c.pc = {}; return; }}",
+                                                unit_name(layout_.unit_of(t)), id_of(t), pc(t))
+                                  : std::format("if (depth < kMaxDepth) {}(c, {}u, depth + 1u); else {{ c.pc = {}; return; }}",
+                                                unit_name(layout_.unit_of(t)), id_of(t), pc(t));
         else
-            invoke = std::format("call(c, {}, depth + 1u);", hex(t));
-        return invoke + std::format(" if (c.pc != {}) [[unlikely]] return;", hex(ret));
+            invoke = std::format("call(c, {}, depth + 1u);", pc(t));
+        return invoke + std::format(" if (c.pc != {}) [[unlikely]] return;", pc(ret));
     }
 
     std::string condition(const Insn &i) {
@@ -288,7 +303,7 @@ private:
 
     std::string delay(const Insn &ds) {
         if (ds.op == Invalid || has_delay_slot(ds.op) || ds.op == Syscall)
-            return std::format("stop(c, {}, \"unsupported delay slot\"); return;", hex(ds.pc));
+            return std::format("stop(c, {}, \"unsupported delay slot\"); return;", pc(ds.pc));
         std::string text;
         capture_ = &text;
         simple(ds);
@@ -301,8 +316,16 @@ private:
         line(std::format("c.budget -= {};", pending_ + 2));
         pending_ = 0;
         const std::string slot = delay(ds);
-        const std::string link = std::format("c.r[31].sd[0] = static_cast<std::int32_t>({});", hex(ret));
+        const std::string link = std::format("c.r[31].sd[0] = static_cast<std::int32_t>({});", pc(ret));
         const std::uint32_t t = i.branch_target_of();
+        if (dynamic_jump(a)) {
+            const std::string target = std::format("const std::uint32_t t = (({} + 4u) & 0xF0000000u) | ((ld32({}) & 0x03FFFFFFu) << 2);", pc(a), pc(a));
+            if (i.op == Jal)
+                line(std::format("{{ {} {} {} call(c, t, depth + 1u); if (c.pc != {}) [[unlikely]] return; }}", target, link, slot, pc(ret)));
+            else
+                line(std::format("{{ {} {} c.pc = t; [[clang::musttail]] return dispatch(c, 0u, depth); }}", target, slot));
+            return;
+        }
         switch (i.op) {
         case Jal:
             line(std::format("{{ {} {} {} }}", link, slot, call_to(t, ret)));
@@ -331,13 +354,13 @@ private:
                 line(std::format("{{ const std::uint32_t t = {}; {} c.pc = t; return; }}", w(31), slot));
             } else {
                 line(std::format("{{ const std::uint32_t t = {}; {} c.pc = t; if (t - {} < {}u) {{ entry = {}[(t - {}) >> 2]; if (entry) goto dispatch_entry; }} [[clang::musttail]] return dispatch(c, 0u, depth); }}",
-                                 w(i.rs()), slot, hex(base_), layout_.size(), table_name(layout_.unit_of(base_)), hex(base_)));
+                                 w(i.rs()), slot, pc(base_), layout_.size(), table_name(layout_.unit_of(base_)), pc(base_)));
             }
             break;
         case Flow::CallRegister: {
-            const std::string set = i.rd() ? std::format("c.r[{}].sd[0] = static_cast<std::int32_t>({});", i.rd(), hex(ret)) : "";
+            const std::string set = i.rd() ? std::format("c.r[{}].sd[0] = static_cast<std::int32_t>({});", i.rd(), pc(ret)) : "";
             line(std::format("{{ const std::uint32_t t = {}; {} {} c.pc = t; call(c, t, depth + 1u); if (c.pc != {}) [[unlikely]] return; }}",
-                             w(i.rs()), set, slot, hex(ret)));
+                             w(i.rs()), set, slot, pc(ret)));
             break;
         }
         default:
@@ -395,9 +418,9 @@ private:
         case Movn: if (rd) line(std::format("if ({} != 0) c.r[{}].d[0] = {};", d(rt), rd, d(rs))); break;
         case Syscall:
             flush();
-            line(std::format("c.pc = {}; syscall(c, {}); if (c.pc != {}) return;", hex(i.pc + 4), hex(i.pc), hex(i.pc + 4)));
+            line(std::format("c.pc = {}; syscall(c, {}); if (c.pc != {}) return;", pc(i.pc + 4), pc(i.pc), pc(i.pc + 4)));
             break;
-        case Break: line(std::format("breakpoint(c, {});", hex(i.pc))); break;
+        case Break: line(std::format("breakpoint(c, {});", pc(i.pc))); break;
         case Sync: case Cache: case Pref: break;
         case Mfhi: set_d(rd, "c.hi.d[0]"); break;
         case Mflo: set_d(rd, "c.lo.d[0]"); break;
@@ -436,32 +459,39 @@ private:
         case Sltu: set_d(rd, std::format("{} < {} ? 1ull : 0ull", d(rs), d(rt))); break;
         case Dadd: case Daddu: set_d(rd, d(rs) + " + " + d(rt)); break;
         case Dsub: case Dsubu: set_d(rd, d(rs) + " - " + d(rt)); break;
-        case Tge: line(std::format("if ({} >= {}) trap(c, {});", sd(rs), sd(rt), hex(i.pc))); break;
-        case Tgeu: line(std::format("if ({} >= {}) trap(c, {});", d(rs), d(rt), hex(i.pc))); break;
-        case Tlt: line(std::format("if ({} < {}) trap(c, {});", sd(rs), sd(rt), hex(i.pc))); break;
-        case Tltu: line(std::format("if ({} < {}) trap(c, {});", d(rs), d(rt), hex(i.pc))); break;
-        case Teq: line(std::format("if ({} == {}) trap(c, {});", d(rs), d(rt), hex(i.pc))); break;
-        case Tne: line(std::format("if ({} != {}) trap(c, {});", d(rs), d(rt), hex(i.pc))); break;
-        case Tgei: line(std::format("if ({} >= {}ll) trap(c, {});", sd(rs), i.simm(), hex(i.pc))); break;
-        case Tgeiu: line(std::format("if ({} >= static_cast<std::uint64_t>({}ll)) trap(c, {});", d(rs), i.simm(), hex(i.pc))); break;
-        case Tlti: line(std::format("if ({} < {}ll) trap(c, {});", sd(rs), i.simm(), hex(i.pc))); break;
-        case Tltiu: line(std::format("if ({} < static_cast<std::uint64_t>({}ll)) trap(c, {});", d(rs), i.simm(), hex(i.pc))); break;
-        case Teqi: line(std::format("if ({} == {}ll) trap(c, {});", sd(rs), i.simm(), hex(i.pc))); break;
-        case Tnei: line(std::format("if ({} != {}ll) trap(c, {});", sd(rs), i.simm(), hex(i.pc))); break;
+        case Tge: line(std::format("if ({} >= {}) trap(c, {});", sd(rs), sd(rt), pc(i.pc))); break;
+        case Tgeu: line(std::format("if ({} >= {}) trap(c, {});", d(rs), d(rt), pc(i.pc))); break;
+        case Tlt: line(std::format("if ({} < {}) trap(c, {});", sd(rs), sd(rt), pc(i.pc))); break;
+        case Tltu: line(std::format("if ({} < {}) trap(c, {});", d(rs), d(rt), pc(i.pc))); break;
+        case Teq: line(std::format("if ({} == {}) trap(c, {});", d(rs), d(rt), pc(i.pc))); break;
+        case Tne: line(std::format("if ({} != {}) trap(c, {});", d(rs), d(rt), pc(i.pc))); break;
+        case Tgei: line(std::format("if ({} >= {}ll) trap(c, {});", sd(rs), i.simm(), pc(i.pc))); break;
+        case Tgeiu: line(std::format("if ({} >= static_cast<std::uint64_t>({}ll)) trap(c, {});", d(rs), i.simm(), pc(i.pc))); break;
+        case Tlti: line(std::format("if ({} < {}ll) trap(c, {});", sd(rs), i.simm(), pc(i.pc))); break;
+        case Tltiu: line(std::format("if ({} < static_cast<std::uint64_t>({}ll)) trap(c, {});", d(rs), i.simm(), pc(i.pc))); break;
+        case Teqi: line(std::format("if ({} == {}ll) trap(c, {});", sd(rs), i.simm(), pc(i.pc))); break;
+        case Tnei: line(std::format("if ({} != {}ll) trap(c, {});", sd(rs), i.simm(), pc(i.pc))); break;
         case Dsll: set_d(rd, std::format("{} << {}", d(rt), sa)); break;
         case Dsrl: set_d(rd, std::format("{} >> {}", d(rt), sa)); break;
         case Dsra: set_d(rd, std::format("static_cast<std::uint64_t>({} >> {})", sd(rt), sa)); break;
         case Dsll32: set_d(rd, std::format("{} << {}", d(rt), sa + 32)); break;
         case Dsrl32: set_d(rd, std::format("{} >> {}", d(rt), sa + 32)); break;
         case Dsra32: set_d(rd, std::format("static_cast<std::uint64_t>({} >> {})", sd(rt), sa + 32)); break;
-        case Addi: case Addiu: set_w(rt, w(rs) + offset(i.simm())); break;
+        case Addi: case Addiu: set_w(rt, w(rs) + imm(i)); break;
         case Slti: set_d(rt, std::format("{} < {}ll ? 1ull : 0ull", sd(rs), i.simm())); break;
         case Sltiu: set_d(rt, std::format("{} < static_cast<std::uint64_t>({}ll) ? 1ull : 0ull", d(rs), i.simm())); break;
-        case Andi: set_d(rt, std::format("{} & {}ull", d(rs), i.uimm())); break;
-        case Ori: set_d(rt, std::format("{} | {}ull", d(rs), i.uimm())); break;
-        case Xori: set_d(rt, std::format("{} ^ {}ull", d(rs), i.uimm())); break;
-        case Lui: if (rt) line(std::format("c.r[{}].sd[0] = static_cast<std::int32_t>({});", rt, hex(i.uimm() << 16))); break;
-        case Daddi: case Daddiu: set_d(rt, std::format("{} + static_cast<std::uint64_t>({}ll)", d(rs), i.simm())); break;
+        case Andi: set_d(rt, std::format("{} & {}", d(rs), uimm(i))); break;
+        case Ori: set_d(rt, std::format("{} | {}", d(rs), uimm(i))); break;
+        case Xori: set_d(rt, std::format("{} ^ {}", d(rs), uimm(i))); break;
+        case Lui:
+            if (!rt) break;
+            if (const auto e = field(i)) line(std::format("c.r[{}].sd[0] = static_cast<std::int32_t>({} << 16);", rt, *e));
+            else line(std::format("c.r[{}].sd[0] = static_cast<std::int32_t>({});", rt, hex(i.uimm() << 16)));
+            break;
+        case Daddi: case Daddiu:
+            if (const auto e = field(i)) set_d(rt, std::format("{} + static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int16_t>({})))", d(rs), *e));
+            else set_d(rt, std::format("{} + static_cast<std::uint64_t>({}ll)", d(rs), i.simm()));
+            break;
         case Ldl: if (rt) line(std::format("ldl({}, {});", reg(rt), address(i))); break;
         case Ldr: if (rt) line(std::format("ldr({}, {});", reg(rt), address(i))); break;
         case Lwl: if (rt) line(std::format("lwl({}, {});", reg(rt), address(i))); break;
@@ -589,7 +619,7 @@ private:
         case Ei: line("set_interrupts(c, true);"); break;
         case Di: line("set_interrupts(c, false);"); break;
         case Tlbr: case Tlbwi: case Tlbwr: case Tlbp:
-            line(std::format("stop(c, {}, \"{}\");", hex(i.pc), name(i.op)));
+            line(std::format("stop(c, {}, \"{}\");", pc(i.pc), name(i.op)));
             break;
 
         case Mfc1: set_w(rt, f(i.fs())); break;
@@ -732,13 +762,16 @@ private:
         case Vrxor: line(std::format("c.vu0.r = (c.vu0.r ^ {}.w[{}]) & 0x7FFFFFu;", vf(i.fs()), fsf)); break;
 
         default:
-            line(std::format("stop(c, {}, \"{}\"); return;", hex(i.pc), name(i.op)));
+            line(std::format("stop(c, {}, \"{}\"); return;", pc(i.pc), name(i.op)));
             break;
         }
     }
 
     const Image &image_;
     Program &p_;
+    const Links *links_;
+    std::string prefix_;
+    bool relocatable_;
     const CodegenOptions &options_;
     Layout layout_;
     std::vector<std::map<std::uint32_t, std::uint16_t>> ids_;
@@ -752,8 +785,40 @@ private:
 
 }
 
-void generate(const Image &image, Program &program, const CodegenOptions &options) {
-    Generator(image, program, options).run();
+void generate(const std::vector<Translation> &translations, const CodegenOptions &options) {
+    fs::create_directories(options.output);
+    std::ostringstream header, table, modules;
+    header << "#pragma once\n\n#include \"ps2/generated.hpp\"\n\nnamespace gen {\n";
+    table << "#include \"units.hpp\"\n\nnamespace gen {\n\n";
+    std::size_t written = 0, main_units = 0, module_count = 0;
+    for (const Translation &t : translations) {
+        const std::vector<UnitRow> rows = Generator(t, options).run();
+        written += rows.size();
+        for (const UnitRow &r : rows) {
+            header << "void " << r.function << "(ps2::Cpu &c, std::uint32_t entry, std::uint32_t depth);\n";
+            header << "extern const std::uint16_t " << r.table << "[];\n";
+        }
+        table << "const ps2::UnitInfo " << (t.relocatable ? t.prefix + "units" : "kUnits") << "[] = {\n";
+        for (const UnitRow &r : rows) table << std::format("    {{{}, {}u, &{}, {}}},\n", hex(r.base), r.size, r.function, r.table);
+        table << "};\n\n";
+        if (!t.relocatable) {
+            main_units = rows.size();
+            continue;
+        }
+        table << "const std::uint32_t " << t.prefix << "checks[] = {";
+        for (const auto &[at, value] : t.checks) table << std::format("{}, {}, ", hex(at), hex(value));
+        table << "};\n\n";
+        modules << std::format("    {{\"{}\", {}, {}checks, {}u, {}units, {}u}},\n", t.name, hex(t.size), t.prefix, t.checks.size(), t.prefix, rows.size());
+        ++module_count;
+    }
+    header << "}\n";
+    if (module_count) table << "const ps2::ModuleInfo kModules[] = {\n" << modules.str() << "};\n\n";
+    table << "}\n\nvoid register_generated_code() { ps2::register_units(gen::kUnits, " << main_units << "u);";
+    if (module_count) table << " ps2::register_modules(gen::kModules, " << module_count << "u);";
+    table << " }\n";
+    write_if_changed(fs::path(options.output) / "units.hpp", header.str());
+    write_if_changed(fs::path(options.output) / "table.cpp", table.str());
+    std::printf("%zu units written to %s\n", written, options.output.c_str());
 }
 
 }

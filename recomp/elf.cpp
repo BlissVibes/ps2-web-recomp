@@ -68,6 +68,13 @@ Image Image::load(const std::string &path) {
     return image;
 }
 
+Image Image::raw(std::uint32_t address, std::vector<std::uint8_t> bytes, std::pair<std::uint32_t, std::uint32_t> text) {
+    Image image;
+    image.segments_.push_back(Segment{address, std::move(bytes), true});
+    image.text_ = text;
+    return image;
+}
+
 std::optional<std::uint32_t> Image::word(std::uint32_t address) const {
     for (const auto &segment : segments_) {
         if (address >= segment.address && address - segment.address + 4 <= segment.bytes.size()) {

@@ -57,7 +57,7 @@ struct Cpu {
     std::uint32_t sa{};
     std::uint32_t pc{};
     std::int32_t budget{};
-    std::uint32_t pad0{};
+    std::uint32_t base{};
 
     std::uint32_t f[32];
     std::uint32_t facc{};

@@ -51,7 +51,7 @@ public:
                 if (!valid_target(pc + 4) || decode(*image_.word(pc + 4), pc + 4).op == Op::Invalid) return false;
                 if (has_delay_slot(decode(*image_.word(pc + 4), pc + 4).op)) return false;
                 seen.insert(pc + 4);
-                if (f == Flow::Branch || f == Flow::BranchLikely || f == Flow::Jump) {
+                if (f == Flow::Branch || f == Flow::BranchLikely || (f == Flow::Jump && !p_.dynamic.count(pc))) {
                     if (!valid_target(insn.branch_target_of())) return false;
                     pending.push_back(insn.branch_target_of());
                 }
@@ -79,10 +79,10 @@ private:
                 local(insn.branch_target_of(), pc);
                 break;
             case Flow::Jump:
-                local(insn.branch_target_of(), pc);
+                if (!p_.dynamic.count(pc)) local(insn.branch_target_of(), pc);
                 return;
             case Flow::Call:
-                strong(insn.branch_target_of(), true);
+                if (!p_.dynamic.count(pc)) strong(insn.branch_target_of(), true);
                 p_.entries.insert(pc + 8);
                 break;
             case Flow::CallRegister:
@@ -184,8 +184,9 @@ std::vector<std::uint32_t> computed_branches(const Image &image, const Program &
 
 }
 
-Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entries) {
+Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entries, const std::set<std::uint32_t> &dynamic) {
     Program p;
+    p.dynamic = dynamic;
     p.base = UINT32_MAX;
     for (const auto &segment : image.segments()) {
         if (!segment.executable) continue;

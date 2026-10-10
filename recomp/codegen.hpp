@@ -2,10 +2,13 @@
 
 #include "analysis.hpp"
 #include "elf.hpp"
+#include "snr2.hpp"
 
 #include <cstdint>
 #include <set>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace recomp {
 
@@ -15,6 +18,17 @@ struct CodegenOptions {
     std::set<std::uint32_t> probes;
 };
 
-void generate(const Image &image, Program &program, const CodegenOptions &options);
+struct Translation {
+    const Image *image{};
+    Program *program{};
+    const Links *links{};
+    std::string prefix;
+    bool relocatable{};
+    std::string name;
+    std::uint32_t size{};
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> checks;
+};
+
+void generate(const std::vector<Translation> &translations, const CodegenOptions &options);
 
 }

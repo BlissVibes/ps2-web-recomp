@@ -109,9 +109,34 @@ def extract(image, destination, patterns, limit):
     print('%d files extracted to %s' % (count, destination))
 
 
+def read_at(image, sector, offset, size):
+    image.file.seek(sector * SECTOR + offset)
+    return image.file.read(size)
+
+
+def modules(image, destination):
+    found = []
+    for path, _, sector, size in image.files():
+        head = read_at(image, sector, 0, 8)
+        if head[:4] == b'SNR2':
+            found.append((path.replace('/', '_'), sector, 0, size))
+        elif head[:4] == b'AFS\0':
+            count = struct.unpack_from('<I', head, 4)[0]
+            table = read_at(image, sector, 8, count * 8)
+            for index in range(count):
+                offset, length = struct.unpack_from('<II', table, index * 8)
+                if offset + 4 <= size and read_at(image, sector, offset, 4) == b'SNR2':
+                    found.append(('%s_%04d' % (path.replace('/', '_'), index), sector, offset, length))
+    os.makedirs(destination, exist_ok=True)
+    for name, sector, offset, length in found:
+        with open(os.path.join(destination, name + '.snr'), 'wb') as out:
+            out.write(read_at(image, sector, offset, length))
+    print('%d SNR2 modules extracted to %s' % (len(found), destination))
+
+
 def main():
     parser = argparse.ArgumentParser(description='Read files from PS2 CD and DVD images, including both layers of a DVD9.')
-    parser.add_argument('command', choices=['info', 'list', 'extract'])
+    parser.add_argument('command', choices=['info', 'list', 'extract', 'modules'])
     parser.add_argument('image')
     parser.add_argument('destination', nargs='?')
     parser.add_argument('patterns', nargs='*', help='paths or globs to extract, everything below --limit if omitted')
@@ -122,6 +147,10 @@ def main():
         info(image)
     elif args.command == 'list':
         listing(image)
+    elif args.command == 'modules':
+        if not args.destination:
+            parser.error('modules needs a destination folder')
+        modules(image, args.destination)
     else:
         if not args.destination:
             parser.error('extract needs a destination folder')

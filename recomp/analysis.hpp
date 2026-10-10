@@ -16,12 +16,13 @@ struct Program {
     std::set<std::uint32_t> functions;
     std::set<std::uint32_t> entries;
     std::set<std::uint32_t> rejected;
+    std::set<std::uint32_t> dynamic;
 
     bool is_code(std::uint32_t address) const {
         return address >= base && address < end && (address & 3u) == 0 && code[(address - base) >> 2];
     }
 };
 
-Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entries);
+Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entries, const std::set<std::uint32_t> &dynamic = {});
 
 }

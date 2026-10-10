@@ -21,7 +21,17 @@ struct UnitInfo {
     const std::uint16_t *entries;
 };
 
+struct ModuleInfo {
+    const char *name;
+    std::uint32_t size;
+    const std::uint32_t *checks;
+    std::uint32_t check_count;
+    const UnitInfo *units;
+    std::uint32_t count;
+};
+
 void register_units(const UnitInfo *units, std::uint32_t count);
+void register_modules(const ModuleInfo *modules, std::uint32_t count);
 
 void dispatch(Cpu &c, std::uint32_t entry, std::uint32_t depth);
 void call(Cpu &c, std::uint32_t target, std::uint32_t depth);

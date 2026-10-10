@@ -88,8 +88,13 @@ elif python3 -I "$here/disc.py" list "$iso" | awk '{print $4}' | grep -qx CORE.G
   elf="$game/core.elf"
 fi
 echo "${elf#$ROOT/}"
+modules=()
+if grep -q SNR2 "$elf"; then
+  python3 -I "$here/disc.py" modules "$iso" "$game/modules"
+  modules=(--modules "$game/modules")
+fi
 
-translate() { "$tools/eerecomp" "$elf" --entries "$game/entries.txt" --out "$generated" | tail -1; }
+translate() { "$tools/eerecomp" "$elf" --entries "$game/entries.txt" "${modules[@]}" --out "$generated" | tail -1; }
 
 echo "== [3/6] machine code to C++"
 touch "$game/entries.txt"
@@ -111,12 +116,15 @@ if [ "$explore" = 1 ]; then
     added=$(python3 -I - "$game/entries.txt" "$game/misses.txt" <<'EOF'
 import os, sys
 entries, misses = sys.argv[1], sys.argv[2]
-known = {int(t, 16) for t in open(entries).read().split()}
-found = [int(t, 16) for t in open(misses).read().split()] if os.path.exists(misses) else []
-new = sorted({a for a in found if a not in known})
+def token(t):
+    name, _, at = t.rpartition(':')
+    return (name + ':' if name else '') + '%x' % int(at, 16)
+known = {token(t) for t in open(entries).read().split()}
+found = [token(t) for t in open(misses).read().split()] if os.path.exists(misses) else []
+new = sorted({t for t in found if t not in known})
 with open(entries, 'a') as out:
-    for a in new:
-        out.write('%x\n' % a)
+    for t in new:
+        out.write(t + '\n')
 print(len(new))
 EOF
 )
