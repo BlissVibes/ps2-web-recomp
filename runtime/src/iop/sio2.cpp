@@ -19,7 +19,6 @@ namespace ps2::iop::sio2 {
 namespace {
 
 constexpr std::uint8_t kDigital = 0x41, kAnalog = 0x73, kPressure = 0x79, kConfig = 0xF3;
-constexpr std::uint32_t kNoDevice = 0x1D100u;
 
 struct Pad {
     bool connected = false;
@@ -57,9 +56,11 @@ Pad g_pads[2];
 Card g_card;
 Dma g_dma[2];
 
+void no_device(int port) { g_stat |= 0xC000u | (0x10000u << port); }
+
 void controller(int port, std::size_t at, std::uint32_t out_size) {
     if (port > 1 || !g_pads[port].connected) {
-        g_stat = kNoDevice;
+        no_device(port);
         return;
     }
     Pad &p = g_pads[port];
@@ -162,7 +163,7 @@ void memory_card(std::size_t at, std::uint32_t out_size) {
     Card &c = g_card;
     const std::vector<std::uint8_t> in(g_in.begin(), g_in.end());
     if (!c.present || in.size() < 2 || in[0] != 0x81) {
-        g_stat = kNoDevice;
+        no_device(2);
         return;
     }
     const std::size_t n = out_size;
@@ -244,10 +245,10 @@ void process() {
     const int port = static_cast<int>(reg & 3u);
     const std::size_t at = g_out.size();
     for (std::uint32_t i = 0; i < out_size; ++i) g_out.push_back(0xFF);
-    g_stat = 0x1100u;
+    if (g_index == 0) g_stat = 0x1100u;
     const std::uint32_t device = g_ctrl2[port];
     if (port == 2) memory_card(at, out_size);
-    else if (device == 0x5FFFFu || device == 0x00030064u || port >= 2) g_stat = kNoDevice;
+    else if (device == 0x5FFFFu || device == 0x00030064u || port >= 2) no_device(port);
     else controller(port, at, out_size);
     g_in.clear();
     ++g_index;
