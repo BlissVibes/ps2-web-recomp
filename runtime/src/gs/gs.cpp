@@ -681,7 +681,10 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
             else g_state.count = 0;
         }
         break;
-    case 0x1010: g_imr = value; break;
+    case 0x1010:
+        g_imr = value;
+        if (g_csr & ~(g_imr >> 8) & 0x1Fu) hw::intc_raise(0);
+        break;
     case 0x1040: g_busdir = value; break;
     case 0x1080: g_siglblid = value; break;
     default: break;
