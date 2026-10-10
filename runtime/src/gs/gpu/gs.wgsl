@@ -938,8 +938,8 @@ fn z_at(p: u32, d: f32) -> u32 {
     return z0 - u32(min(-step, f32(z0)));
 }
 
-fn edge_in(e: f32, gx: f32, gy: f32) -> bool {
-    return e > 0.0 || (e == 0.0 && (gx > 0.0 || (gx == 0.0 && gy > 0.0)));
+fn edge_in(w: f32, inclusive: u32) -> bool {
+    return w > 0.0 || (w == 0.0 && inclusive != 0u);
 }
 
 fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
@@ -954,16 +954,13 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             let x2 = fat(p + 8u);
             let y2 = fat(p + 9u);
             let inv = fat(p + 10u);
-            let e0 = (x1 - px) * (y2 - py) - (x2 - px) * (y1 - py);
-            let e1 = (x2 - px) * (y0 - py) - (x0 - px) * (y2 - py);
-            let e2 = (x0 - px) * (y1 - py) - (x1 - px) * (y0 - py);
-            let sg = sign(inv);
-            if (!edge_in(e0 * sg, (y1 - y2) * sg, (x2 - x1) * sg) || !edge_in(e1 * sg, (y2 - y0) * sg, (x0 - x2) * sg) ||
-                !edge_in(e2 * sg, (y0 - y1) * sg, (x1 - x0) * sg)) {
+            let w0 = ((x1 - px) * (y2 - py) - (x2 - px) * (y1 - py)) * inv;
+            let w1 = ((x2 - px) * (y0 - py) - (x0 - px) * (y2 - py)) * inv;
+            let c2 = ((x0 - px) * (y1 - py) - (x1 - px) * (y0 - py)) * inv;
+            let inclusive = data[p + 27u];
+            if (!edge_in(w0, inclusive & 1u) || !edge_in(w1, inclusive & 2u) || !edge_in(c2, inclusive & 4u)) {
                 return;
             }
-            let w0 = e0 * inv;
-            let w1 = e1 * inv;
             let w2 = 1.0 - w0 - w1;
             let c = vertex_attr(p, 0u) * w0 + vertex_attr(p, 1u) * w1 + vertex_attr(p, 2u) * w2;
             let t = vertex_tex(p, 0u) * w0 + vertex_tex(p, 1u) * w1 + vertex_tex(p, 2u) * w2;

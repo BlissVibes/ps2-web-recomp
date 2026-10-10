@@ -1024,6 +1024,12 @@ void draw(const State &st, const Vertex *v, int count) {
         const float xy[6] = {x0, y0, x1, y1, x2, y2};
         for (int i = 0; i < 6; ++i) rec[4 + i] = f2u(xy[i]);
         rec[10] = f2u(1.0f / area);
+        const float sg = area > 0.0f ? 1.0f : -1.0f;
+        const auto inclusive = [&](float ax, float ay, float bx, float by) {
+            const float gx = (ay - by) * sg, gy = (bx - ax) * sg;
+            return gx > 0.0f || (gx == 0.0f && gy > 0.0f);
+        };
+        rec[27] = (inclusive(x1, y1, x2, y2) ? 1u : 0u) | (inclusive(x2, y2, x0, y0) ? 2u : 0u) | (inclusive(x0, y0, x1, y1) ? 4u : 0u);
         for (int i = 0; i < 3; ++i) attrs(rec, i, v[i], fst, iip ? nullptr : &v[2]);
         rec[24] = v[0].z;
         rec[25] = f2u(static_cast<float>(static_cast<std::int64_t>(v[1].z) - static_cast<std::int64_t>(v[0].z)));
