@@ -191,6 +191,7 @@ struct HardTimer {
     std::uint64_t generation = 0;
 };
 std::map<std::uint32_t, HardTimer> g_hard_timers;
+std::map<std::uint32_t, std::uint64_t> g_hard_timer_start;
 
 std::uint64_t timer_cycles(const HardTimer &t, std::uint32_t ticks) {
     const std::uint64_t per_tick = (t.source & 4u) ? 2343u : std::max<std::uint32_t>(t.prescale, 1u);
@@ -198,6 +199,13 @@ std::uint64_t timer_cycles(const HardTimer &t, std::uint32_t ticks) {
 }
 
 void arm_hard_timer(std::uint32_t id);
+
+std::uint32_t hard_timer_counter(std::uint32_t id) {
+    const auto it = g_hard_timers.find(id);
+    if (it == g_hard_timers.end()) return 0;
+    const std::uint64_t start = g_hard_timer_start.try_emplace(id, now()).first->second;
+    return static_cast<std::uint32_t>((now() - start) / timer_cycles(it->second, 1));
+}
 
 void fire_hard_timer(std::uint32_t id, std::uint64_t generation) {
     auto it = g_hard_timers.find(id);
@@ -948,7 +956,12 @@ void install_timrman() {
     def("timrman", 5, "ReferHardTimer", [](Cpu &c) { c.r[2] = 1; });
     def("timrman", 6, "FreeHardTimer", [](Cpu &c) { c.r[2] = 0; });
     def("timrman", 7, "SetTimerMode", [](Cpu &c) { c.r[2] = 0; });
-    def("timrman", 9, "SetTimerCounter", [](Cpu &c) { c.r[2] = 0; });
+    def("timrman", 9, "SetTimerCounter", [](Cpu &c) {
+        const auto it = g_hard_timers.find(arg(c, 0));
+        if (it != g_hard_timers.end()) g_hard_timer_start[arg(c, 0)] = now() - std::min<std::uint64_t>(now(), static_cast<std::uint64_t>(arg(c, 1)) * timer_cycles(it->second, 1));
+        c.r[2] = 0;
+    });
+    def("timrman", 10, "GetTimerCounter", [](Cpu &c) { c.r[2] = hard_timer_counter(arg(c, 0)); });
     def("timrman", 11, "SetTimerCompare", [](Cpu &c) { c.r[2] = 0; });
     def("timrman", 16, "GetHardTimerIntrCode", [](Cpu &c) { c.r[2] = 14; });
     def("timrman", 20, "SetTimerHandler", [](Cpu &c) {
@@ -967,6 +980,7 @@ void install_timrman() {
     });
     def("timrman", 23, "StartHardTimer", [](Cpu &c) {
         g_hard_timers[arg(c, 0)].running = true;
+        g_hard_timer_start[arg(c, 0)] = now();
         arm_hard_timer(arg(c, 0));
         c.r[2] = 0;
     });
@@ -1059,6 +1073,7 @@ void install_libraries() {
     g_vblank_end_waiters.clear();
     g_alarms.clear();
     g_hard_timers.clear();
+    g_hard_timer_start.clear();
     g_next_object = 1;
     g_next_alarm = 1;
     g_rotate_order = 1ull << 40;
