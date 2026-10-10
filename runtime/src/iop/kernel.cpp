@@ -55,6 +55,7 @@ struct Interrupt {
 
 std::vector<HleEntry> g_hle;
 std::map<std::pair<std::string, std::uint32_t>, std::uint32_t> g_hle_ids;
+std::vector<std::pair<std::uint32_t, std::uint32_t>> g_hle_stubs;
 std::map<std::string, std::uint32_t> g_hle_versions;
 std::map<std::string, std::uint32_t> g_libraries;
 std::map<std::string, HleModuleStart> g_hle_modules;
@@ -146,6 +147,24 @@ void link_imports(std::uint32_t base, std::uint32_t size) {
             }
         }
     }
+}
+
+void relink_hle_imports() {
+    for (const auto &[id, m] : g_modules) {
+        for (std::uint32_t a = m.base; a + 20 <= m.base + m.size; a += 4) {
+            if (ram32(a) != 0x41E00000u) continue;
+            char raw[9] = {};
+            std::memcpy(raw, ram_ptr(a + 12), 8);
+            const std::string library(raw);
+            for (std::uint32_t stub = a + 20; stub + 8 <= m.base + m.size; stub += 8) {
+                const std::uint32_t w0 = ram32(stub), w1 = ram32(stub + 4);
+                if ((w0 >> 26) == 2u && w1 == 0) continue;
+                if ((w0 >> 26) != kHleOpcode || (w1 & 0xFFFF0000u) != 0x24000000u) break;
+                set_ram32(stub, (kHleOpcode << 26) | hle_id_for(library, w1 & 0xFFFFu));
+            }
+        }
+    }
+    for (const auto &[at, id] : g_hle_stubs) set_ram32(at, (kHleOpcode << 26) | id);
 }
 
 struct Elf {
@@ -447,6 +466,7 @@ std::uint32_t hle_stub(const HleFunction &function) {
     const std::uint32_t id = register_hle("kernel", static_cast<std::uint32_t>(g_hle.size()) + 0x1000u, function);
     const std::uint32_t at = kernel_alloc(8);
     set_ram32(at, (kHleOpcode << 26) | id);
+    g_hle_stubs.emplace_back(at, id);
     return at;
 }
 
@@ -499,6 +519,7 @@ void trace_hle(const char *library, const char *function, const Cpu &c) {
 void boot() {
     g_hle.clear();
     g_hle_ids.clear();
+    g_hle_stubs.clear();
     g_hle_versions.clear();
     g_libraries.clear();
     g_hle_modules.clear();
@@ -769,6 +790,7 @@ void state(ps2::state::Stream &s) {
     s.pod(g_nested_done);
     s.pod(g_return_stub);
     s.pod(g_exit_stub);
+    if (s.loading()) relink_hle_imports();
 }
 
 }
