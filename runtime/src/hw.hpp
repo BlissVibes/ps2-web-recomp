@@ -45,6 +45,7 @@ void dmac_ack(unsigned channel);
 void dmac_raise(unsigned channel);
 bool dmac_set_mask(unsigned channel, bool enabled);
 std::uint64_t gs_imr();
+std::uint64_t gs_csr();
 void gs_set_imr(std::uint64_t value);
 void gs_set_crt(std::uint32_t interlace, std::uint32_t mode, std::uint32_t field);
 

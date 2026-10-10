@@ -159,6 +159,7 @@ bool dmac_set_mask(unsigned channel, bool enabled) {
 }
 
 std::uint64_t gs_imr() { return gs::read_privileged(0x12001010u); }
+std::uint64_t gs_csr() { return gs::read_privileged(0x12001000u); }
 void gs_set_imr(std::uint64_t value) { gs::write_privileged(0x12001010u, value); }
 
 void gs_set_crt(std::uint32_t interlace, std::uint32_t mode, std::uint32_t field) {

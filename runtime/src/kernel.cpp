@@ -431,10 +431,10 @@ void service(Cpu &c) {
 }
 
 void on_vblank_start() {
-    if (g_vsync_flag) {
-        st32(g_vsync_flag, 1);
-        if (g_vsync_data) st64(g_vsync_data, frame_count());
-    }
+    if (!g_vsync_flag) return;
+    st32(g_vsync_flag, 1);
+    if (g_vsync_data) st64(g_vsync_data, hw::gs_csr());
+    g_vsync_flag = g_vsync_data = 0;
 }
 
 void wake_idle() { g_reschedule = true; }
