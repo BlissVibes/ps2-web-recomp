@@ -17,6 +17,7 @@ void reset();
 std::uint32_t get_reg(std::uint32_t reg);
 void set_reg(std::uint32_t reg, std::uint32_t value);
 std::uint32_t set_dma(std::uint32_t transfers, std::uint32_t count);
+int dma_stat(std::uint32_t id);
 void packet_processed();
 void pump();
 void dump();

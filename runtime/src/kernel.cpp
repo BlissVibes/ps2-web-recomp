@@ -695,7 +695,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
         else std::fprintf(stderr, "[sys] SetSyscall(0x%X) not supported\n", arg(c, 0));
         ret(c, 0);
         break;
-    case 0x76: ret(c, -1); break;
+    case 0x76: ret(c, sif::dma_stat(arg(c, 0))); break;
     case 0x77: ret(c, sif::set_dma(arg(c, 0), arg(c, 1))); request_iop_sync(); break;
     case 0x78:
         if (interrupt_variant) sif::packet_processed();

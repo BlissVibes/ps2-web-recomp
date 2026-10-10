@@ -80,6 +80,7 @@ std::map<std::uint32_t, int> g_iop_clients;
 std::uint32_t g_iop_rpc_id = 1;
 std::uint32_t g_loop_stub = 0, g_finish_stub = 0;
 std::uint32_t g_iop_dma_id = 1, g_ee_dma_id = 1;
+std::uint64_t g_ee_dma_done = 0;
 
 template <typename T>
 T ee_read(std::uint32_t a) {
@@ -672,6 +673,7 @@ void reset() {
     g_iop_clients.clear();
     std::memset(g_sreg, 0, sizeof g_sreg);
     g_iop_dma_id = g_ee_dma_id = 1;
+    g_ee_dma_done = 0;
     g_iop_rpc_id = 1;
     g_fileio_async = false;
     g_fileio_result = 0;
@@ -696,18 +698,23 @@ void set_reg(std::uint32_t reg, std::uint32_t value) {
 
 std::uint32_t set_dma(std::uint32_t transfers, std::uint32_t count) {
     if (!count) count = 1;
+    std::uint64_t bytes = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
         const std::uint32_t base = transfers + i * 16;
         const std::uint32_t src = ee_read<std::uint32_t>(base) & (kRamSize - 1);
         const std::uint32_t dst = ee_read<std::uint32_t>(base + 4);
         const std::uint32_t size = ee_read<std::uint32_t>(base + 8) & 0x7FFFFFFFu;
+        bytes += size;
         if (dst == kRpcRecvAddr) g_data_addr = src;
         else if (dst == 0) reboot(src);
         else if (dst == kCmdBuffer) command(src, size);
         else std::memcpy(iop::ram_ptr(dst), g_ram + src, std::min(size, iop::kRamSize - (iop::phys(dst) & (iop::kRamSize - 1))));
     }
+    g_ee_dma_done = std::max(g_ee_dma_done, now()) + 256u + bytes * 2u;
     return g_ee_dma_id++;
 }
+
+int dma_stat(std::uint32_t id) { return id + 1 == g_ee_dma_id && now() < g_ee_dma_done ? 0 : -1; }
 
 void packet_processed() {
     g_processed = true;
