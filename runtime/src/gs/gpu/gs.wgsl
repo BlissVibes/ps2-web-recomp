@@ -996,7 +996,9 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             if (point && abs(dv) >= abs(dy) * 0.999) {
                 uy = f32(y);
             }
-            if (SCALE > 1u && (ux < min(x0, x0 + dx) || ux >= max(x0, x0 + dx) || uy < min(y0, y0 + dy) || uy >= max(y0, y0 + dy))) {
+            let cx = f32(x);
+            let cy = f32(y);
+            if (SCALE > 1u && (cx < min(x0, x0 + dx) || cx >= max(x0, x0 + dx) || cy < min(y0, y0 + dy) || cy >= max(y0, y0 + dy))) {
                 return;
             }
             var tx = 0.0;

@@ -1038,9 +1038,9 @@ void draw(const State &st, const Vertex *v, int count) {
     }
     case 6: {
         const float x0 = sx(v[0]), y0 = sy(v[0]), x1 = sx(v[1]), y1 = sy(v[1]);
-        minx = std::max(scax0, first(std::min(x0, x1)));
+        minx = std::max(scax0, static_cast<int>(std::ceil(std::min(x0, x1))));
         maxx = std::min(scax1, static_cast<int>(std::ceil(std::max(x0, x1))) - 1);
-        miny = std::max(scay0, first(std::min(y0, y1)));
+        miny = std::max(scay0, static_cast<int>(std::ceil(std::min(y0, y1))));
         maxy = std::min(scay1, static_cast<int>(std::ceil(std::max(y0, y1))) - 1);
         rec[1] = 1;
         rec[4] = f2u(x0);
