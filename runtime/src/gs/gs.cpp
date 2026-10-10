@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <stdexcept>
 #include <string>
 #include <functional>
@@ -850,11 +851,13 @@ void post_present() {
     for (std::uint32_t done = g_presented.load(); g_posted_presents - done > 2; done = g_presented.load()) queue::wait(g_presented, done);
 }
 
-bool render_pending(const std::function<void(const DisplayRegs &)> &on_present) {
+Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_present, double budget_ms) {
     queue::role() = queue::Role::Render;
     queue::Header h;
     const std::uint8_t *payload = nullptr;
-    while (queue::render().peek(h, payload)) {
+    const auto start = std::chrono::steady_clock::now();
+    for (std::uint32_t n = 1; queue::render().peek(h, payload); ++n) {
+        if (!(n & 7u) && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > budget_ms) return Rendered::busy;
         bool presented = false;
         switch (h.type) {
         case queue::kGif: gif::render(static_cast<int>(h.arg0), payload, h.arg1); break;
@@ -888,10 +891,10 @@ bool render_pending(const std::function<void(const DisplayRegs &)> &on_present) 
         if (presented) {
             g_presented.fetch_add(1);
             queue::notify(g_presented);
-            return true;
+            return Rendered::presented;
         }
     }
-    return false;
+    return Rendered::idle;
 }
 
 std::uint64_t primitives_drawn() { return g_primitives; }

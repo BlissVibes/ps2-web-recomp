@@ -454,16 +454,18 @@ void run_vu_thread() {
 }
 void post_present() { gs::post_present(); }
 
-bool render_pending(bool surface, const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> &copy) {
+Rendered render_pending(bool surface, const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> &copy,
+                        const std::function<void()> &before_present, double budget_ms) {
     static std::vector<std::uint32_t> frame;
     return gs::render_pending([&](const gs::DisplayRegs &regs) {
+        if (before_present) before_present();
         if (surface) {
             gs::present(regs);
             return;
         }
         std::uint32_t width = 0, height = 0;
         if (copy && gs::copy_frame(regs, frame, width, height)) copy(frame.data(), width, height);
-    });
+    }, budget_ms);
 }
 
 void wait_render_work(int timeout_ms) { gs::queue::render().wait_for_work(timeout_ms); }

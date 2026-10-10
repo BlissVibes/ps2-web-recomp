@@ -504,6 +504,13 @@ async function chooseGpu() {
 }
 
 let frames = 0, last = performance.now(), lastGpu = 0, lastEmuIdle = 0, lastRenderIdle = 0, lastVuIdle = 0, lastInterpreted = 0;
+let shown = 0, fresh = false;
+const countShown = () => {
+  if (fresh) ++shown;
+  fresh = false;
+  requestAnimationFrame(countShown);
+};
+requestAnimationFrame(countShown);
 var Module = {
   canvas,
   arguments: ['/game/core.elf'].concat(params.has('arg') ? ['--arg', params.get('arg')] : [], params.getAll('press').flatMap((p) => p.split(',').flatMap((x) => ['--press', x]))),
@@ -559,13 +566,14 @@ var Module = {
   onFrame: () => {
     pollInput();
     ++frames;
+    fresh = true;
     const now = performance.now();
     if (now - last >= 1000) {
       const gpu = Module._ps2web_gpu_ms();
       const memory = (Module.HEAPU8.length / 1048576).toFixed(0);
       const emuIdle = Module._ps2web_idle_ms(0), renderIdle = Module._ps2web_idle_ms(1), vuIdle = Module._ps2web_idle_ms(2), span = now - last;
       const interpreted = Module._ps2web_vu_interpreted();
-      statsEl.textContent = 'frame ' + Module._ps2web_frames() + '   ' + (frames * 1000 / span).toFixed(1) + ' fps   GPU ' + ((gpu - lastGpu) / span * 100).toFixed(0) +
+      statsEl.textContent = 'frame ' + Module._ps2web_frames() + '   ' + (frames * 1000 / span).toFixed(1) + ' fps (' + (shown * 1000 / span).toFixed(0) + ' on screen)   GPU ' + ((gpu - lastGpu) / span * 100).toFixed(0) +
                             '%   idle emu ' + ((emuIdle - lastEmuIdle) / span * 100).toFixed(0) + '% vu ' + ((vuIdle - lastVuIdle) / span * 100).toFixed(0) +
                             '% gs ' + ((renderIdle - lastRenderIdle) / span * 100).toFixed(0) +
                             '%   heap ' + memory + ' MB   audio ' + Module.audioQueuedMs().toFixed(0) + ' ms' +
@@ -576,6 +584,7 @@ var Module = {
       lastVuIdle = vuIdle;
       lastGpu = gpu;
       frames = 0;
+      shown = 0;
       last = now;
     }
   },

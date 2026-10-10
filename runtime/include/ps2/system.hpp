@@ -99,7 +99,9 @@ void run_vu_thread();
 double vu_thread_idle_ms();
 std::uint64_t vu1_interpreted_calls();
 void post_present();
-bool render_pending(bool surface, const std::function<void(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height)> &copy);
+enum class Rendered { idle, presented, busy };
+Rendered render_pending(bool surface, const std::function<void(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height)> &copy,
+                        const std::function<void()> &before_present, double budget_ms);
 void wait_render_work(int timeout_ms);
 void wake_render_thread();
 bool copy_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);

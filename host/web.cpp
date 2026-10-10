@@ -80,7 +80,24 @@ EM_JS(double, ps2web_url_read, (const char *url, std::uint8_t *out, double size)
     }
 });
 EM_JS(char *, ps2web_disc_url, (), { return stringToNewUTF8(new URL(Module.discUrl, location.href).href); });
-EM_JS(void, ps2web_frame_done, (), { if (Module.onFrame) Module.onFrame(); });
+EM_JS(void, ps2web_frame_done, (), {
+    if (!Module.shownChannel) {
+        Module.shownChannel = new MessageChannel();
+        Module.shownWaiters = [];
+        Module.shownChannel.port1.onmessage = () => {
+            Module.shownPending = false;
+            const waiters = Module.shownWaiters;
+            Module.shownWaiters = [];
+            for (const resolve of waiters) resolve();
+        };
+    }
+    Module.shownPending = true;
+    requestAnimationFrame(() => Module.shownChannel.port2.postMessage(0));
+    if (Module.onFrame) Module.onFrame();
+});
+EM_ASYNC_JS(void, ps2web_wait_shown, (), {
+    if (Module.shownPending) await new Promise((resolve) => Module.shownWaiters.push(resolve));
+});
 EM_JS(void, ps2web_blit, (const std::uint32_t *rgba, int width, int height), {
     const canvas = Module.canvas;
     if (!Module.blitContext) Module.blitContext = canvas.getContext('2d');
@@ -376,10 +393,28 @@ int main(int argc, char **argv) {
         ps2web_blit(rgba, static_cast<int>(width), static_cast<int>(height));
     };
     const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> none;
+    const std::function<void()> wait_shown = [] {
+        static int since_skip = 0;
+        static double window_start = 0.0, window_gpu = 0.0, gpu_load = 1.0;
+        const double start = emscripten_get_now();
+        if (start - window_start > 500.0) {
+            const double gpu = ps2::gpu_busy_ms();
+            gpu_load = window_start > 0.0 ? (gpu - window_gpu) / (start - window_start) : 1.0;
+            window_start = start;
+            window_gpu = gpu;
+        }
+        if (++since_skip > 8 && gpu_load < 0.8 && g_audio.active.load() && audio_queued_ms() < 40.0) {
+            since_skip = 0;
+            return;
+        }
+        ps2web_wait_shown();
+        g_render_idle.store(g_render_idle.load() + emscripten_get_now() - start);
+    };
     for (;;) {
         service_disc();
-        if (ps2::render_pending(surface, copy ? blit : none)) {
-            ps2web_frame_done();
+        const ps2::Rendered rendered = ps2::render_pending(surface, copy ? blit : none, wait_shown, 6.0);
+        if (rendered == ps2::Rendered::presented) ps2web_frame_done();
+        if (rendered != ps2::Rendered::idle) {
             ps2::browser_yield();
         } else {
             const double start = emscripten_get_now();
