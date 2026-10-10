@@ -4,6 +4,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace recomp {
@@ -21,6 +22,7 @@ public:
     std::uint32_t entry() const { return entry_; }
     const std::vector<Segment> &segments() const { return segments_; }
     const std::map<std::uint32_t, std::string> &symbols() const { return symbols_; }
+    std::pair<std::uint32_t, std::uint32_t> text() const { return text_; }
 
     std::optional<std::uint32_t> word(std::uint32_t address) const;
     bool executable(std::uint32_t address) const;
@@ -30,6 +32,7 @@ private:
     std::uint32_t entry_{};
     std::vector<Segment> segments_;
     std::map<std::uint32_t, std::string> symbols_;
+    std::pair<std::uint32_t, std::uint32_t> text_{};
 };
 
 }

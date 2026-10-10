@@ -116,13 +116,16 @@ std::vector<std::uint32_t> address_constants(const Image &image, const Program &
         if (!p.is_code(pc)) continue;
         const Insn lui = decode(*image.word(pc), pc);
         if (lui.op != Op::Lui) continue;
-        for (std::uint32_t next = pc + 4; next < pc + 40 && p.is_code(next); next += 4) {
+        std::uint32_t stop = pc + 160;
+        for (std::uint32_t next = pc + 4; next < stop && p.is_code(next); next += 4) {
             const Insn insn = decode(*image.word(next), next);
             if ((insn.op == Op::Addiu || insn.op == Op::Ori) && insn.rs() == lui.rt()) {
                 const std::uint32_t high = lui.uimm() << 16;
                 found.push_back(insn.op == Op::Addiu ? high + static_cast<std::uint32_t>(insn.simm()) : high | insn.uimm());
             }
             if (insn.rt() == lui.rt() && insn.op == Op::Lui) break;
+            const Flow f = flow(insn.op);
+            if (f == Flow::Jump || f == Flow::JumpRegister || f == Flow::Stop) stop = std::min(stop, std::max(pc + 40, next + 8));
         }
     }
     return found;
@@ -204,6 +207,10 @@ Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entr
             text_begin = std::min(text_begin, pc);
             text_end = pc + 4;
         }
+    }
+    if (image.text().second > image.text().first) {
+        text_begin = std::min(text_begin, image.text().first);
+        text_end = std::max(text_end, image.text().second);
     }
 
     for (int round = 0; round < 8; ++round) {

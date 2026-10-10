@@ -45,8 +45,16 @@ Image Image::load(const std::string &path) {
         image.segments_.push_back(std::move(segment));
     }
 
+    const auto shstrndx = read<std::uint16_t>(data, 50);
     for (std::uint32_t i = 0; shoff && i < shnum; ++i) {
         const std::size_t sh = shoff + i * shentsize;
+        if (read<std::uint32_t>(data, sh + 4) == 1 && shstrndx < shnum) {
+            const std::size_t name = read<std::uint32_t>(data, shoff + shstrndx * shentsize + 16) + read<std::uint32_t>(data, sh);
+            if (name + 6 <= data.size() && std::memcmp(data.data() + name, ".text", 6) == 0) {
+                const auto address = read<std::uint32_t>(data, sh + 12), size = read<std::uint32_t>(data, sh + 20);
+                image.text_ = {address, address + size};
+            }
+        }
         if (read<std::uint32_t>(data, sh + 4) != 2) continue;
         const auto symoff = read<std::uint32_t>(data, sh + 16), symsize = read<std::uint32_t>(data, sh + 20);
         const auto link = read<std::uint32_t>(data, sh + 24);
