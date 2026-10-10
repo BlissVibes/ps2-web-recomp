@@ -393,14 +393,21 @@ void triangle(const Setup &s, const Vertex *v) {
     const int maxy = std::min(s.scay1, static_cast<int>(std::ceil(std::max({y0, y1, y2}))) - 1);
     if (minx > maxx || miny > maxy) return;
     const float inv = 1.0f / area;
+    const float sg = area > 0.0f ? 1.0f : -1.0f;
+    const auto edge_in = [](float e, float gx, float gy) { return e > 0.0f || (e == 0.0f && (gx > 0.0f || (gx == 0.0f && gy > 0.0f))); };
     for (int y = miny; y <= maxy; ++y) {
         const float py = static_cast<float>(y);
         for (int x = minx; x <= maxx; ++x) {
             const float px = static_cast<float>(x);
-            const float w0 = ((x1 - px) * (y2 - py) - (x2 - px) * (y1 - py)) * inv;
-            const float w1 = ((x2 - px) * (y0 - py) - (x0 - px) * (y2 - py)) * inv;
+            const float e0 = (x1 - px) * (y2 - py) - (x2 - px) * (y1 - py);
+            const float e1 = (x2 - px) * (y0 - py) - (x0 - px) * (y2 - py);
+            const float e2 = (x0 - px) * (y1 - py) - (x1 - px) * (y0 - py);
+            if (!edge_in(e0 * sg, (y1 - y2) * sg, (x2 - x1) * sg) || !edge_in(e1 * sg, (y2 - y0) * sg, (x0 - x2) * sg) ||
+                !edge_in(e2 * sg, (y0 - y1) * sg, (x1 - x0) * sg))
+                continue;
+            const float w0 = e0 * inv;
+            const float w1 = e1 * inv;
             const float w2 = 1.0f - w0 - w1;
-            if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) continue;
             plot(s, x, y, lerp3(a0, a1, a2, w0, w1, w2));
         }
     }
