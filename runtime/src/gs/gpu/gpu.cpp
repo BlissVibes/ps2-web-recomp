@@ -1005,6 +1005,8 @@ void draw(const State &st, const Vertex *v, int count) {
     const int scay0 = static_cast<int>(setup[11] & 0xFFFFu), scay1 = static_cast<int>(setup[11] >> 16);
     const auto sx = [&](const Vertex &p) { return (static_cast<float>(p.x) - static_cast<float>(ofx)) / 16.0f; };
     const auto sy = [&](const Vertex &p) { return (static_cast<float>(p.y) - static_cast<float>(ofy)) / 16.0f; };
+    const float samples = static_cast<float>(g_scale);
+    const auto first = [&](float lo) { return static_cast<int>(std::floor(std::ceil(lo * samples) / samples)); };
 
     std::uint32_t rec[kPrimWords] = {};
     int minx, miny, maxx, maxy;
@@ -1014,9 +1016,9 @@ void draw(const State &st, const Vertex *v, int count) {
         const float x0 = sx(v[0]), y0 = sy(v[0]), x1 = sx(v[1]), y1 = sy(v[1]), x2 = sx(v[2]), y2 = sy(v[2]);
         const float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
         if (area == 0.0f) return;
-        minx = std::max(scax0, static_cast<int>(std::ceil(std::min({x0, x1, x2}))));
+        minx = std::max(scax0, first(std::min({x0, x1, x2})));
         maxx = std::min(scax1, static_cast<int>(std::ceil(std::max({x0, x1, x2}))) - 1);
-        miny = std::max(scay0, static_cast<int>(std::ceil(std::min({y0, y1, y2}))));
+        miny = std::max(scay0, first(std::min({y0, y1, y2})));
         maxy = std::min(scay1, static_cast<int>(std::ceil(std::max({y0, y1, y2}))) - 1);
         rec[1] = 0;
         const float xy[6] = {x0, y0, x1, y1, x2, y2};
@@ -1030,9 +1032,9 @@ void draw(const State &st, const Vertex *v, int count) {
     }
     case 6: {
         const float x0 = sx(v[0]), y0 = sy(v[0]), x1 = sx(v[1]), y1 = sy(v[1]);
-        minx = std::max(scax0, static_cast<int>(std::ceil(std::min(x0, x1))));
+        minx = std::max(scax0, first(std::min(x0, x1)));
         maxx = std::min(scax1, static_cast<int>(std::ceil(std::max(x0, x1))) - 1);
-        miny = std::max(scay0, static_cast<int>(std::ceil(std::min(y0, y1))));
+        miny = std::max(scay0, first(std::min(y0, y1)));
         maxy = std::min(scay1, static_cast<int>(std::ceil(std::max(y0, y1))) - 1);
         rec[1] = 1;
         rec[4] = f2u(x0);
@@ -1077,10 +1079,6 @@ void draw(const State &st, const Vertex *v, int count) {
     }
     default:
         return;
-    }
-    if (g_scale > 1) {
-        --minx;
-        --miny;
     }
     minx = std::max(minx, 0);
     miny = std::max(miny, 0);
