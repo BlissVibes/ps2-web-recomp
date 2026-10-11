@@ -21,25 +21,31 @@ void register_generated_vu();
 EM_JS_DEPS(ps2web, "$stringToNewUTF8,$UTF8ToString");
 
 EM_JS(void, ps2web_fetch, (const char *url, double offset, int size, void *out, std::atomic<std::uint32_t> *state), {
-    const target = UTF8ToString(url);
     const finish = (value) => {
         Atomics.store(HEAP32, state >> 2, value);
         Atomics.notify(HEAP32, state >> 2);
     };
+    const store = (buffer, from) => {
+        let bytes = new Uint8Array(buffer);
+        if (from) bytes = bytes.subarray(from, from + size);
+        HEAPU8.set(bytes.subarray(0, Math.min(bytes.length, size)), out);
+        finish(3);
+    };
+    const fail = (e) => {
+        console.warn('disc read failed', e);
+        finish(4);
+    };
+    if (Module.discFile) {
+        Module.discFile.slice(offset, offset + size).arrayBuffer().then((buffer) => store(buffer, 0)).catch(fail);
+        return;
+    }
+    const target = UTF8ToString(url);
     fetch(target, {headers: {Range: 'bytes=' + offset + '-' + (offset + size - 1)}})
         .then((response) => {
             if (response.status !== 206 && response.status !== 200) throw new Error('status ' + response.status);
-            return response.arrayBuffer().then((buffer) => {
-                let bytes = new Uint8Array(buffer);
-                if (response.status === 200) bytes = bytes.subarray(offset, offset + size);
-                HEAPU8.set(bytes.subarray(0, Math.min(bytes.length, size)), out);
-                finish(3);
-            });
+            return response.arrayBuffer().then((buffer) => store(buffer, response.status === 200 ? offset : 0));
         })
-        .catch((e) => {
-            console.warn('disc read failed', e);
-            finish(4);
-        });
+        .catch(fail);
 });
 
 EM_JS(int, ps2web_save_program, (const char *name, const std::uint8_t *code, int size), {
