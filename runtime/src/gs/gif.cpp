@@ -23,6 +23,8 @@ struct Path {
 
 Path g_paths[4];
 std::uint32_t g_stat = 0;
+bool g_mask_vif1 = false;       // PATH3 masked by VIF1 MSKPATH3 (GIF_STAT.M3P)
+std::uint32_t g_mode = 0;       // GIF_MODE: bit 0 M3R, bit 2 IMT (mirrored into GIF_STAT bits 0 and 2)
 std::uint64_t g_tags[4][4];
 
 template <typename Sink>
@@ -147,6 +149,8 @@ Path g_scan[4];
 
 void reset() {
     g_stat = 0;
+    g_mask_vif1 = false;
+    g_mode = 0;
     if (gs::queue::active()) {
         for (Path &p : g_scan) p = Path{};
         gs::queue::post(gs::queue::kGifReset, 0, 0, nullptr, 0);
@@ -184,13 +188,16 @@ void stats() {
                      static_cast<unsigned long long>(g_tags[p][2] + g_tags[p][3]));
 }
 
+void set_path3_mask(bool masked) { g_mask_vif1 = masked; }
+
 std::uint32_t read(std::uint32_t a) {
-    if ((a & 0xF0u) == 0x20u) return g_stat;
+    if ((a & 0xF0u) == 0x20u) return g_stat | (g_mode & 5u) | (g_mask_vif1 ? 2u : 0u);
     return 0;
 }
 
 void write(std::uint32_t a, std::uint32_t v) {
     if ((a & 0xF0u) == 0x00u && (v & 1u)) reset();
+    if ((a & 0xF0u) == 0x10u) g_mode = v & 5u;
 }
 
 }
@@ -201,6 +208,8 @@ void state(ps2::state::Stream &s) {
     s.tag("gif");
     s.pod(g_paths);
     s.pod(g_stat);
+    s.pod(g_mask_vif1);
+    s.pod(g_mode);
     s.pod(g_tags);
     s.pod(g_scan);
 }
