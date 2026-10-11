@@ -46,7 +46,7 @@ void probe(const Cpu &c, std::uint32_t pc) {
 }
 
 void bad(Cpu &c, std::uint32_t pc, std::uint32_t w) {
-    std::fprintf(stderr, "[iop] unknown instruction %08X at 0x%08X (ra 0x%08X)\n", w, pc, c.r[31]);
+    if (kernel::fault_logging()) std::fprintf(stderr, "[iop] unknown instruction %08X at 0x%08X (ra 0x%08X)\n", w, pc, c.r[31]);
     kernel::fault("unknown instruction");
 }
 

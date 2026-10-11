@@ -729,9 +729,10 @@ void install_sysclib() {
         else if (dst < src) for (std::uint32_t i = 0; i < n; ++i) write8(dst + i, read8(src + i));
         else for (std::uint32_t i = n; i-- > 0;) write8(dst + i, read8(src + i));
     };
-    def("sysclib", 12, "memcpy", [copy](Cpu &c) { copy(arg(c, 0), arg(c, 1), arg(c, 2)); c.r[2] = arg(c, 0); });
-    def("sysclib", 13, "memmove", [copy](Cpu &c) { copy(arg(c, 0), arg(c, 1), arg(c, 2)); c.r[2] = arg(c, 0); });
+    def("sysclib", 12, "memcpy", [copy](Cpu &c) { note_guest_write("sysclib:memcpy", arg(c, 0), arg(c, 2), c.r[31]); copy(arg(c, 0), arg(c, 1), arg(c, 2)); c.r[2] = arg(c, 0); });
+    def("sysclib", 13, "memmove", [copy](Cpu &c) { note_guest_write("sysclib:memmove", arg(c, 0), arg(c, 2), c.r[31]); copy(arg(c, 0), arg(c, 1), arg(c, 2)); c.r[2] = arg(c, 0); });
     def("sysclib", 14, "memset", [](Cpu &c) {
+        note_guest_write("sysclib:memset", arg(c, 0), arg(c, 2), c.r[31]);
         if (phys(arg(c, 0)) + arg(c, 2) <= kRamSize) std::memset(ram_ptr(arg(c, 0)), static_cast<int>(arg(c, 1) & 0xFF), arg(c, 2));
         else for (std::uint32_t i = 0; i < arg(c, 2); ++i) write8(arg(c, 0) + i, static_cast<std::uint8_t>(arg(c, 1)));
         c.r[2] = arg(c, 0);
@@ -739,8 +740,8 @@ void install_sysclib() {
     def("sysclib", 15, "bcmp", [](Cpu &c) {
         c.r[2] = std::memcmp(ram_ptr(arg(c, 0)), ram_ptr(arg(c, 1)), arg(c, 2)) ? 1u : 0u;
     });
-    def("sysclib", 16, "bcopy", [copy](Cpu &c) { copy(arg(c, 1), arg(c, 0), arg(c, 2)); });
-    def("sysclib", 17, "bzero", [](Cpu &c) { std::memset(ram_ptr(arg(c, 0)), 0, arg(c, 1)); });
+    def("sysclib", 16, "bcopy", [copy](Cpu &c) { note_guest_write("sysclib:bcopy", arg(c, 1), arg(c, 2), c.r[31]); copy(arg(c, 1), arg(c, 0), arg(c, 2)); });
+    def("sysclib", 17, "bzero", [](Cpu &c) { note_guest_write("sysclib:bzero", arg(c, 0), arg(c, 1), c.r[31]); std::memset(ram_ptr(arg(c, 0)), 0, arg(c, 1)); });
     def("sysclib", 19, "sprintf", [](Cpu &c) {
         const std::string s = format(c, arg(c, 1), 2);
         std::memcpy(ram_ptr(arg(c, 0)), s.c_str(), s.size() + 1);

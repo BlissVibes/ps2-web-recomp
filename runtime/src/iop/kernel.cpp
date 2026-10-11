@@ -81,6 +81,10 @@ std::map<unsigned, Interrupt> g_interrupts;
 bool g_suspended = false;
 int g_nesting = 0;
 bool g_nested_done = false;
+bool g_nested_faulted = false;
+unsigned g_fault_count = 0;
+constexpr unsigned kFaultLogLimit = 256;
+unsigned g_kernel_writes_reported = 0;
 std::uint32_t g_return_stub = 0;
 std::uint32_t g_exit_stub = 0;
 std::set<std::pair<std::string, std::uint32_t>> g_missing_reported;
@@ -243,12 +247,36 @@ std::string module_name_of(const std::string &path) {
 }
 
 void fault(const char *reason) {
-    std::fprintf(stderr, "[iop] fault: %s (pc 0x%08X thread %d)\n", reason, g_cpu.pc, g_current);
+    ++g_fault_count;
+    if (g_fault_count <= kFaultLogLimit)
+        std::fprintf(stderr, "[iop] fault: %s (pc 0x%08X thread %d)\n", reason, g_cpu.pc, g_current);
+    if (g_fault_count == kFaultLogLimit)
+        std::fprintf(stderr, "[iop] %u faults logged; further faults are only counted\n", g_fault_count);
+    if (g_nesting) {
+        // The faulting code runs under call_guest: an interrupt, alarm, hard-timer, SIF command or SIF DMA
+        // callback handler. On the console an exception inside such a handler halts the IOP; here the
+        // handler is abandoned, the call ends now and reports failure to its caller, and the thread that
+        // was interrupted resumes untouched when call_guest restores its context.
+        g_nested_done = true;
+        g_nested_faulted = true;
+        return;
+    }
     if (Thread *t = current()) {
         t->status = kDormant;
         g_current = 0;
     }
     g_switch = true;
+}
+
+bool fault_logging() { return g_fault_count < kFaultLogLimit; }
+
+void note_guest_write(const char *who, std::uint32_t at, std::uint32_t size, std::uint32_t ra) {
+    // Guest modules never own memory below kUserBase: 0x0000-0x0FFF is unused and 0x1000-0x1EFFF holds
+    // the HLE stubs, the SIF command buffer and the interrupt stack. A write there is a guest bug, usually
+    // a null buffer, that on the console would land on the exception vectors and the kernel modules.
+    if (!size || phys(at) >= kUserBase || g_kernel_writes_reported >= 16) return;
+    ++g_kernel_writes_reported;
+    std::fprintf(stderr, "[iop] %s writes 0x%X bytes at 0x%08X from 0x%08X: below the user area\n", who, size, phys(at), ra);
 }
 
 std::uint32_t fetch_special(std::uint32_t pc) {
@@ -367,9 +395,9 @@ bool in_interrupt() { return g_nesting > 0; }
 
 std::uint32_t call_guest(std::uint32_t address, std::uint32_t a0, std::uint32_t a1, std::uint32_t a2, std::uint32_t a3) {
     const Cpu saved = g_cpu;
-    const bool saved_done = g_nested_done;
+    const bool saved_done = g_nested_done, saved_faulted = g_nested_faulted;
     ++g_nesting;
-    g_nested_done = false;
+    g_nested_done = g_nested_faulted = false;
     g_cpu.r[4] = a0;
     g_cpu.r[5] = a1;
     g_cpu.r[6] = a2;
@@ -390,9 +418,13 @@ std::uint32_t call_guest(std::uint32_t address, std::uint32_t a0, std::uint32_t 
     }
     g_switch = switch_wanted;
     if (guard <= 0) std::fprintf(stderr, "[iop] guest call to 0x%08X did not return\n", address);
-    const std::uint32_t result = g_cpu.r[2];
+    else if (g_nested_faulted && g_fault_count <= kFaultLogLimit) std::fprintf(stderr, "[iop] guest call to 0x%08X ended by a fault\n", address);
+    // A handler that faulted or never returned reports 0: an interrupt handler's 0 masks its line, an
+    // alarm or hard-timer handler's 0 is not re-armed, so a dead handler is not called again and again.
+    const std::uint32_t result = g_nested_faulted || guard <= 0 ? 0u : g_cpu.r[2];
     g_cpu = saved;
     g_nested_done = saved_done;
+    g_nested_faulted = saved_faulted;
     --g_nesting;
     return result;
 }
@@ -533,6 +565,9 @@ void boot() {
     g_now = g_target = 0;
     g_switch = g_suspended = false;
     g_nesting = 0;
+    g_nested_done = g_nested_faulted = false;
+    g_fault_count = 0;
+    g_kernel_writes_reported = 0;
     g_interrupts.clear();
     std::memset(&g_cpu, 0, sizeof g_cpu);
     g_return_stub = hle_stub([](Cpu &) { g_nested_done = true; });
@@ -619,6 +654,7 @@ bool idle() { return !kernel::current() && kernel::g_events.empty(); }
 
 void dump() {
     using namespace kernel;
+    std::fprintf(stderr, "[iop] %u faults\n", g_fault_count);
     for (const auto &[id, m] : g_modules) std::fprintf(stderr, "[iop] module %d %s at 0x%08X\n", id, m.name.c_str(), m.base);
     for (const auto &[id, t] : g_threads)
         std::fprintf(stderr, "[iop] thread %d status %d prio %d wait %d/%d pc 0x%08X\n", id, t.status, t.priority, t.wait, t.wait_id,

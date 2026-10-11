@@ -641,17 +641,46 @@ void install_servers() {
         return true;
     });
     register_hle_server(0x80000003u, [](std::uint32_t method, std::uint32_t args, std::uint32_t, std::uint32_t ret, std::uint32_t) {
+        // Sony's IOP heap service (hosted by the FILEIO module on a console). The method numbers are
+        // libkernel's sceSif*IopHeap / *SysMemory client order: 1 AllocIopHeap(size), 2 FreeIopHeap(addr),
+        // 3 LoadIopHeap(addr, path), 4 AllocSysMemory(size, type, addr) in the IOP allocator's argument
+        // order (type 0 low, 1 high, 2 at addr), 5 QueryMemSize, 6 QueryMaxFreeMemSize, 7 QueryTotalFreeMemSize,
+        // 8 QueryBlockTopAddress(addr), 9 QueryBlockSize(addr). Every reply is one word; an allocation that
+        // fails returns 0, which is what the EE wrappers map their own failures to as well.
+        const auto word = [args](std::uint32_t i) { return ee_read<std::uint32_t>(args + 4u * i); };
+        std::uint32_t result = 0;
         switch (method) {
-        case 1: store<std::uint32_t>(g_ram + ret, iop::kernel::alloc(ee_read<std::uint32_t>(args))); break;
-        case 2: iop::kernel::free(ee_read<std::uint32_t>(args)); store<std::uint32_t>(g_ram + ret, 0); break;
-        case 5: store<std::uint32_t>(g_ram + ret, iop::kRamSize); break;
-        case 6: store<std::uint32_t>(g_ram + ret, iop::kernel::free_max()); break;
-        case 7: store<std::uint32_t>(g_ram + ret, iop::kernel::free_total()); break;
-        default:
-            std::fprintf(stderr, "[iopheap] method %u\n", method);
-            store<std::uint32_t>(g_ram + ret, 0);
+        case 1: result = iop::kernel::alloc(word(0)); break;
+        case 2: iop::kernel::free(word(0)); break;
+        case 3: {
+            // Load a whole disc file to an IOP address: {addr, path[252]}.
+            const std::string path(reinterpret_cast<const char *>(g_ram + ((args + 4) & (kRamSize - 1))));
+            std::uint32_t mode = 0, size = 0;
+            const int fd = iop::io::stat(path, mode, size) ? iop::io::open(path, 1) : -1;
+            if (fd < 0) {
+                std::fprintf(stderr, "[iopheap] load %s failed\n", path.c_str());
+                result = static_cast<std::uint32_t>(-1);
+                break;
+            }
+            const std::uint32_t at = iop::phys(word(0)) & (iop::kRamSize - 1);
+            std::vector<std::uint8_t> buffer(size);
+            const int n = iop::io::read(fd, buffer.data(), size);
+            iop::io::close(fd);
+            if (n > 0) std::memcpy(iop::ram_ptr(at), buffer.data(), std::min<std::uint32_t>(static_cast<std::uint32_t>(n), iop::kRamSize - at));
+            std::fprintf(stderr, "[iopheap] load %s to 0x%08X, %d bytes\n", path.c_str(), at, n);
             break;
         }
+        case 4: result = iop::kernel::alloc(word(0), static_cast<int>(word(1)), word(2)); break;
+        case 5: result = iop::kRamSize; break;
+        case 6: result = iop::kernel::free_max(); break;
+        case 7: result = iop::kernel::free_total(); break;
+        case 8: result = word(0); break;
+        case 9: result = 0; break;
+        default:
+            std::fprintf(stderr, "[iopheap] method %u\n", method);
+            break;
+        }
+        store<std::uint32_t>(g_ram + ret, result);
         return true;
     });
 }

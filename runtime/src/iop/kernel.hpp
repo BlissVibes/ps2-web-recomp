@@ -42,6 +42,8 @@ struct Thread {
 };
 
 void fault(const char *reason);
+bool fault_logging();
+void note_guest_write(const char *who, std::uint32_t at, std::uint32_t size, std::uint32_t ra);
 std::uint32_t fetch_special(std::uint32_t pc);
 void syscall(Cpu &c, std::uint32_t pc);
 void set_status(Cpu &c, std::uint32_t value);
