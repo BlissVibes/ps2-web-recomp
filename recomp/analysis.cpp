@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <map>
 
 namespace recomp {
 
@@ -182,6 +183,41 @@ std::vector<std::uint32_t> computed_branches(const Image &image, const Program &
     return found;
 }
 
+// Tables of function pointers in data: static constructor lists, virtual tables, callback arrays.
+// Four or more consecutive non-code words that each point at plausible code. Their targets are
+// accepted even outside the code range found so far, because functions reached only through a
+// table often lie past everything the explorer can reach from the entry point.
+std::vector<std::uint32_t> pointer_tables(const Image &image, const Program &p, Explorer &explorer) {
+    std::vector<std::uint32_t> found;
+    std::map<std::uint32_t, bool> verdict;
+    const auto plausible = [&](std::uint32_t target) {
+        if (!explorer.valid_target(target) || p.rejected.count(target)) return false;
+        if (p.is_code(target)) return true;
+        const auto it = verdict.find(target);
+        if (it != verdict.end()) return it->second;
+        return verdict[target] = explorer.tentative(target);
+    };
+    for (const auto &segment : image.segments()) {
+        std::vector<std::uint32_t> run;
+        const auto flush = [&] {
+            if (run.size() >= 4) found.insert(found.end(), run.begin(), run.end());
+            run.clear();
+        };
+        for (std::size_t offset = 0; offset + 4 <= segment.bytes.size(); offset += 4) {
+            const std::uint32_t at = segment.address + static_cast<std::uint32_t>(offset);
+            if (p.is_code(at)) {
+                flush();
+                continue;
+            }
+            const std::uint32_t target = *image.word(at);
+            if (plausible(target)) run.push_back(target);
+            else flush();
+        }
+        flush();
+    }
+    return found;
+}
+
 }
 
 Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entries, const std::set<std::uint32_t> &dynamic) {
@@ -235,6 +271,12 @@ Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entr
             } else {
                 p.rejected.insert(target);
             }
+        }
+        for (std::uint32_t target : pointer_tables(image, p, explorer)) {
+            if (p.entries.count(target) || p.rejected.count(target)) continue;
+            p.entries.insert(target);
+            if (!p.is_code(target)) explorer.strong(target, true);
+            ++added;
         }
         explorer.drain();
         if (!added) break;
