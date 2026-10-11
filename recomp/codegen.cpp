@@ -791,10 +791,12 @@ void generate(const std::vector<Translation> &translations, const CodegenOptions
     header << "#pragma once\n\n#include \"ps2/generated.hpp\"\n\nnamespace gen {\n";
     table << "#include \"units.hpp\"\n\nnamespace gen {\n\n";
     std::size_t written = 0, main_units = 0, module_count = 0;
+    std::set<std::string> current;
     for (const Translation &t : translations) {
         const std::vector<UnitRow> rows = Generator(t, options).run();
         written += rows.size();
         for (const UnitRow &r : rows) {
+            current.insert(r.function + ".cpp");
             header << "void " << r.function << "(ps2::Cpu &c, std::uint32_t entry, std::uint32_t depth);\n";
             header << "extern const std::uint16_t " << r.table << "[];\n";
         }
@@ -816,6 +818,15 @@ void generate(const std::vector<Translation> &translations, const CodegenOptions
     table << "}\n\nvoid register_generated_code() { ps2::register_units(gen::kUnits, " << main_units << "u);";
     if (module_count) table << " ps2::register_modules(gen::kModules, " << module_count << "u);";
     table << " }\n";
+    // Unit files from an earlier pass that this one no longer emits would still be compiled
+    // (the build globs the directory) and refer to units the header no longer declares.
+    std::vector<fs::path> stale;
+    for (const auto &item : fs::directory_iterator(options.output)) {
+        const std::string name = item.path().filename().string();
+        const bool unit = name.starts_with("unit_") || name.find("_unit_") != std::string::npos;
+        if (unit && item.path().extension() == ".cpp" && !current.count(name)) stale.push_back(item.path());
+    }
+    for (const fs::path &path : stale) fs::remove(path);
     write_if_changed(fs::path(options.output) / "units.hpp", header.str());
     write_if_changed(fs::path(options.output) / "table.cpp", table.str());
     std::printf("%zu units written to %s\n", written, options.output.c_str());
