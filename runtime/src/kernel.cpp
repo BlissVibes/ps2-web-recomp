@@ -703,7 +703,14 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
         break;
     case 0x79: sif::set_reg(arg(c, 0), arg(c, 1)); ret(c, 0); break;
     case 0x7A: ret(c, static_cast<std::int32_t>(sif::get_reg(arg(c, 0)))); break;
-    case 0x7C: ret(c, 0); break;
+    case 0x7C: {
+        // Deci2Call. No development host is attached, as on a retail console: a request to send
+        // (3 ReqSend, 7 ExReqSend) fails at once so the kernel-library TTY writer takes its error
+        // path instead of polling for a completion that never comes. Everything else stays a no-op.
+        const std::uint32_t command = arg(c, 0);
+        ret(c, command == 3 || command == 7 ? -1 : 0);
+        break;
+    }
     case 0x7E: ret(c, 0); break;
     case 0x7F: ret(c, kRamSize); break;
     default:
