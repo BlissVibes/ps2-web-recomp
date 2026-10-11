@@ -32,6 +32,8 @@ enum Event {
     kEventTimer3,
     kEventDma0,
     kEventIop = kEventDma0 + 10,
+    kEventIntcArm0,                        // one per INTC line, 16 lines
+    kEventIntcArmEnd = kEventIntcArm0 + 15,
     kEventCount
 };
 

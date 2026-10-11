@@ -25,7 +25,13 @@ namespace {
 constexpr std::uint32_t kIntcStat = 0x1000F000u, kIntcMask = 0x1000F010u;
 constexpr std::uint32_t kDmacStat = 0x1000E010u;
 
+// The CPU takes an INTC interrupt a little after the status bit rises. A tight poll of INTC_STAT
+// (libgraph's sceGsSyncV) reads the bit inside that window before the kernel acknowledges it.
+constexpr std::uint64_t kIntcLatency = 32;
+
 std::uint32_t g_intc_stat = 0, g_intc_mask = 0;
+std::uint32_t g_intc_requested = 0;    // lines that rose while enabled and will be delivered
+std::uint32_t g_intc_deliverable = 0;  // requested lines whose latency has passed
 std::uint32_t g_dmac_stat = 0;
 std::map<std::uint32_t, std::uint64_t> g_regs;
 std::set<std::uint32_t> g_reported;
@@ -109,6 +115,7 @@ bool is_timer(std::uint32_t a) { return a >= 0x10000000u && a < 0x10002000u && (
 
 void reset() {
     g_intc_stat = g_intc_mask = g_dmac_stat = 0;
+    g_intc_requested = g_intc_deliverable = 0;
     gs::reset();
     gif::reset();
     vif::reset();
@@ -126,20 +133,48 @@ void vblank_start() {
     schedule(kEventVblankEnd, now() + hblank_cycles() * 22u, [] { intc_raise(3); });
 }
 
-std::uint32_t intc_pending() { return g_intc_stat & g_intc_mask; }
+namespace {
 
-void intc_raise(unsigned cause) {
-    g_intc_stat |= 1u << cause;
-    if (g_intc_mask & (1u << cause)) kernel::wake_idle();
+void intc_arm(unsigned cause) {
+    const std::uint32_t bit = 1u << cause;
+    if (!(g_intc_requested & bit)) return;
+    g_intc_deliverable |= bit;
+    if (g_intc_mask & bit) kernel::wake_idle();
 }
 
-void intc_ack(unsigned cause) { g_intc_stat &= ~(1u << cause); }
+void intc_request(unsigned cause) {
+    const std::uint32_t bit = 1u << cause;
+    if (g_intc_requested & bit) return;
+    g_intc_requested |= bit;
+    schedule(kEventIntcArm0 + static_cast<int>(cause), now() + kIntcLatency, [cause] { intc_arm(cause); });
+}
+
+}
+
+std::uint32_t intc_pending() { return g_intc_deliverable & g_intc_mask; }
+
+void intc_raise(unsigned cause) {
+    const std::uint32_t bit = 1u << cause;
+    g_intc_stat |= bit;
+    if (g_intc_mask & bit) intc_request(cause);
+}
+
+void intc_ack(unsigned cause) {
+    const std::uint32_t bit = 1u << cause;
+    g_intc_stat &= ~bit;
+    g_intc_requested &= ~bit;
+    g_intc_deliverable &= ~bit;
+}
 
 bool intc_set_mask(unsigned cause, bool enabled) {
     const std::uint32_t bit = 1u << cause;
     const bool was = g_intc_mask & bit;
-    if (enabled) g_intc_mask |= bit;
-    else g_intc_mask &= ~bit;
+    if (enabled) {
+        g_intc_mask |= bit;
+        if (g_intc_stat & bit) intc_request(cause);   // level-sensitive: enabling a line that is already up fires it
+    } else {
+        g_intc_mask &= ~bit;
+    }
     return was != enabled;
 }
 
@@ -205,7 +240,12 @@ std::uint32_t read32(std::uint32_t a) {
 
 void write32(std::uint32_t a, std::uint32_t v) {
     if (a == kIntcStat) { g_intc_stat &= ~v; return; }
-    if (a == kIntcMask) { g_intc_mask ^= v; return; }
+    if (a == kIntcMask) {
+        g_intc_mask ^= v;
+        for (unsigned cause = 0; cause < 16; ++cause)
+            if (g_intc_mask & g_intc_stat & (1u << cause)) intc_request(cause);
+        return;
+    }
     if (a == kDmacStat) {
         g_dmac_stat &= ~(v & 0xFFFFu);
         g_dmac_stat ^= v & 0xFFFF0000u;
@@ -285,6 +325,7 @@ namespace ps2::hw {
 std::function<void()> event_action(int id) {
     if (id == kEventVblankEnd) return [] { intc_raise(3); };
     if (id >= kEventTimer0 && id <= kEventTimer3) return [n = id - kEventTimer0] { timer_event(n); };
+    if (id >= kEventIntcArm0 && id <= kEventIntcArmEnd) return [cause = static_cast<unsigned>(id - kEventIntcArm0)] { intc_arm(cause); };
     return [] {};
 }
 
@@ -292,6 +333,8 @@ void state(ps2::state::Stream &s) {
     s.tag("eehw");
     s.pod(g_intc_stat);
     s.pod(g_intc_mask);
+    s.pod(g_intc_requested);
+    s.pod(g_intc_deliverable);
     s.pod(g_dmac_stat);
     s.map(g_regs);
     s.pod(g_crt);
