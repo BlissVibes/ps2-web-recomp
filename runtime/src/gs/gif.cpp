@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace ps2::gif {
 
@@ -25,6 +26,10 @@ Path g_paths[4];
 std::uint32_t g_stat = 0;
 bool g_mask_vif1 = false;       // PATH3 masked by VIF1 MSKPATH3 (GIF_STAT.M3P)
 std::uint32_t g_mode = 0;       // GIF_MODE: bit 0 M3R, bit 2 IMT (mirrored into GIF_STAT bits 0 and 2)
+std::vector<std::uint8_t> g_path3_held;   // PATH3 data received while PATH3 was masked, in arrival order
+constexpr std::uint32_t kGifFifoQwords = 16;
+
+bool path3_masked() { return g_mask_vif1 || (g_mode & 1u); }
 std::uint64_t g_tags[4][4];
 
 template <typename Sink>
@@ -151,6 +156,7 @@ void reset() {
     g_stat = 0;
     g_mask_vif1 = false;
     g_mode = 0;
+    g_path3_held.clear();
     if (gs::queue::active()) {
         for (Path &p : g_scan) p = Path{};
         gs::queue::post(gs::queue::kGifReset, 0, 0, nullptr, 0);
@@ -168,13 +174,32 @@ void render(int path, const std::uint8_t *data, std::uint32_t qwc) {
     walk(g_paths[path], data, qwc, sink);
 }
 
-void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
+namespace {
+
+void forward(int path, const std::uint8_t *data, std::uint32_t qwc) {
     if (!gs::queue::active()) {
         render(path, data, qwc);
         return;
     }
     if (gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);
     gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), qwc, data, qwc * 16);
+}
+
+void release_path3() {
+    if (g_path3_held.empty()) return;
+    std::vector<std::uint8_t> held = std::move(g_path3_held);
+    g_path3_held.clear();
+    forward(3, held.data(), static_cast<std::uint32_t>(held.size() / 16));
+}
+
+}
+
+void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
+    if (path == 3 && path3_masked()) {
+        g_path3_held.insert(g_path3_held.end(), data, data + static_cast<std::size_t>(qwc) * 16);
+        return;
+    }
+    forward(path, data, qwc);
 }
 
 void scan_signals(int path, const std::uint8_t *data, std::uint32_t qwc) { scan(g_scan[path], data, qwc); }
@@ -188,16 +213,24 @@ void stats() {
                      static_cast<unsigned long long>(g_tags[p][2] + g_tags[p][3]));
 }
 
-void set_path3_mask(bool masked) { g_mask_vif1 = masked; }
+void set_path3_mask(bool masked) {
+    g_mask_vif1 = masked;
+    if (!path3_masked()) release_path3();
+}
 
 std::uint32_t read(std::uint32_t a) {
-    if ((a & 0xF0u) == 0x20u) return g_stat | (g_mode & 5u) | (g_mask_vif1 ? 2u : 0u);
-    return 0;
+    if ((a & 0xF0u) != 0x20u) return 0;
+    const std::uint32_t held = static_cast<std::uint32_t>(g_path3_held.size() / 16);
+    const std::uint32_t fqc = std::min(held, kGifFifoQwords);
+    return g_stat | (g_mode & 5u) | (g_mask_vif1 ? 2u : 0u) | (held ? (1u << 6) : 0u) | (fqc << 24);
 }
 
 void write(std::uint32_t a, std::uint32_t v) {
     if ((a & 0xF0u) == 0x00u && (v & 1u)) reset();
-    if ((a & 0xF0u) == 0x10u) g_mode = v & 5u;
+    if ((a & 0xF0u) == 0x10u) {
+        g_mode = v & 5u;
+        if (!path3_masked()) release_path3();
+    }
 }
 
 }
@@ -210,6 +243,7 @@ void state(ps2::state::Stream &s) {
     s.pod(g_stat);
     s.pod(g_mask_vif1);
     s.pod(g_mode);
+    s.vec(g_path3_held);
     s.pod(g_tags);
     s.pod(g_scan);
 }
