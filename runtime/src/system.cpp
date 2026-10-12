@@ -13,6 +13,7 @@
 #include "ps2/disc.hpp"
 #include "kernel.hpp"
 #include "ps2/generated.hpp"
+#include "ps2/harness.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/state.hpp"
 #include "ps2/system.hpp"
@@ -138,6 +139,7 @@ void vblank() {
     kernel::on_vblank_start();
     if (g_options.max_frames && g_frames >= g_options.max_frames) halt("frame limit reached");
     if (g_options.save_state_frame && g_frames == g_options.save_state_frame) g_state_request = true;
+    if (g_options.snapshot_every && g_frames % g_options.snapshot_every == 0) g_state_request = true;
     schedule(hw::kEventVblank, now() + frame_cycles(), vblank);
 }
 
@@ -178,7 +180,10 @@ void load_context(Cpu &c, const ThreadContext &t) {
     c.fcr31 = t.fcr31;
 }
 
-std::uint64_t now() { return g_base + static_cast<std::uint64_t>(g_given - g_cpu.budget); }
+std::uint64_t now() {
+    if (harness::g_active) return harness::g_time;
+    return g_base + static_cast<std::uint64_t>(g_given - g_cpu.budget);
+}
 
 std::uint64_t hblank_cycles() { return frame_cycles() * 2u / (g_options.pal ? 625u : 525u); }
 
@@ -194,6 +199,7 @@ void schedule(int event, std::uint64_t at, std::function<void()> action) {
 }
 
 bool preempt(Cpu &c) {
+    if (harness::g_active) return harness::preempt(c);
     run_due_events();
     refill(c);
     return g_halted || g_state_request || kernel::must_unwind();
@@ -305,6 +311,7 @@ bool load_state(const std::string &path) {
 }
 
 std::uint64_t frame_count() { return g_frames; }
+std::uint32_t state_version() { return kStateVersion; }
 
 bool load_elf(const std::string &path, std::uint32_t &entry) {
     std::ifstream file(path, std::ios::binary);
@@ -336,6 +343,7 @@ void sync_iop() {
 }
 
 void request_iop_sync() {
+    if (harness::g_active) return;
     if (g_cpu.budget > 64) set_budget(g_cpu, 64);
 }
 
@@ -363,14 +371,26 @@ void boot(std::uint32_t entry, const std::vector<std::string> &args) {
     schedule(hw::kEventVblank, frame_cycles(), vblank);
 }
 
+namespace {
+
+void save_requested_state() {
+    if (!g_state_request) return;
+    g_state_request = false;
+    if (g_options.save_state_frame && g_frames == g_options.save_state_frame) save_state(g_options.save_state_path);
+    if (g_options.snapshot_every && g_frames % g_options.snapshot_every == 0) {
+        char name[64];
+        std::snprintf(name, sizeof name, "/s%06llu.state", static_cast<unsigned long long>(g_frames));
+        save_state(g_options.snapshot_dir + name);
+    }
+}
+
+}
+
 int run() {
     Cpu &c = g_cpu;
     if (!g_resumed) set_budget(c, kMaxSlice);
     while (!g_halted) {
-        if (g_state_request) {
-            g_state_request = false;
-            save_state(g_options.save_state_path);
-        }
+        save_requested_state();
         c.pc &= ~kUnwind;
         run_due_events();
         kernel::service(c);
@@ -382,6 +402,7 @@ int run() {
         if (c.budget <= 0) refill(c);
         dispatch(c, 0, 0);
     }
+    save_requested_state();   // a state due on the frame the run ends on
     kernel::dump();
     iop::dump();
     sif::dump();

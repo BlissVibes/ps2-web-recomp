@@ -33,6 +33,8 @@ add_library(ps2runtime STATIC
     runtime/src/dispatch.cpp
     runtime/src/system.cpp
     runtime/src/kernel.cpp
+    runtime/src/harness.cpp
+    runtime/src/hooks.cpp
     runtime/src/hw.cpp
     runtime/src/cop.cpp
     runtime/src/disc.cpp
@@ -87,6 +89,17 @@ if(PS2_GENERATED)
     target_link_libraries(ps2game PUBLIC ps2runtime)
     target_compile_options(ps2game PRIVATE -Wno-unused-label -Wno-unused-variable)
 
+    set(PS2_HOOKS "" CACHE PATH "Folder with decompiled functions that replace recompiled ones (hooks_table.cpp defines register_hooks())")
+    if(PS2_HOOKS)
+        file(GLOB_RECURSE PS2_HOOK_SOURCES CONFIGURE_DEPENDS "${PS2_HOOKS}/*.cpp")
+        add_library(ps2hooks STATIC ${PS2_HOOK_SOURCES})
+        # The parent too, so sources can include "hooks/<subsystem>/<name>.hpp".
+        cmake_path(GET PS2_HOOKS PARENT_PATH PS2_HOOKS_PARENT)
+        target_include_directories(ps2hooks PRIVATE "${PS2_HOOKS}" "${PS2_HOOKS_PARENT}")
+        target_link_libraries(ps2hooks PUBLIC ps2runtime)
+        target_compile_definitions(ps2runtime PUBLIC PS2_HOOKS)
+    endif()
+
     if(EMSCRIPTEN)
         set(PS2_WEB_ELF "" CACHE FILEPATH "Game executable preloaded as /game/core.elf")
         set(PS2_WEB_BOOT_FILE "" CACHE FILEPATH "Text file holding the argv[0] the game sees, preloaded as /game/boot.txt")
@@ -95,7 +108,7 @@ if(PS2_GENERATED)
         if(PS2_WEB_BOOT_FILE)
             target_link_options(ps2web PRIVATE "SHELL:--preload-file ${PS2_WEB_BOOT_FILE}@/game/boot.txt")
         endif()
-        target_link_libraries(ps2web PRIVATE ps2game ps2runtime)
+        target_link_libraries(ps2web PRIVATE $<$<BOOL:${PS2_HOOKS}>:ps2hooks> ps2game ps2runtime)
         target_link_options(ps2web PRIVATE --profiling-funcs -sJSPI -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=268435456 -sPTHREAD_POOL_SIZE=2 -sALLOW_TABLE_GROWTH=1 -lidbfs.js -sSTACK_SIZE=16777216 -sENVIRONMENT=web
             -sEXPORTED_FUNCTIONS=_main,_ps2web_pad,_ps2web_resize,_ps2web_gpu_ms,_ps2web_frames,_ps2web_primitives,_ps2web_audio_ring,_ps2web_audio_queued_ms,_ps2web_idle_ms,_ps2web_vu_interpreted
             -sEXPORTED_RUNTIME_METHODS=callMain,addRunDependency,removeRunDependency,HEAPU8,ENV
@@ -105,7 +118,7 @@ if(PS2_GENERATED)
     endif()
 
     add_executable(ps2run host/main.cpp)
-    target_link_libraries(ps2run PRIVATE ps2game ps2runtime)
+    target_link_libraries(ps2run PRIVATE $<$<BOOL:${PS2_HOOKS}>:ps2hooks> ps2game ps2runtime)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         target_sources(ps2run PRIVATE host/profile.cpp)
         target_compile_definitions(ps2run PRIVATE PS2_PROFILE)

@@ -41,6 +41,8 @@ struct Options {
     std::function<void()> on_memcard_saved;
     std::string save_state_path;
     std::uint64_t save_state_frame = 0;
+    std::uint64_t snapshot_every = 0;   // save a state every N frames into snapshot_dir
+    std::string snapshot_dir;
 };
 
 extern Options g_options;
@@ -77,6 +79,7 @@ bool load_state(const std::string &path);
 bool load_state(const std::uint8_t *data, std::size_t size);
 bool halted();
 std::uint64_t frame_count();
+std::uint32_t state_version();
 
 bool display_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 

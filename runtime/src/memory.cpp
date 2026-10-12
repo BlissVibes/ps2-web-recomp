@@ -1,5 +1,6 @@
 #include "hw.hpp"
 #include "vu_micro.hpp"
+#include "ps2/harness.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/system.hpp"
 
@@ -79,6 +80,7 @@ void write_slow(std::uint32_t a, T v) {
         return;
     }
     if (t.region == Region::Io) {
+        if (harness::g_active) harness::io_write(t.address, static_cast<std::uint64_t>(v), sizeof(T));
         if constexpr (sizeof(T) == 8) hw::write64(t.address, v);
         else hw::write32(t.address, static_cast<std::uint32_t>(v));
         return;
@@ -115,7 +117,10 @@ void slow_st64(std::uint32_t a, std::uint64_t v) { write_slow(a, v); }
 void slow_st128(std::uint32_t a, const Reg128 &v) {
     const Target t = resolve(a);
     if (t.host) std::memcpy(t.host, &v, 16);
-    else if (t.region == Region::Io) hw::write128(t.address, v);
+    else if (t.region == Region::Io) {
+        if (harness::g_active) harness::io_write(t.address, v.d[0], 16);
+        hw::write128(t.address, v);
+    }
     else unmapped("write128", a);
 }
 

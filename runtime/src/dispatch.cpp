@@ -117,6 +117,7 @@ void dispatch(Cpu &c, std::uint32_t, std::uint32_t depth) {
     const std::uint32_t pc = c.pc;
     if (pc & kUnwind) return;
     if (pc == kHandlerReturn || pc == kIdle) return;
+    if (g_hooks && enter(c, pc)) return;
     const UnitInfo *u = unit_for(pc);
     const std::uint16_t id = u ? u->entries[(pc - u->base) >> 2] : 0;
     if (!id) {

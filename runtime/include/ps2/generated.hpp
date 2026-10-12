@@ -37,6 +37,8 @@ void dispatch(Cpu &c, std::uint32_t entry, std::uint32_t depth);
 void call(Cpu &c, std::uint32_t target, std::uint32_t depth);
 void bad_entry(Cpu &c, std::uint32_t unit_base);
 bool preempt(Cpu &c);
+extern bool g_hooks;
+bool enter(Cpu &c, std::uint32_t address);
 
 void syscall(Cpu &c, std::uint32_t pc);
 void breakpoint(Cpu &c, std::uint32_t pc);

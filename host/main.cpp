@@ -1,3 +1,5 @@
+#include "ps2/harness.hpp"
+#include "ps2/hook.hpp"
 #include "ps2/system.hpp"
 
 #ifdef PS2_WINDOW
@@ -15,6 +17,7 @@
 
 void register_generated_code();
 void register_generated_vu();
+void register_hooks();
 
 namespace {
 
@@ -24,7 +27,11 @@ int usage() {
                  "              [--disc image.iso] [--memcard card.ps2] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
                  "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n]\n"
                  "              [--press frame:button[+button][:frames]]... [--window]\n"
-                 "              [--save-state frame:file] [--load-state file]\n");
+                 "              [--save-state frame:file] [--load-state file]\n"
+                 "              [--snapshot-every n --snapshot-dir dir]\n"
+                 "              [--call addr --snapshot file [--a0..--a3 --t0..--t3 v] [--f12..--f19 v] [--gp v] [--sp v]\n"
+                 "               [--stack-reserve n] [--buf reg:size[:hex]] [--poke addr:hex] [--budget n] [--trace-calls]\n"
+                 "               [--hook name|addr] [--hooks all] [--out file.json]]\n");
     return 2;
 }
 
@@ -35,6 +42,10 @@ int main(int argc, char **argv) {
     std::vector<std::string> args{argv[1]};
     [[maybe_unused]] bool window = false;
     std::string load_path;
+    ps2::harness::Request call;
+    std::string call_out;
+    std::vector<std::string> hooks;
+    bool all_hooks = false;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--arg" && i + 1 < argc) args.push_back(argv[++i]);
@@ -69,6 +80,15 @@ int main(int argc, char **argv) {
             ps2::g_options.save_state_path = spec.substr(colon + 1);
         }
         else if (a == "--load-state" && i + 1 < argc) load_path = argv[++i];
+        else if (a == "--snapshot-every" && i + 1 < argc) ps2::g_options.snapshot_every = std::strtoull(argv[++i], nullptr, 10);
+        else if (a == "--snapshot-dir" && i + 1 < argc) ps2::g_options.snapshot_dir = argv[++i];
+        else if (a == "--call" && i + 1 < argc) call.address = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 16));
+        else if (a == "--snapshot" && i + 1 < argc) load_path = argv[++i];
+        else if (a == "--out" && i + 1 < argc) call_out = argv[++i];
+        else if (a == "--trace-calls") call.trace = true;
+        else if (a == "--hook" && i + 1 < argc) hooks.push_back(argv[++i]);
+        else if (a == "--hooks" && i + 1 < argc && std::string(argv[i + 1]) == "all") { all_hooks = true; ++i; }
+        else if (i + 1 < argc && ps2::harness::parse_option(a, argv[i + 1], call)) ++i;
         else return usage();
     }
 
@@ -77,6 +97,22 @@ int main(int argc, char **argv) {
 #endif
     register_generated_code();
     register_generated_vu();
+    register_hooks();
+    if (all_hooks) ps2::enable_all_hooks();
+    for (const std::string &name : hooks) {
+        if (!ps2::enable_hook(name)) {
+            std::fprintf(stderr, "unknown hook %s\n", name.c_str());
+            return 2;
+        }
+    }
+    if (ps2::g_options.snapshot_every && ps2::g_options.snapshot_dir.empty()) {
+        std::fprintf(stderr, "--snapshot-every needs --snapshot-dir\n");
+        return 2;
+    }
+    if (call.address && load_path.empty()) {
+        std::fprintf(stderr, "--call needs --snapshot\n");
+        return 2;
+    }
     std::uint32_t entry = 0;
     if (!ps2::load_elf(argv[1], entry)) {
         std::fprintf(stderr, "cannot load %s\n", argv[1]);
@@ -84,6 +120,20 @@ int main(int argc, char **argv) {
     }
     ps2::boot(entry, args);
     if (!load_path.empty() && !ps2::load_state(load_path)) return 1;
+    if (call.address) {
+        if (call.trace) ps2::set_entry_trace(true);
+        const ps2::harness::Result result = ps2::harness::call(call);
+        std::fprintf(stderr, "[call] 0x%08X %s%s%s v0 %016llX v1 %016llX f0 %08X cycles %lld ram %zu spr %zu stack %zu io %zu syscalls %zu%s\n",
+                     call.address, ps2::harness::status_name(result.status), result.detail.empty() ? "" : ": ", result.detail.c_str(),
+                     static_cast<unsigned long long>(result.after.r[2].d[0]), static_cast<unsigned long long>(result.after.r[3].d[0]), result.after.f[0],
+                     static_cast<long long>(result.cycles), result.ram.size(), result.spr.size(), result.stack.size(), result.io.size(), result.syscalls.size(),
+                     result.hook_ran ? " (hook)" : "");
+        if (!call_out.empty() && !ps2::harness::write(result, call_out)) {
+            std::fprintf(stderr, "cannot write %s\n", call_out.c_str());
+            return 1;
+        }
+        return result.status == ps2::harness::Status::ok ? 0 : 3;
+    }
 #ifdef PS2_PROFILE
     const char *profile = std::getenv("PS2_PROFILE");
     const char *profile_from = std::getenv("PS2_PROFILE_FROM");
