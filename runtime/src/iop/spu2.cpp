@@ -24,6 +24,17 @@ constexpr unsigned kBatch = 32;
 constexpr unsigned kInputFrames = 512;
 constexpr std::uint32_t kInputBase[2] = {0x2000u, 0x2400u};
 constexpr unsigned kSpuLine = 9;
+// The mixer's write-back areas in SPU2 RAM (halfword addresses). Every output sample each core
+// stores voice 1 and voice 3 (after ADSR) and its dry and wet L/R mixes, and core 0 stores its final
+// L/R output, each at area + output position (a 0x200-halfword ring). Software uses these as a clock
+// by pointing IRQA into one of them; the address IRQ fires when the mixer writes there.
+constexpr std::uint32_t kOutputRing = 0x200;
+constexpr std::uint32_t kVoice1Area[2] = {0x0400u, 0x0C00u};
+constexpr std::uint32_t kVoice3Area[2] = {0x0600u, 0x0E00u};
+constexpr std::uint32_t kDryArea[2][2] = {{0x1000u, 0x1200u}, {0x1800u, 0x1A00u}};
+constexpr std::uint32_t kWetArea[2][2] = {{0x1400u, 0x1600u}, {0x1C00u, 0x1E00u}};
+constexpr std::uint32_t kCore0OutArea[2] = {0x0800u, 0x0A00u};
+static_assert(kOutputRing % kBatch == 0, "a batch must not straddle the output ring wrap");
 
 enum Phase { kOff, kAttack, kDecay, kSustain, kRelease };
 
@@ -80,6 +91,7 @@ bool g_record = false;
 std::function<void(const std::int16_t *, std::size_t)> g_sink;
 std::uint64_t g_next_tick = 0;
 bool g_tick_pending = false;
+std::uint32_t g_out_pos = 0;
 
 void check_irq(std::uint32_t address, std::uint32_t words) {
     for (Core &k : g_cores) {
@@ -164,7 +176,7 @@ std::int32_t volume(std::uint16_t reg, Envelope &e) {
     return e.level;
 }
 
-void render_voice(Voice &v, std::int32_t (*sum)[2]) {
+void render_voice(Voice &v, std::int32_t (*sum)[2], std::int16_t *capture) {
     if (v.key_on) key_on(v);
     const std::uint32_t step = std::min<std::uint32_t>(v.pitch, 0x3FFFu);
     const bool sweep_l = v.voll & 0x8000u, sweep_r = v.volr & 0x8000u;
@@ -185,6 +197,7 @@ void render_voice(Voice &v, std::int32_t (*sum)[2]) {
         }
         update_envelope(v);
         const std::int32_t out = sample * v.env.level >> 15;
+        if (capture) capture[n] = static_cast<std::int16_t>(std::clamp(out, -32768, 32767));
         sum[n][0] += out * (sweep_l ? volume(v.voll, v.vol[0]) : fixed_l) >> 15;
         sum[n][1] += out * (sweep_r ? volume(v.volr, v.vol[1]) : fixed_r) >> 15;
     }
@@ -232,27 +245,50 @@ void render_input(int core, std::int32_t &left, std::int32_t &right) {
 
 std::int32_t master(std::uint16_t reg) { return reg & 0x8000u ? 0x7FFF : static_cast<std::int16_t>(reg << 1); }
 
+std::int16_t clamp16(std::int32_t value) { return static_cast<std::int16_t>(std::clamp(value, -32768, 32767)); }
+
+void write_area(std::uint32_t area, const std::int16_t *values) {
+    const std::uint32_t at = area + g_out_pos;
+    check_irq(at, kBatch);
+    for (unsigned n = 0; n < kBatch; ++n) g_ram[at + n] = static_cast<std::uint16_t>(values[n]);
+}
+
 void tick() {
     std::int16_t out[kBatch * 2];
     std::int32_t sum[2][kBatch][2] = {};
+    std::int16_t raw[2][2][kBatch] = {};   // [core][voice 1, voice 3][sample], 0 while the voice is off
+    std::int16_t dry[2][2][kBatch] = {};   // [core][left, right][sample], the voice mix before the input
+    std::int16_t wet[2][kBatch] = {};      // reverb is not modelled, so the wet mixes are silence
+    std::int16_t core0[2][kBatch] = {};    // core 0 output after its master volume
     static const bool count = std::getenv("PS2_SPU2_COUNT") != nullptr;
     static std::uint64_t ticks = 0, active = 0, phases[5] = {};
     for (int c = 0; c < 2; ++c) {
-        for (Voice &v : g_cores[c].voices) {
+        for (int i = 0; i < 24; ++i) {
+            Voice &v = g_cores[c].voices[i];
             if (!v.key_on && v.phase == kOff) continue;
             if (count) {
                 ++active;
                 ++phases[v.phase];
             }
-            render_voice(v, sum[c]);
+            render_voice(v, sum[c], i == 1 ? raw[c][0] : i == 3 ? raw[c][1] : nullptr);
+        }
+        for (unsigned n = 0; n < kBatch; ++n) {
+            dry[c][0][n] = clamp16(sum[c][n][0]);
+            dry[c][1][n] = clamp16(sum[c][n][1]);
         }
         for (unsigned n = 0; n < kBatch; ++n) render_input(c, sum[c][n][0], sum[c][n][1]);
     }
     for (unsigned n = 0; n < kBatch; ++n) {
         std::int32_t mix[2] = {};
         for (int c = 0; c < 2; ++c) {
-            mix[0] += sum[c][n][0] * master(g_cores[c].mvol[0]) >> 15;
-            mix[1] += sum[c][n][1] * master(g_cores[c].mvol[1]) >> 15;
+            const std::int32_t left = sum[c][n][0] * master(g_cores[c].mvol[0]) >> 15;
+            const std::int32_t right = sum[c][n][1] * master(g_cores[c].mvol[1]) >> 15;
+            if (c == 0) {
+                core0[0][n] = clamp16(left);
+                core0[1][n] = clamp16(right);
+            }
+            mix[0] += left;
+            mix[1] += right;
         }
         out[n * 2] = static_cast<std::int16_t>(std::clamp(mix[0], -32768, 32767));
         out[n * 2 + 1] = static_cast<std::int16_t>(std::clamp(mix[1], -32768, 32767));
@@ -262,6 +298,19 @@ void tick() {
                      static_cast<double>(phases[1]) / ticks, static_cast<double>(phases[2]) / ticks, static_cast<double>(phases[3]) / ticks, static_cast<double>(phases[4]) / ticks);
     if (g_record) g_audio.insert(g_audio.end(), out, out + kBatch * 2);
     if (g_sink) g_sink(out, kBatch);
+    for (int c = 0; c < 2; ++c) {
+        write_area(kVoice1Area[c], raw[c][0]);
+        write_area(kVoice3Area[c], raw[c][1]);
+        write_area(kDryArea[c][0], dry[c][0]);
+        write_area(kDryArea[c][1], dry[c][1]);
+        write_area(kWetArea[c][0], wet[0]);
+        write_area(kWetArea[c][1], wet[1]);
+        if (c == 0) {
+            write_area(kCore0OutArea[0], core0[0]);
+            write_area(kCore0OutArea[1], core0[1]);
+        }
+    }
+    g_out_pos = (g_out_pos + kBatch) % kOutputRing;
     feed_input(0);
     feed_input(1);
     g_next_tick += kBatch * kCyclesPerSample;
@@ -452,6 +501,7 @@ void reset() {
     g_record = std::getenv("PS2_DUMP_AUDIO") != nullptr;
     g_next_tick = 0;
     g_tick_pending = false;
+    g_out_pos = 0;
 }
 
 std::uint16_t *ram() { return g_ram.data(); }
@@ -560,6 +610,7 @@ void state(ps2::state::Stream &s) {
     s.pod(g_spdif_media);
     s.pod(g_next_tick);
     s.pod(g_tick_pending);
+    s.pod(g_out_pos);
 }
 
 }

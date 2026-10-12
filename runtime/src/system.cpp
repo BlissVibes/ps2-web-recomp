@@ -210,7 +210,7 @@ bool halted() { return g_halted; }
 namespace {
 
 constexpr char kStateMagic[8] = {'P', 'S', '2', 'S', 'T', 'A', 'T', 'E'};
-constexpr std::uint32_t kStateVersion = 3;
+constexpr std::uint32_t kStateVersion = 4;
 
 std::function<void()> event_action(int id) {
     if (id == hw::kEventVblank) return vblank;
