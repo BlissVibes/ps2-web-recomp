@@ -853,6 +853,61 @@ ProgramFn lookup(std::uint32_t address) {
     return e.function;
 }
 
+// DIV, SQRT and RSQRT deliver Q, and the EFU instructions deliver P, a fixed number of instructions
+// after they start. Until then Q and P still hold the previous result, and programs read them in
+// that window on purpose: hand-scheduled code starts the divide for the next vertex and, a few
+// instructions later, multiplies by the Q of the current one. Results therefore must not appear
+// early. A result becomes visible to the instruction `latency` places after the one that started
+// it; WAITQ and WAITP, the end of the program, and the start of another operation of the same
+// kind (which the hardware stalls for) deliver it at once. Stalls from register hazards between
+// ordinary instructions are not modelled.
+struct Delayed {
+    std::uint32_t q = 0, p = 0, q_left = 0, p_left = 0;
+
+    void tick(Vu0Regs &r) {
+        if (q_left && --q_left == 0) r.q = q;
+        if (p_left && --p_left == 0) r.p = p;
+    }
+
+    void finish(Vu0Regs &r) {
+        if (q_left) r.q = q;
+        if (p_left) r.p = p;
+        q_left = p_left = 0;
+    }
+
+    // After a lower instruction ran and wrote its result straight into r.q or r.p.
+    void issued(Vu0Regs &r, std::uint32_t lo, std::uint32_t q_before, std::uint32_t p_before) {
+        if ((lo >> 25) != 0x40u || (lo & 0x3Cu) != 0x3Cu) return;
+        std::uint32_t wait_q = 0, wait_p = 0;
+        switch ((((lo >> 6) & 31u) << 2) | (lo & 3u)) {
+        case 0x38: case 0x39: wait_q = 7; break;                   // DIV, SQRT
+        case 0x3A: wait_q = 13; break;                             // RSQRT
+        case 0x3B: if (q_left) { r.q = q; q_left = 0; } break;     // WAITQ
+        case 0x70: wait_p = 11; break;                             // ESADD
+        case 0x71: case 0x72: case 0x79: wait_p = 18; break;       // ERSADD, ELENG, ERSQRT
+        case 0x73: wait_p = 24; break;                             // ERLENG
+        case 0x74: case 0x75: case 0x7D: wait_p = 54; break;       // EATANxy, EATANxz, EATAN
+        case 0x76: case 0x78: case 0x7A: wait_p = 12; break;       // ESUM, ESQRT, ERCPR
+        case 0x7B: if (p_left) { r.p = p; p_left = 0; } break;     // WAITP
+        case 0x7C: wait_p = 29; break;                             // ESIN
+        case 0x7E: wait_p = 44; break;                             // EEXP
+        default: break;
+        }
+        if (wait_q) {
+            const std::uint32_t fresh = r.q;
+            r.q = q_left ? q : q_before;
+            q = fresh;
+            q_left = wait_q;
+        }
+        if (wait_p) {
+            const std::uint32_t fresh = r.p;
+            r.p = p_left ? p : p_before;
+            p = fresh;
+            p_left = wait_p;
+        }
+    }
+};
+
 void run_fast(int n, std::uint32_t address) {
     Unit u = unit_of(n);
     Vu0Regs &r = *u.regs;
@@ -865,6 +920,7 @@ void run_fast(int n, std::uint32_t address) {
     std::uint32_t pc = address & u.code_mask, npc = (pc + 8u) & u.code_mask;
     bool ending = false;
     UpperOut out;
+    Delayed delayed;
     static std::uint64_t total = 0, calls = 0;
     static const bool count = std::getenv("PS2_VU_COUNT") != nullptr;
     static const bool record_jumps = std::getenv("PS2_VU_RECORD") != nullptr || static_cast<bool>(g_options.on_vu_program);
@@ -882,13 +938,16 @@ void run_fast(int n, std::uint32_t address) {
         pc = npc;
         npc = (npc + 8u) & u.code_mask;
         ++pipe.t;
+        delayed.tick(r);
         fast_upper(r, d, out);
         if (hi & 0x80000000u) {
             r.i = lo;
         } else {
             bool branch = false;
             std::uint32_t target = npc;
+            const std::uint32_t q_before = r.q, p_before = r.p;
             lower(u, lo, current, target, branch);
+            delayed.issued(r, lo, q_before, p_before);
             if (branch) npc = target;
             if (branch && record_jumps && n == 1 && ((lo >> 25) == 0x24u || (lo >> 25) == 0x25u)) lookup(target);
         }
@@ -910,6 +969,7 @@ void run_fast(int n, std::uint32_t address) {
         r.vf[0].w[3] = fp::kOne;
         r.vi[0] = 0;
         if (ending) {
+            delayed.finish(r);
             r.tpc = pc;
             return;
         }
@@ -931,6 +991,7 @@ void run(int n, std::uint32_t address) {
     u.pipe = &pipe;
     std::uint32_t pc = address & u.code_mask, npc = (pc + 8u) & u.code_mask;
     bool ending = false;
+    Delayed delayed;
     for (std::uint32_t steps = 0; steps < 1'000'000; ++steps) {
         std::uint32_t lo, hi;
         std::memcpy(&lo, u.code + pc, 4);
@@ -939,13 +1000,16 @@ void run(int n, std::uint32_t address) {
         pc = npc;
         npc = (npc + 8u) & u.code_mask;
         ++pipe.t;
+        delayed.tick(r);
         UpperOut out = upper(r, hi);
         bool branch = false;
         if (hi & 0x80000000u) {
             r.i = lo;
         } else {
             std::uint32_t target = npc;
+            const std::uint32_t q_before = r.q, p_before = r.p;
             lower(u, lo, current, target, branch);
+            delayed.issued(r, lo, q_before, p_before);
             if (branch) npc = target;
         }
         commit(r, out);
@@ -959,6 +1023,7 @@ void run(int n, std::uint32_t address) {
         r.vf[0].w[3] = fp::kOne;
         r.vi[0] = 0;
         if (ending) {
+            delayed.finish(r);
             r.tpc = pc;
             return;
         }
