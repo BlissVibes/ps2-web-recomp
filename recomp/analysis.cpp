@@ -183,6 +183,26 @@ std::vector<std::uint32_t> computed_branches(const Image &image, const Program &
     return found;
 }
 
+// Every address something points at: the constants the code builds and each word of the image.
+std::vector<std::uint32_t> pointed_at(const Image &image, const Program &p) {
+    std::vector<std::uint32_t> found = address_constants(image, p);
+    for (const auto &segment : image.segments())
+        for (std::size_t offset = 0; offset + 4 <= segment.bytes.size(); offset += 4)
+            found.push_back(*image.word(segment.address + static_cast<std::uint32_t>(offset)));
+    return found;
+}
+
+// True when the code before `address` ends in a return (jr ra and its delay slot), with at most a few words
+// that are not code in between (padding). That is where a function starts; a loop head, a return address
+// or the middle of a function does not look like it.
+bool follows_return(const Image &image, const Program &p, std::uint32_t address) {
+    std::uint32_t last = address - 4;   // the last word of code before it
+    for (int padding = 0; padding < 7 && last >= p.base + 4 && !p.is_code(last); ++padding) last -= 4;
+    if (last < p.base + 4 || !p.is_code(last) || !p.is_code(last - 4)) return false;
+    const Insn jr = decode(*image.word(last - 4), last - 4);
+    return jr.op == Op::Jr && jr.rs() == 31;
+}
+
 // Tables of function pointers in data: static constructor lists, virtual tables, callback arrays.
 // Four or more consecutive non-code words that each point at plausible code. Their targets are
 // accepted even outside the code range found so far, because functions reached only through a
@@ -251,12 +271,9 @@ Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entr
     }
 
     for (int round = 0; round < 8; ++round) {
-        std::vector<std::uint32_t> candidates = address_constants(image, p);
+        std::vector<std::uint32_t> candidates = pointed_at(image, p);
         const std::vector<std::uint32_t> branches = computed_branches(image, p);
         candidates.insert(candidates.end(), branches.begin(), branches.end());
-        for (const auto &segment : image.segments())
-            for (std::size_t offset = 0; offset + 4 <= segment.bytes.size(); offset += 4)
-                candidates.push_back(*image.word(segment.address + static_cast<std::uint32_t>(offset)));
         std::sort(candidates.begin(), candidates.end());
         candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
 
@@ -281,6 +298,14 @@ Program analyse(const Image &image, const std::vector<std::uint32_t> &extra_entr
         explorer.drain();
         if (!added) break;
     }
+
+    // A function that is only ever called through a pointer (a callback, a virtual function, a comparator
+    // handed to a sort) was found above from the pointer, as an entry and not as a function, and generated
+    // code offers only functions to the hooks. An entry something points at is a function when it starts
+    // after a return. Nothing is explored here: the code and the entries stay as they are, so generated
+    // code differs from before in nothing but the hook check of these entries.
+    for (std::uint32_t target : pointed_at(image, p))
+        if (p.entries.count(target) && p.is_code(target) && follows_return(image, p, target)) p.functions.insert(target);
     return p;
 }
 
