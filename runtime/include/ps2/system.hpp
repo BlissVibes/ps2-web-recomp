@@ -82,6 +82,18 @@ std::uint64_t frame_count();
 std::uint32_t state_version();
 std::uint64_t preempt_count();   // how often generated code has stopped to run due events
 
+// An idle call: a game that waits in a loop, calling `function` through a pointer on every turn from the
+// call that returns to `return_address`, with register `waiting_register` non-zero while it still waits.
+// Nothing such a loop waits for can happen before the next event, and its turns are all alike: once two
+// turns in a row have cost the same number of cycles, the runtime takes whole turns off the time slice
+// at once and leaves the last one or two to run. The slice then ends exactly where it would have ended
+// with the loop spinning, so nothing the game can observe changes. The function must do the same thing
+// on every turn of one wait (the registration is that promise). Registered per game (the hooks table
+// does it). PS2_NO_IDLE=1 turns it off.
+void add_idle_call(std::uint32_t function, std::uint32_t return_address, int waiting_register);
+std::uint64_t idle_calls_taken();   // turns skipped so far
+void forget_idle_progress();        // start measuring afresh (tests)
+
 bool display_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 
 struct WindowTarget {

@@ -1,8 +1,10 @@
 #include "ps2/generated.hpp"
+#include "ps2/harness.hpp"
 #include "ps2/system.hpp"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <set>
 #include <string>
@@ -17,6 +19,14 @@ std::vector<const UnitInfo *> g_index;
 std::uint32_t g_origin = 0;
 std::uint32_t g_unit_size = 1;
 std::set<std::uint32_t> g_misses;
+
+struct IdleCall {
+    std::uint32_t function, return_address;
+    int waiting_register;
+    std::int32_t last = 0, turn = 0;   // budget at the previous matching call of this slice, and the cycles one turn cost
+};
+std::vector<IdleCall> g_idle_calls;
+std::uint64_t g_idle_taken = 0;
 std::set<std::string> g_module_misses;
 
 constexpr std::uint32_t kModuleMagic = 0x32524E53u;
@@ -118,6 +128,23 @@ void dispatch(Cpu &c, std::uint32_t, std::uint32_t depth) {
     if (pc & kUnwind) return;
     if (pc == kHandlerReturn || pc == kIdle) return;
     if (g_hooks && offer(c, pc)) return;
+    for (IdleCall &i : g_idle_calls) {
+        if (i.function != pc || c.r[31].w[0] != i.return_address) continue;
+        if (c.r[i.waiting_register].d[0] == 0 || harness::g_active) {
+            i.last = i.turn = 0;
+            continue;
+        }
+        // Budgets at successive calls of one slice go down by the cost of a turn. A call with more budget
+        // than the last one is in a new slice: nothing is known yet.
+        const std::int32_t turn = i.last > c.budget ? i.last - c.budget : 0;
+        if (turn > 0 && turn == i.turn && c.budget >= 2 * turn) {
+            const std::int32_t skipped = (c.budget - turn) / turn;   // leaves at least one whole turn before the slice can end
+            c.budget -= skipped * turn;
+            g_idle_taken += static_cast<std::uint64_t>(skipped);
+        }
+        i.turn = turn;
+        i.last = c.budget;
+    }
     const UnitInfo *u = unit_for(pc);
     const std::uint16_t id = u ? u->entries[(pc - u->base) >> 2] : 0;
     if (!id) {
@@ -142,6 +169,17 @@ void dispatch(Cpu &c, std::uint32_t, std::uint32_t depth) {
         return;
     }
     u->function(c, id, depth);
+}
+
+void add_idle_call(std::uint32_t function, std::uint32_t return_address, int waiting_register) {
+    static const bool off = std::getenv("PS2_NO_IDLE") != nullptr;
+    if (!off) g_idle_calls.push_back({function, return_address, waiting_register});
+}
+
+std::uint64_t idle_calls_taken() { return g_idle_taken; }
+
+void forget_idle_progress() {
+    for (IdleCall &i : g_idle_calls) i.last = i.turn = 0;
 }
 
 void call(Cpu &c, std::uint32_t target, std::uint32_t depth) {
