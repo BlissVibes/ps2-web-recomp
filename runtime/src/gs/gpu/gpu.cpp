@@ -1,4 +1,5 @@
 #include "gpu.hpp"
+#include "upload_cache.hpp"
 #include "ps2/system.hpp"
 
 #include <webgpu/webgpu.h>
@@ -225,19 +226,9 @@ void dispatch_linear(Pipeline p, std::uint32_t items, std::uint32_t param) {
 constexpr std::uint32_t kCacheWords = 4u << 20;
 constexpr std::size_t kCacheMinBytes = 256;
 
-struct CacheEntry {
-    std::uint64_t key;
-    std::uint32_t offset, words;
-    std::size_t bytes;
-    std::uint64_t used;
-};
-
 WGPUBuffer g_cache = nullptr;
-std::vector<std::uint32_t> g_cache_copy;
-std::deque<CacheEntry> g_cache_ring;
-std::unordered_multimap<std::uint64_t, CacheEntry *> g_cache_index;
+UploadCache g_cache_book;   // what is where in g_cache, and its copy on this side
 std::unordered_map<std::uint64_t, std::uint32_t> g_cache_seen;
-std::uint32_t g_cache_head = 0;
 std::uint64_t g_serial = 1;
 
 std::uint64_t content_key(const std::uint8_t *p, std::size_t n) {
@@ -258,49 +249,12 @@ std::uint64_t content_key(const std::uint8_t *p, std::size_t n) {
     return h;
 }
 
-bool cache_find(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, std::uint32_t &offset) {
-    const auto [first, last] = g_cache_index.equal_range(key);
-    for (auto it = first; it != last; ++it) {
-        CacheEntry &e = *it->second;
-        if (e.bytes != n || std::memcmp(g_cache_copy.data() + e.offset, bytes, n) != 0) continue;
-        e.used = g_serial;
-        offset = e.offset;
-        return true;
-    }
-    return false;
-}
+bool cache_find(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, std::uint32_t &offset) { return g_cache_book.find(key, bytes, n, g_serial, offset); }
 
 bool cache_insert(std::uint64_t key, const std::uint8_t *bytes, std::size_t n, std::uint32_t &offset) {
-    const auto words = static_cast<std::uint32_t>((n + 3) / 4 + 1);
-    if (words > kCacheWords / 4) return false;
-    const auto evict_front = [] {
-        CacheEntry &front = g_cache_ring.front();
-        if (front.used == g_serial) return false;
-        const auto [first, last] = g_cache_index.equal_range(front.key);
-        for (auto it = first; it != last; ++it)
-            if (it->second == &front) {
-                g_cache_index.erase(it);
-                break;
-            }
-        g_cache_ring.pop_front();
-        return true;
-    };
-    if (g_cache_head + words > kCacheWords) {
-        while (!g_cache_ring.empty() && g_cache_ring.front().offset >= g_cache_head)
-            if (!evict_front()) return false;
-        g_cache_head = 0;
-    }
-    while (!g_cache_ring.empty() && g_cache_ring.front().offset < g_cache_head + words)
-        if (!evict_front()) return false;
-    offset = g_cache_head;
-    std::uint32_t *to = g_cache_copy.data() + offset;
-    to[words - 1] = 0;
-    to[words - 2] = 0;
-    std::memcpy(to, bytes, n);
-    wgpuQueueWriteBuffer(g_queue, g_cache, static_cast<std::uint64_t>(offset) * 4, to, static_cast<std::uint64_t>(words) * 4);
-    g_cache_ring.push_back({key, offset, words, n, g_serial});
-    g_cache_index.emplace(key, &g_cache_ring.back());
-    g_cache_head += words;
+    std::uint32_t words = 0;
+    if (!g_cache_book.insert(key, bytes, n, g_serial, offset, words)) return false;
+    wgpuQueueWriteBuffer(g_queue, g_cache, static_cast<std::uint64_t>(offset) * 4, g_cache_book.data() + offset, static_cast<std::uint64_t>(words) * 4);
     return true;
 }
 
@@ -920,7 +874,7 @@ bool init(Mode m) {
     g_clut = make_buffer(static_cast<std::uint64_t>(kClutSlots) * kClutEntries * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
     g_scratch = make_buffer((static_cast<std::uint64_t>(g_copy_words) + 2ull * g_field_words) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc);
     g_cache = make_buffer(static_cast<std::uint64_t>(kCacheWords) * 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
-    g_cache_copy.assign(kCacheWords, 0);
+    g_cache_book.reset(kCacheWords);
     g_readback = make_buffer(static_cast<std::uint64_t>(g_copy_words) * 4, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst);
     if (g_timestamps) {
         WGPUQuerySetDescriptor qd = WGPU_QUERY_SET_DESCRIPTOR_INIT;
@@ -1275,6 +1229,9 @@ void stats() {
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");
+    std::fprintf(stderr, "[gpu] upload cache: %zu entries, %llu uploads found, %llu stored, %llu refused (an entry in use was in the way)\n", g_cache_book.entries(),
+                 static_cast<unsigned long long>(g_cache_book.hits()), static_cast<unsigned long long>(g_cache_book.inserts()),
+                 static_cast<unsigned long long>(g_cache_book.refused()));
 }
 
 void configure_surface() {
