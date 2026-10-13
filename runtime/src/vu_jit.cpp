@@ -31,7 +31,7 @@ constexpr ImportType kImportTypes[kImports] = {
 
 enum Local : std::uint32_t {
     kR, kMem, kPend, kPendj, kEnding, kJpc, kPcw, kUclip, kUx, kUy, kUz, kUw, kTmp, kTmp2, kMacv, kStat, kSlot, kQPend, kQLeft, kQOld, kPPend, kPLeft, kPOld, kI32Locals,
-    kUv = kI32Locals, kV0, kV1, kV2, kV3, kV4, kV5, kShadow0
+    kUv = kI32Locals, kV0, kV1, kV2, kV3, kV4, kV5, kV6, kV7, kShadow0
 };
 constexpr std::uint32_t kI32Count = kI32Locals - 2;
 constexpr std::uint32_t kVecTemps = kShadow0 - kUv;
@@ -168,7 +168,7 @@ enum : std::uint8_t {
 
 enum : std::uint32_t {
     kVSplat = 0x11, kVExtract = 0x1B, kI32x4Eq = 0x37, kI32x4LtS = 0x39, kI32x4LeS = 0x3D, kI32x4GeS = 0x3F, kF32x4Ge = 0x46,
-    kVAnd = 0x4E, kVOr = 0x50, kVXor = 0x51, kVBitselect = 0x52, kI32x4Neg = 0xA1, kI32x4MinS = 0xB6, kF32x4Add = 0xE4, kF32x4Sub = 0xE5, kF32x4Mul = 0xE6,
+    kVAnd = 0x4E, kVOr = 0x50, kVXor = 0x51, kVBitselect = 0x52, kVNot = 0x4D, kVAndNot = 0x4F, kF32x4Eq = 0x41, kF32x4Ne = 0x42, kI32x4Neg = 0xA1, kI32x4Add = 0xAE, kI32x4Sub = 0xB1, kI32x4MinS = 0xB6, kI32x4MaxS = 0xB8, kF32x4Add = 0xE4, kF32x4Sub = 0xE5, kF32x4Mul = 0xE6,
 };
 
 enum Kind { Nop, Add, Sub, Madd, Msub, Max, Min, Mul, Abs, Ftoi, Itof, Clip, Opmula, Opmsub };
@@ -515,6 +515,106 @@ private:
         c_.simd(kVOr);
     }
 
+    // The VU adder (vuops::vadd_vu, same steps): replaces the two vectors on the stack by their sum as
+    // the VU gives it. kV2 a, kV3 b, kV4 the host sum, kV5 its exact error, kV6 away, kV7 below.
+    // Used for the ADD family only. SUB, MADD and MSUB go through the same adder on a VU, and the C++
+    // paths correct them too, but here they keep the host's rounding: the correction is about five
+    // times the work of the add, these three are two thirds of the adder's use in a race, and the VU
+    // thread has no room for them in the page (gap 013). Every sum corrected is the VU's; none is worse.
+    void vadd_vu() {
+        c_.set(kV3);
+        c_.set(kV2);
+        c_.get(kV2);
+        c_.get(kV3);
+        c_.simd(kF32x4Add);
+        c_.tee(kV4);
+        c_.get(kV2);
+        c_.simd(kF32x4Sub);
+        c_.set(kV5);            // bv = s - a
+        c_.get(kV2);
+        c_.get(kV4);
+        c_.get(kV5);
+        c_.simd(kF32x4Sub);     // av = s - bv
+        c_.simd(kF32x4Sub);     // a - av
+        c_.get(kV3);
+        c_.get(kV5);
+        c_.simd(kF32x4Sub);     // b - bv
+        c_.simd(kF32x4Add);
+        c_.set(kV5);            // err
+        c_.get(kV4);
+        c_.get(kV5);
+        c_.simd(kVXor);
+        c_.vsplatc(0u);
+        c_.simd(kI32x4LtS);
+        c_.set(kV6);            // away
+        // below: |s| under the larger operand's power of two, or on it and away
+        c_.get(kV4);
+        c_.vsplatc(0x7FFFFFFFu);
+        c_.simd(kVAnd);
+        c_.tee(kV7);            // |s| for now
+        c_.get(kV2);
+        c_.vsplatc(0x7FFFFFFFu);
+        c_.simd(kVAnd);
+        c_.get(kV3);
+        c_.vsplatc(0x7FFFFFFFu);
+        c_.simd(kVAnd);
+        c_.simd(kI32x4MaxS);
+        c_.vsplatc(0x7F800000u);
+        c_.simd(kVAnd);
+        c_.tee(kV0);            // power
+        c_.simd(kI32x4LtS);     // |s| < power
+        c_.get(kV7);
+        c_.get(kV0);
+        c_.simd(kI32x4Eq);
+        c_.get(kV6);
+        c_.simd(kVAnd);
+        c_.simd(kVOr);
+        c_.set(kV7);            // below
+        // opposite signs
+        c_.get(kV2);
+        c_.get(kV3);
+        c_.simd(kVXor);
+        c_.vsplatc(0u);
+        c_.simd(kI32x4LtS);
+        c_.set(kV0);            // opposite
+        // back = away & (~opposite | (~below & tie))
+        c_.get(kV4);
+        c_.get(kV5);
+        c_.get(kV5);
+        c_.simd(kF32x4Add);
+        c_.tee(kV1);            // twice
+        c_.simd(kF32x4Add);
+        c_.get(kV4);
+        c_.simd(kF32x4Sub);
+        c_.get(kV1);
+        c_.simd(kF32x4Eq);      // tie
+        c_.get(kV7);
+        c_.simd(kVAndNot);      // tie & ~below
+        c_.get(kV0);
+        c_.simd(kVNot);
+        c_.simd(kVOr);
+        c_.get(kV6);
+        c_.simd(kVAnd);         // back
+        // forward = opposite & below & ~away
+        c_.get(kV0);
+        c_.get(kV7);
+        c_.simd(kVAnd);
+        c_.get(kV6);
+        c_.simd(kVAndNot);
+        c_.simd(kI32x4Sub);     // back - forward
+        // only where the sum is inexact (and the error is a number)
+        c_.get(kV5);
+        c_.vsplatc(0u);
+        c_.simd(kF32x4Ne);
+        c_.get(kV5);
+        c_.get(kV5);
+        c_.simd(kF32x4Eq);
+        c_.simd(kVAnd);
+        c_.simd(kVAnd);
+        c_.get(kV4);
+        c_.simd(kI32x4Add);
+    }
+
     // The lanes of a local as the sign-magnitude integers MAX and MINI compare (fp::order):
     // x for a clear sign bit, x ^ 0x7FFFFFFF for a set one.
     void vorder_of(std::uint32_t local) {
@@ -763,7 +863,7 @@ void Translator::upper_pre(const Up &u, bool flags_live) {
             break;
         }
         switch (u.kind) {
-        case Add: c_.simd(kF32x4Add); vfix(); break;
+        case Add: vadd_vu(); vfix(); break;
         case Sub: c_.simd(kF32x4Sub); vfix(); break;
         case Mul: c_.simd(kF32x4Mul); vfix(); break;
         case Madd:
