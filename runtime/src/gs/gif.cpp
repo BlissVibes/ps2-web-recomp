@@ -27,7 +27,31 @@ Path g_paths[4];
 std::uint32_t g_stat = 0;
 bool g_mask_vif1 = false;       // PATH3 masked by VIF1 MSKPATH3 (GIF_STAT.M3P)
 std::uint32_t g_mode = 0;       // GIF_MODE: bit 0 M3R, bit 2 IMT (mirrored into GIF_STAT bits 0 and 2)
-std::vector<std::uint8_t> g_path3_held;   // PATH3 data received while PATH3 was masked, in arrival order
+// PATH3 data received while PATH3 was masked, in arrival order. What has already been let through is
+// the first g_path3_passed bytes: a release moves that mark instead of the data, and the storage is
+// kept from frame to frame (a game that meters texture uploads through the mask holds megabytes here
+// every frame and releases them a packet at a time).
+std::vector<std::uint8_t> g_path3_held;
+std::size_t g_path3_passed = 0;
+
+std::size_t held_bytes() { return g_path3_held.size() - g_path3_passed; }
+const std::uint8_t *held_data() { return g_path3_held.data() + g_path3_passed; }
+
+// Marks the first bytes of what is held as passed; forgets everything once nothing is left.
+void pass_held(std::size_t bytes) {
+    g_path3_passed += bytes;
+    if (g_path3_passed == g_path3_held.size()) {
+        g_path3_held.clear();
+        g_path3_passed = 0;
+    }
+}
+
+// Drops the passed bytes for real, so that the vector holds only what waits.
+void compact_held() {
+    if (!g_path3_passed) return;
+    g_path3_held.erase(g_path3_held.begin(), g_path3_held.begin() + static_cast<std::ptrdiff_t>(g_path3_passed));
+    g_path3_passed = 0;
+}
 constexpr std::uint32_t kGifFifoQwords = 16;
 
 bool path3_masked() { return g_mask_vif1 || (g_mode & 1u); }
@@ -217,6 +241,7 @@ void reset() {
     g_mask_vif1 = false;
     g_mode = 0;
     g_path3_held.clear();
+    g_path3_passed = 0;
     g_cut = Path{};
     if (gs::queue::active()) {
         for (Path &p : g_scan) p = Path{};
@@ -248,29 +273,22 @@ void forward(int path, const std::uint8_t *data, std::uint32_t qwc) {
 
 // Everything held goes to the GS: PATH3 has been open long enough to drain.
 void release_path3() {
-    if (g_path3_held.empty()) return;
-    std::vector<std::uint8_t> held = std::move(g_path3_held);
-    g_path3_held.clear();
-    const std::uint32_t qwc = static_cast<std::uint32_t>(held.size() / 16);
+    if (!held_bytes()) return;
+    const std::uint32_t qwc = static_cast<std::uint32_t>(held_bytes() / 16);
     if (trace_path3()) std::fprintf(stderr, "[gif] path3 open: all %u held qwords pass\n", qwc);
-    follow(held.data(), qwc);
-    forward(3, held.data(), qwc);
+    follow(held_data(), qwc);
+    forward(3, held_data(), qwc);
+    pass_held(static_cast<std::size_t>(qwc) * 16);
 }
 
 // The mask has just been lifted: the first held packet starts, and nothing can stop it any more.
 void start_path3() {
-    if (g_path3_held.empty()) return;
-    const std::uint32_t total = static_cast<std::uint32_t>(g_path3_held.size() / 16);
-    const std::uint32_t n = packet_span(g_path3_held.data(), total);
+    if (!held_bytes()) return;
+    const std::uint32_t total = static_cast<std::uint32_t>(held_bytes() / 16);
+    const std::uint32_t n = packet_span(held_data(), total);
     if (trace_path3()) std::fprintf(stderr, "[gif] path3 unmasked: one packet of %u qwords passes, %u stay held\n", n, total - n);
-    if (n == total) {
-        std::vector<std::uint8_t> held = std::move(g_path3_held);
-        g_path3_held.clear();
-        forward(3, held.data(), n);
-        return;
-    }
-    forward(3, g_path3_held.data(), n);
-    g_path3_held.erase(g_path3_held.begin(), g_path3_held.begin() + static_cast<std::ptrdiff_t>(n) * 16);
+    forward(3, held_data(), n);
+    pass_held(static_cast<std::size_t>(n) * 16);
 }
 
 }
@@ -287,17 +305,19 @@ void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
         return;
     }
     // Masked. The rest of a packet that was already on its way still passes; whole packets wait.
-    if (g_path3_held.empty() && g_cut.address_data) {
+    if (!held_bytes() && g_cut.address_data) {
         const std::uint32_t n = packet_span(data, qwc);
         forward(3, data, n);
         data += static_cast<std::size_t>(n) * 16;
         qwc -= n;
     }
-    g_path3_held.insert(g_path3_held.end(), data, data + static_cast<std::size_t>(qwc) * 16);
+    const std::size_t bytes = static_cast<std::size_t>(qwc) * 16;
+    if (g_path3_held.size() + bytes > g_path3_held.capacity()) compact_held();   // before the storage grows, reuse what has passed
+    g_path3_held.insert(g_path3_held.end(), data, data + bytes);
 }
 
 void path3_advance() {
-    if (!g_path3_held.empty() && !path3_masked()) release_path3();
+    if (held_bytes() && !path3_masked()) release_path3();
 }
 
 void scan_signals(int path, const std::uint8_t *data, std::uint32_t qwc) { scan(g_scan[path], data, qwc); }
@@ -314,14 +334,14 @@ void stats() {
 void set_path3_mask(bool masked) {
     const bool was = path3_masked();
     g_mask_vif1 = masked;
-    if (trace_path3()) std::fprintf(stderr, "[gif] mskpath3 %d, %zu qwords held\n", masked ? 1 : 0, g_path3_held.size() / 16);
+    if (trace_path3()) std::fprintf(stderr, "[gif] mskpath3 %d, %zu qwords held\n", masked ? 1 : 0, held_bytes() / 16);
     if (was && !path3_masked()) start_path3();
 }
 
 std::uint32_t read(std::uint32_t a) {
     if ((a & 0xF0u) != 0x20u) return 0;
     path3_advance();   // the EE had time to come and look: an open PATH3 has drained
-    const std::uint32_t held = static_cast<std::uint32_t>(g_path3_held.size() / 16);
+    const std::uint32_t held = static_cast<std::uint32_t>(held_bytes() / 16);
     const std::uint32_t fqc = std::min(held, kGifFifoQwords);
     return g_stat | (g_mode & 5u) | (g_mask_vif1 ? 2u : 0u) | (held ? (1u << 6) : 0u) | (fqc << 24);
 }
@@ -345,6 +365,7 @@ void state(ps2::state::Stream &s) {
     s.pod(g_stat);
     s.pod(g_mask_vif1);
     s.pod(g_mode);
+    compact_held();   // the state holds only what waits, as it always did
     s.vec(g_path3_held);
     s.pod(g_tags);
     s.pod(g_scan);
