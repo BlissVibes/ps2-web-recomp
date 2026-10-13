@@ -31,7 +31,8 @@ int usage() {
                  "              [--snapshot-every n --snapshot-dir dir]\n"
                  "              [--call addr --snapshot file [--a0..--a3 --t0..--t3 v|x64:hex] [--f12..--f19 v] [--gp v] [--sp v]\n"
                  "               [--fcr31 hex] [--stack-reserve n] [--buf reg:size[:hex]] [--poke addr:hex] [--budget n] [--trace-calls]\n"
-                 "               [--hook name|addr] [--hooks all] [--out file.json]]\n");
+                 "               [--hook name|addr] [--hooks all] [--out file.json]]\n"
+                 "              [--shadow N]   with hooks: compare every Nth call of each hook with the recompiled function\n");
     return 2;
 }
 
@@ -46,6 +47,7 @@ int main(int argc, char **argv) {
     std::string call_out;
     std::vector<std::string> hooks;
     bool all_hooks = false;
+    std::uint32_t shadow = 0;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--arg" && i + 1 < argc) args.push_back(argv[++i]);
@@ -88,6 +90,7 @@ int main(int argc, char **argv) {
         else if (a == "--trace-calls") call.trace = true;
         else if (a == "--hook" && i + 1 < argc) hooks.push_back(argv[++i]);
         else if (a == "--hooks" && i + 1 < argc && std::string(argv[i + 1]) == "all") { all_hooks = true; ++i; }
+        else if (a == "--shadow" && i + 1 < argc) shadow = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         else if (i + 1 < argc && ps2::harness::parse_option(a, argv[i + 1], call)) ++i;
         else return usage();
     }
@@ -99,6 +102,7 @@ int main(int argc, char **argv) {
     register_generated_vu();
     register_hooks();
     if (all_hooks) ps2::enable_all_hooks();
+    ps2::set_hook_shadow(shadow);
     for (const std::string &name : hooks) {
         if (!ps2::enable_hook(name)) {
             std::fprintf(stderr, "unknown hook %s\n", name.c_str());
@@ -140,8 +144,9 @@ int main(int argc, char **argv) {
     if (profile) start_profile(profile_from ? std::strtoull(profile_from, nullptr, 10) : 0);
     const int result = ps2::run();
     if (profile) write_profile(profile);
-    return result;
 #else
-    return ps2::run();
+    const int result = ps2::run();
 #endif
+    ps2::report_hooks();
+    return result;
 }

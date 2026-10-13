@@ -198,8 +198,15 @@ void schedule(int event, std::uint64_t at, std::function<void()> action) {
     g_events.push_back({event, at, std::move(action)});
 }
 
+namespace {
+std::uint64_t g_preempts = 0;
+}
+
+std::uint64_t preempt_count() { return g_preempts; }
+
 bool preempt(Cpu &c) {
     if (harness::g_active) return harness::preempt(c);
+    ++g_preempts;
     run_due_events();
     refill(c);
     return g_halted || g_state_request || kernel::must_unwind();

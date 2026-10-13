@@ -80,6 +80,7 @@ bool load_state(const std::uint8_t *data, std::size_t size);
 bool halted();
 std::uint64_t frame_count();
 std::uint32_t state_version();
+std::uint64_t preempt_count();   // how often generated code has stopped to run due events
 
 bool display_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 

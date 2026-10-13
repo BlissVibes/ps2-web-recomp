@@ -37,8 +37,13 @@ void dispatch(Cpu &c, std::uint32_t entry, std::uint32_t depth);
 void call(Cpu &c, std::uint32_t target, std::uint32_t depth);
 void bad_entry(Cpu &c, std::uint32_t unit_base);
 bool preempt(Cpu &c);
+// Hooks (hook.hpp). g_hooks is true while a hook, the entry trace or the entry snapshot is on. Generated
+// code calls enter() where a function is entered through its unit, and dispatch() calls offer() for every
+// address it is given; the enter() that follows an offer() of the same entry does not count it again.
+// Both return true when a hook served the call: the caller returns at once.
 extern bool g_hooks;
 bool enter(Cpu &c, std::uint32_t address);
+bool offer(Cpu &c, std::uint32_t address);
 
 void syscall(Cpu &c, std::uint32_t pc);
 void breakpoint(Cpu &c, std::uint32_t pc);

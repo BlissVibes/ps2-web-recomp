@@ -29,6 +29,10 @@ bool enable_hook(const std::string &name_or_hex_address);
 void enable_all_hooks();
 void set_entry_trace(bool on);
 void set_entry_snapshot(std::uint32_t address, std::uint32_t every, std::uint32_t max, const std::string &dir);
+// Shadow mode: enabled hooks do not serve their calls; on every `every`th call of a hook the recompiled
+// function and the hook both run on the live call and their outcomes are compared (0 = off).
+void set_hook_shadow(std::uint32_t every);
+void report_hooks();   // one line per enabled hook on stderr: how many calls it served, or was compared on
 
 // Defined in runtime/src/memory.cpp and declared in the private header runtime/src/hw.hpp, which
 // decompiled code must not include; declared here as well.

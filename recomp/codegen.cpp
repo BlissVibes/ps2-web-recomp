@@ -191,7 +191,13 @@ private:
         out_ << "void " << unit_name(u) << "(Cpu &c, std::uint32_t entry, std::uint32_t depth) {\n";
         if (relocatable_) out_ << "    [[maybe_unused]] const std::uint32_t B = c.base;\n";
         out_ << "dispatch_entry:\n    switch (entry) {\n";
-        for (const auto &[a, id] : ids_[u]) out_ << "    case " << id << "u: goto " << label(a) << ";\n";
+        for (const auto &[a, id] : ids_[u]) {
+            // A function entered through the unit is offered to the hooks. A branch inside the unit to a
+            // function's first instruction is a goto to its label and does not come this way.
+            out_ << "    case " << id << "u: ";
+            if (p_.functions.count(a)) out_ << "if (g_hooks) [[unlikely]] { if (enter(c, " << pc(a) << ")) return; } ";
+            out_ << "goto " << label(a) << ";\n";
+        }
         out_ << "    default: bad_entry(c, " << pc(base_) << "); return;\n    }\n";
 
         pending_ = 0;
