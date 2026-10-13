@@ -53,6 +53,7 @@ void compact_held() {
     g_path3_passed = 0;
 }
 constexpr std::uint32_t kGifFifoQwords = 16;
+constexpr std::size_t kHeldWorthSaying = 16u << 20;   // several frames of uploads: the game holds 3.5 MB at its fullest
 
 bool path3_masked() { return g_mask_vif1 || (g_mode & 1u); }
 std::uint64_t g_tags[4][4];
@@ -268,7 +269,16 @@ void forward(int path, const std::uint8_t *data, std::uint32_t qwc) {
         return;
     }
     if (gs::queue::role() != gs::queue::Role::Vu) scan(g_scan[path], data, qwc);
-    gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), qwc, data, qwc * 16);
+    // One message carries a limited amount, and what PATH3 holds has no limit. The data may be cut between
+    // any two qwords: the messages of one call follow each other in the queue, and the reader walks the
+    // path's stream with what it kept from the message before (g_paths).
+    constexpr std::uint32_t kMost = gs::queue::kMaxPayload / 16;
+    while (qwc) {
+        const std::uint32_t n = std::min(qwc, kMost);
+        gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), n, data, n * 16);
+        data += static_cast<std::size_t>(n) * 16;
+        qwc -= n;
+    }
 }
 
 // Everything held goes to the GS: PATH3 has been open long enough to drain.
@@ -314,6 +324,13 @@ void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
     const std::size_t bytes = static_cast<std::size_t>(qwc) * 16;
     if (g_path3_held.size() + bytes > g_path3_held.capacity()) compact_held();   // before the storage grows, reuse what has passed
     g_path3_held.insert(g_path3_held.end(), data, data + bytes);
+    // The hardware would stall the transfer; here it is held, without limit. A game that keeps sending and
+    // never lifts the mask should show in the log rather than only in the memory used.
+    static bool said = false;
+    if (!said && held_bytes() > kHeldWorthSaying) {
+        said = true;
+        std::fprintf(stderr, "[gif] more than %zu MB of PATH3 data is held behind the mask and it is still growing\n", kHeldWorthSaying >> 20);
+    }
 }
 
 void path3_advance() {

@@ -860,7 +860,7 @@ void flush_and_wait() {
 #endif
 }
 
-void start_thread() { queue::render().start(32u << 20); }
+void start_thread() { queue::render().start(queue::kRenderRingBytes); }
 
 void post_present() {
     const DisplayRegs regs = display_regs();

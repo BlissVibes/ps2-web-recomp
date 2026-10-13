@@ -450,7 +450,7 @@ void resize_window(std::uint32_t width, std::uint32_t height) { gs::resize_windo
 bool present_frame() { return gs::present(); }
 void init_graphics() { gs::init(); }
 void start_render_thread() { gs::start_thread(); }
-void start_vu_thread() { gs::queue::vu().start(32u << 20); }
+void start_vu_thread() { gs::queue::vu().start(gs::queue::kVuRingBytes); }
 
 std::atomic<double> g_vu_idle_ms{0.0};
 
