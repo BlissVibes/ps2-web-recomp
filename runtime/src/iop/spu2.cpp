@@ -3,6 +3,7 @@
 #include "hw.hpp"
 #include "iop.hpp"
 #include "kernel.hpp"
+#include "spu2_work_area.hpp"
 
 #include "ps2/state.hpp"
 
@@ -96,6 +97,7 @@ constexpr std::uint32_t kDryArea[2][2] = {{0x1000u, 0x1200u}, {0x1800u, 0x1A00u}
 constexpr std::uint32_t kWetArea[2][2] = {{0x1400u, 0x1600u}, {0x1C00u, 0x1E00u}};
 constexpr std::uint32_t kCore0OutArea[2] = {0x0800u, 0x0A00u};
 static_assert(kOutputRing % kBatch == 0, "a batch must not straddle the output ring wrap");
+static_assert(kBatch % 2 == 0 && kReverbHistory % 2 == 0, "the reverb's sides must keep their turns in its histories over a batch that is not run");
 
 enum Phase { kOff, kAttack, kDecay, kSustain, kRelease };
 
@@ -110,7 +112,8 @@ struct Envelope {
         if (++counter < cycles) return;
         counter = 0;
         int delta = (decrease ? -8 + (rate & 3) : 7 - (rate & 3)) << std::max(0, 11 - shift);
-        if (exponential && decrease) delta = delta * level / 0x8000;
+        // An exponential decrease takes the step times the level, rounded down: at least one unit, so the level gets to 0.
+        if (exponential && decrease) delta = delta * level >> 15;
         level = std::clamp(level + delta, 0, 0x7FFF);
     }
 };
@@ -318,8 +321,12 @@ std::uint32_t switches(const Core &k, std::uint32_t off) { return k.regs[off >> 
 
 std::int32_t scale(std::int32_t value, std::int32_t gain) { return static_cast<std::int32_t>((static_cast<std::int64_t>(value) * gain) >> 15); }
 
-std::int32_t reverb_filter(const std::int16_t *history, unsigned newest) {
-    std::int32_t sum = kReverbFilter[kReverbTaps / 2] * history[(newest - kReverbTaps / 2) % kReverbHistory];
+// The half-band filter over a history, in two parts: its centre tap, and its 20 other taps that are not 0, which
+// lie an even number of samples from the newest.
+std::int32_t reverb_centre(const std::int16_t *history, unsigned newest) { return kReverbFilter[kReverbTaps / 2] * history[(newest - kReverbTaps / 2) % kReverbHistory]; }
+
+std::int32_t reverb_even(const std::int16_t *history, unsigned newest) {
+    std::int32_t sum = 0;
     for (int i = 0; i < kReverbTaps; i += 2) sum += kReverbFilter[i] * history[(newest - (kReverbTaps - 1) + i) % kReverbHistory];
     return sum;
 }
@@ -334,10 +341,19 @@ void render_reverb(Core &k, const std::int32_t (*in)[2], std::int32_t (*out)[2])
     const std::uint32_t end = (static_cast<std::uint32_t>(k.regs[kEea >> 1]) << 16 | 0xFFFFu) & kRamMask;
     const bool enabled = k.attr & 0x80u;
     if (start >= end || (!enabled && !k.evol[0] && !k.evol[1])) return;
-    const std::int64_t size = end - start + 1;
-    std::int64_t offset[kReverbAddresses];
+    const std::uint32_t size = end - start + 1;
+    // Where the network reads and writes, as positions in the work area, wrapped into it once for the batch: the 22
+    // offsets, the halfword before each reflection destination, and each all-pass filter's source (its
+    // destination less its size).
+    std::uint32_t offset[kReverbAddresses], before[2][2], source[2][2];   // [same, different][side], [all-pass 1, 2][side]
     for (int i = 0; i < kReverbAddresses; ++i)
-        offset[i] = static_cast<std::uint32_t>(k.regs[(kReverbAddress + i * 4) >> 1]) << 16 | k.regs[(kReverbAddress + i * 4 + 2) >> 1];
+        offset[i] = work_area::wrap(static_cast<std::uint32_t>(k.regs[(kReverbAddress + i * 4) >> 1]) << 16 | k.regs[(kReverbAddress + i * 4 + 2) >> 1], size);
+    for (int side = 0; side < 2; ++side) {
+        before[0][side] = work_area::sub(offset[kSameDst + side], 1, size);
+        before[1][side] = work_area::sub(offset[kDiffDst + side], 1, size);
+        source[0][side] = work_area::sub(offset[kApf1Dst + side], offset[kApf1Size], size);
+        source[1][side] = work_area::sub(offset[kApf2Dst + side], offset[kApf2Size], size);
+    }
     bool watched = false;
     for (const Core &other : g_cores) watched = watched || (enabled && (other.attr & 0x40u) && !other.irq && other.irqa >= start && other.irqa <= end);
     Reverb &r = k.reverb;
@@ -346,19 +362,19 @@ void render_reverb(Core &k, const std::int32_t (*in)[2], std::int32_t (*out)[2])
     for (unsigned n = 0; n < kBatch; ++n) {
         const std::uint32_t clock = g_samples + n;
         const int side = clock & 1;
-        const std::int64_t origin = clock >> 1;
-        const auto at = [&](std::int64_t relative) {
-            const std::uint32_t address = start + static_cast<std::uint32_t>((((origin + relative) % size) + size) % size);
+        const std::uint32_t origin = work_area::wrap(clock >> 1, size);
+        const auto at = [&](std::uint32_t position) {
+            const std::uint32_t address = start + work_area::add(origin, position, size);
             if (watched) check_irq(address, 1);
             return address;
         };
         r.at = (r.at + 1) % kReverbHistory;
         r.down[0][r.at] = clamp16(in[n][0]);
         r.down[1][r.at] = clamp16(in[n][1]);
-        const std::int32_t input = scale(clamp16(reverb_filter(r.down[side], r.at) >> 15), gain[kInputGain + side]);
+        const std::int32_t input = scale(clamp16((reverb_centre(r.down[side], r.at) + reverb_even(r.down[side], r.at)) >> 15), gain[kInputGain + side]);
         const auto sample = [&](std::uint32_t address) { return static_cast<std::int32_t>(static_cast<std::int16_t>(g_ram[address])); };
-        const std::uint32_t same_dst = at(offset[kSameDst + side]), same_old = at(offset[kSameDst + side] - 1);
-        const std::uint32_t diff_dst = at(offset[kDiffDst + side]), diff_old = at(offset[kDiffDst + side] - 1);
+        const std::uint32_t same_dst = at(offset[kSameDst + side]), same_old = at(before[0][side]);
+        const std::uint32_t diff_dst = at(offset[kDiffDst + side]), diff_old = at(before[1][side]);
         const std::int32_t same = scale(input + scale(sample(at(offset[kSameSrc + side])), gain[kWallGain]) - sample(same_old), gain[kIirGain]) + sample(same_old);
         const std::int32_t diff = scale(input + scale(sample(at(offset[kDiffSrc + (side ^ 1)])), gain[kWallGain]) - sample(diff_old), gain[kIirGain]) + sample(diff_old);
         std::int32_t mix = 0;
@@ -366,8 +382,8 @@ void render_reverb(Core &k, const std::int32_t (*in)[2], std::int32_t (*out)[2])
             static const int kSource[4] = {kComb1, kComb2, kComb3, kComb4};
             mix += scale(sample(at(offset[kSource[comb] + side])), gain[kComb1Gain + comb]);
         }
-        const std::uint32_t apf1_dst = at(offset[kApf1Dst + side]), apf1_src = at(offset[kApf1Dst + side] - offset[kApf1Size]);
-        const std::uint32_t apf2_dst = at(offset[kApf2Dst + side]), apf2_src = at(offset[kApf2Dst + side] - offset[kApf2Size]);
+        const std::uint32_t apf1_dst = at(offset[kApf1Dst + side]), apf1_src = at(source[0][side]);
+        const std::uint32_t apf2_dst = at(offset[kApf2Dst + side]), apf2_src = at(source[1][side]);
         const std::int32_t apf1 = mix - scale(sample(apf1_src), gain[kApf1Gain]);
         mix = sample(apf1_src) + scale(apf1, gain[kApf1Gain]);
         const std::int32_t apf2 = mix - scale(sample(apf2_src), gain[kApf2Gain]);
@@ -380,8 +396,12 @@ void render_reverb(Core &k, const std::int32_t (*in)[2], std::int32_t (*out)[2])
         }
         r.up[side][r.at] = clamp16(mix);
         r.up[side ^ 1][r.at] = 0;
-        out[n][0] = clamp16(reverb_filter(r.up[0], r.at) >> 14);
-        out[n][1] = clamp16(reverb_filter(r.up[1], r.at) >> 14);
+        // On the way out each side's history holds a sample in every second entry and 0 between, the sides in
+        // turn (the lines above; the turns follow the sample clock, which moves on by whole batches while the
+        // reverb is not run). So the side that just ran has samples under the even taps only and the other
+        // side under the centre tap only; the taps over the zeros are left out.
+        out[n][side] = clamp16(reverb_even(r.up[side], r.at) >> 14);
+        out[n][side ^ 1] = clamp16(reverb_centre(r.up[side ^ 1], r.at) >> 14);
     }
 }
 
@@ -439,9 +459,11 @@ void tick() {
                 }
             }
         render_reverb(k, effects, returned);
+        // The core's mix with what the reverb returns is clamped to 16 bits before the master volume, and the
+        // result once more: a mix beyond full scale clips at full scale times the master volume.
         for (unsigned n = 0; n < kBatch; ++n)
             for (int side = 0; side < 2; ++side) {
-                const std::int32_t sum = (mix[n][side] + scale(returned[n][side], static_cast<std::int16_t>(k.evol[side]))) * master(k.mvol[side]) >> 15;
+                const std::int32_t sum = clamp16(mix[n][side] + scale(returned[n][side], static_cast<std::int16_t>(k.evol[side]))) * master(k.mvol[side]) >> 15;
                 if (c == 0) core0[side][n] = clamp16(sum);
                 else out[n * 2 + side] = clamp16(sum);
             }
