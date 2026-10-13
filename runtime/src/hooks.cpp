@@ -21,7 +21,7 @@ namespace {
 struct Entry {
     const Hook *hook;
     bool enabled;
-    std::uint64_t calls = 0, compared = 0, wrong = 0, v0 = 0, f0 = 0, scratch = 0, skipped = 0;
+    std::uint64_t calls = 0, compared = 0, wrong = 0, v0 = 0, f0 = 0, fcr31 = 0, scratch = 0, skipped = 0;
 };
 
 std::unordered_map<std::uint32_t, Entry> g_table;
@@ -94,10 +94,10 @@ void report_hooks() {
             std::fprintf(stderr, "[hook] 0x%08X %s: %llu calls\n", e->hook->address, e->hook->name, static_cast<unsigned long long>(e->calls));
             continue;
         }
-        std::fprintf(stderr, "[hook] 0x%08X %s: %llu calls, %llu compared: %llu wrong (kept registers or memory), v0 differs in %llu, f0 in %llu, other scratch registers in %llu; %llu not compared\n",
+        std::fprintf(stderr, "[hook] 0x%08X %s: %llu calls, %llu compared: %llu wrong (kept registers or memory), v0 differs in %llu, f0 in %llu, fcr31 in %llu, other scratch registers in %llu; %llu not compared\n",
                      e->hook->address, e->hook->name, static_cast<unsigned long long>(e->calls), static_cast<unsigned long long>(e->compared),
                      static_cast<unsigned long long>(e->wrong), static_cast<unsigned long long>(e->v0), static_cast<unsigned long long>(e->f0),
-                     static_cast<unsigned long long>(e->scratch), static_cast<unsigned long long>(e->skipped));
+                     static_cast<unsigned long long>(e->fcr31), static_cast<unsigned long long>(e->scratch), static_cast<unsigned long long>(e->skipped));
     }
 }
 
@@ -142,8 +142,13 @@ std::uint32_t first_difference(const std::uint8_t *a, const std::uint8_t *b, std
 // Wrong: the registers a function must keep, and memory outside the callee's frame. v0 and f0 are
 // counted on their own: one of them is the function's result and the other a register it may use
 // freely, and only the function's description says which. Scratch: every other register.
+// Two exceptions to "scratch". The FPU status (fcr31) is counted on its own, the condition bit apart from
+// the flags: a compare leaves its result there and a divide its sticky flags, some hooks reproduce both on
+// purpose, and among the scratch registers, where nearly every call differs, a miss would not be seen.
+// The upper halves of hi and lo and the shift amount count as wrong: a hook only has them as the function
+// leaves them if it sets them itself, and no other check would show that it does not.
 void compare(Entry &e, const Cpu &before, const Cpu &rec, const Cpu &c, const std::uint8_t *ram, const std::uint8_t *spr) {
-    std::string wrong, scratch;
+    std::string wrong, scratch, status;
     for (int i = 1; i < 32; ++i) {
         const bool kept = (i >= 16 && i <= 23) || i >= 28;
         differ(kept ? wrong : scratch, kRegisters[i], -1, i == 2 ? 0 : rec.r[i].d[0], i == 2 ? 0 : c.r[i].d[0]);
@@ -151,10 +156,14 @@ void compare(Entry &e, const Cpu &before, const Cpu &rec, const Cpu &c, const st
         differ(kept ? wrong : scratch, upper.c_str(), -1, rec.r[i].d[1], c.r[i].d[1]);
     }
     for (int i = 1; i < 32; ++i) differ(i >= 20 ? wrong : scratch, "f", i, rec.f[i], c.f[i]);
-    differ(scratch, "fcr31", -1, rec.fcr31, c.fcr31);
+    differ(status, "condition", -1, (rec.fcr31 & kFpuCondition) != 0, (c.fcr31 & kFpuCondition) != 0);
+    differ(status, "flags", -1, rec.fcr31 & ~kFpuCondition, c.fcr31 & ~kFpuCondition);
     differ(scratch, "facc", -1, rec.facc, c.facc);
     differ(scratch, "hi", -1, rec.hi.d[0], c.hi.d[0]);
     differ(scratch, "lo", -1, rec.lo.d[0], c.lo.d[0]);
+    differ(wrong, "hi1", -1, rec.hi.d[1], c.hi.d[1]);
+    differ(wrong, "lo1", -1, rec.lo.d[1], c.lo.d[1]);
+    differ(wrong, "sa", -1, rec.sa, c.sa);
     const std::uint32_t sp = before.r[29].w[0];
     const std::uint32_t frame = sp >= kFrame && sp <= kRamSize ? sp - kFrame : kRamSize;
     const std::uint32_t at = first_difference(ram, g_ram, kRamSize, frame, kFrame);
@@ -179,6 +188,7 @@ void compare(Entry &e, const Cpu &before, const Cpu &rec, const Cpu &c, const st
                      before.r[7].w[0], before.f[12], before.f[13], before.r[31].w[0]);
     };
     show("wrong", wrong, e.wrong);
+    show("fcr31", status, e.fcr31);
     show("scratch", scratch, e.scratch);
 }
 
