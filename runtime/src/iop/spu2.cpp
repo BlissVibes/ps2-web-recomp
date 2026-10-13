@@ -122,9 +122,9 @@ struct Voice {
     bool lsax_written = false, key_on = false, end = false;
     Phase phase = kOff;
     Envelope env;
-    std::int16_t buffer[56] = {};
+    std::int16_t buffer[56] = {};   // the block being read (block[1]) in the second half, the one before it in the first
     std::int32_t s1 = 0, s2 = 0;
-    std::uint32_t position = 0;
+    std::uint32_t position = 0;     // read position in buffer, 12 fraction bits; 28 to 56 while the voice plays
 };
 
 struct Reverb {
@@ -174,7 +174,9 @@ void check_irq(std::uint32_t address, std::uint32_t words) {
     }
 }
 
-void decode_block(Voice &v, std::int16_t *out) {
+// Decodes the block at v.next into the second half of the buffer: the voice starts reading it now.
+void decode_block(Voice &v) {
+    std::int16_t *const out = v.buffer + 28;
     static const int kFilter[5][2] = {{0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}};
     const std::uint32_t at = v.next & kRamMask;
     const std::uint16_t header = g_ram[at];
@@ -189,16 +191,20 @@ void decode_block(Voice &v, std::int16_t *out) {
         v.s1 = sample;
         out[i] = static_cast<std::int16_t>(sample);
     }
-    v.block[out == v.buffer ? 0 : 1] = at;
+    v.block[1] = at;
     if ((flags & 4u) && !v.lsax_written) v.lsax = at;
     v.next = (at + 8) & kRamMask;
-    if (flags & 1u) {
-        v.end = true;
-        v.next = v.lsax;
-        if (!(flags & 2u)) {
-            v.phase = kRelease;
-            v.env.level = 0;
-        }
+}
+
+// The voice has played the block it was reading to its last sample: the block's end flag acts now.
+void finish_block(Voice &v) {
+    const unsigned flags = g_ram[v.block[1] & kRamMask] >> 8;
+    if (!(flags & 1u)) return;
+    v.end = true;
+    v.next = v.lsax;
+    if (!(flags & 2u)) {
+        v.phase = kRelease;
+        v.env.level = 0;
     }
 }
 
@@ -208,12 +214,13 @@ void key_on(Voice &v) {
     v.end = false;
     v.next = v.ssa;
     v.s1 = v.s2 = 0;
-    v.position = 0;
+    v.position = 28u << 12;
     v.phase = kAttack;
     v.env = Envelope{};
-    decode_block(v, v.buffer);
-    decode_block(v, v.buffer + 28);
-    check_irq(v.block[0], 8);
+    std::fill(v.buffer, v.buffer + 28, 0);
+    decode_block(v);
+    v.block[0] = v.block[1];
+    check_irq(v.block[1], 8);
 }
 
 void update_envelope(Voice &v) {
@@ -257,22 +264,23 @@ void render_voice(Voice &v, std::int32_t (*voice)[2], std::int16_t *capture) {
         const std::int32_t left = sweep_l ? volume(v.voll, v.vol[0]) : fixed_l, right = sweep_r ? volume(v.volr, v.vol[1]) : fixed_r;
         if (v.phase == kOff) continue;
         const std::uint32_t phase = (position >> 4) & 0xFFu;
-        const std::int16_t *const s = v.buffer + (position >> 12);   // four samples from the read position on: the block after is decoded already
+        const std::int16_t *const s = v.buffer + (position >> 12) - 3;   // the sample at the read position and the three before it
         const std::int32_t sample = (kGauss[0xFF - phase] * s[0] >> 15) + (kGauss[0x1FF - phase] * s[1] >> 15) + (kGauss[0x100 + phase] * s[2] >> 15) + (kGauss[phase] * s[3] >> 15);
-        position += step;
-        while ((position >> 12) >= 28) {
-            position -= 28u << 12;
-            std::memmove(v.buffer, v.buffer + 28, 28 * sizeof(std::int16_t));
-            v.block[0] = v.block[1];
-            v.position = position;
-            check_irq(v.block[0], 8);
-            decode_block(v, v.buffer + 28);
-        }
         update_envelope(v);
         const std::int32_t out = sample * v.env.level >> 15;
         if (capture) capture[n] = static_cast<std::int16_t>(std::clamp(out, -32768, 32767));
         voice[n][0] = out * left >> 15;
         voice[n][1] = out * right >> 15;
+        position += step;
+        while ((position >> 12) >= 56) {
+            position -= 28u << 12;
+            finish_block(v);
+            std::memmove(v.buffer, v.buffer + 28, 28 * sizeof(std::int16_t));
+            v.block[0] = v.block[1];
+            v.position = position;
+            decode_block(v);
+            check_irq(v.block[1], 8);
+        }
     }
     v.position = position;
 }
@@ -489,7 +497,8 @@ std::uint32_t read_voice(Core &k, std::uint32_t off) {
         }
     }
     const Voice &v = k.voices[(off - 0x1C0u) / 12];
-    const std::uint32_t nax = (v.block[0] + 1 + (v.position >> 14)) & kRamMask;
+    const std::uint32_t index = v.position >> 12;
+    const std::uint32_t nax = (v.block[1] + 1 + (index >= 28 ? (index - 28) >> 2 : 0)) & kRamMask;
     switch ((off - 0x1C0u) % 12) {
     case 0: return v.ssa >> 16;
     case 2: return v.ssa & 0xFFFFu;
@@ -723,9 +732,9 @@ void dump_voices() {
         for (int i = 0; i < 24; ++i) {
             const Voice &v = g_cores[c].voices[i];
             if (v.phase == kOff && !v.end) continue;
-            const std::uint16_t header = g_ram[v.block[0] & kRamMask];
+            const std::uint16_t header = g_ram[v.block[1] & kRamMask];
             std::fprintf(stderr, "[spu2] core %d voice %d phase %d ssa 0x%05X lsax 0x%05X block 0x%05X flags %X next 0x%05X pitch 0x%04X env %d end %d\n", c, i,
-                         static_cast<int>(v.phase), v.ssa, v.lsax, v.block[0], header >> 8, v.next, v.pitch, v.env.level, v.end ? 1 : 0);
+                         static_cast<int>(v.phase), v.ssa, v.lsax, v.block[1], header >> 8, v.next, v.pitch, v.env.level, v.end ? 1 : 0);
         }
 }
 
@@ -749,6 +758,8 @@ void state(ps2::state::Stream &s) {
     s.vec(g_ram);
     for (Core &k : g_cores) {
         s.pod(k.voices);
+        if (s.loading() && s.version < 6)
+            for (Voice &v : k.voices) v.position = (28u << 12) | (v.position & 0xFFFu);
         s.pod(k.attr);
         s.pod(k.admas);
         s.pod(k.irqa);
