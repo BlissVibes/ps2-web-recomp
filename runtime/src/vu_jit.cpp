@@ -168,7 +168,7 @@ enum : std::uint8_t {
 
 enum : std::uint32_t {
     kVSplat = 0x11, kVExtract = 0x1B, kI32x4Eq = 0x37, kI32x4LtS = 0x39, kI32x4LeS = 0x3D, kI32x4GeS = 0x3F, kF32x4Ge = 0x46,
-    kVAnd = 0x4E, kVOr = 0x50, kVBitselect = 0x52, kI32x4Neg = 0xA1, kI32x4MinS = 0xB6, kF32x4Add = 0xE4, kF32x4Sub = 0xE5, kF32x4Mul = 0xE6,
+    kVAnd = 0x4E, kVOr = 0x50, kVXor = 0x51, kVBitselect = 0x52, kI32x4Neg = 0xA1, kI32x4MinS = 0xB6, kF32x4Add = 0xE4, kF32x4Sub = 0xE5, kF32x4Mul = 0xE6,
 };
 
 enum Kind { Nop, Add, Sub, Madd, Msub, Max, Min, Mul, Abs, Ftoi, Itof, Clip, Opmula, Opmsub };
@@ -393,24 +393,14 @@ private:
         c_.simd(kVOr);
     }
 
-    void vkey_of(std::uint32_t local) {
+    // The lanes of a local as the sign-magnitude integers MAX and MINI compare (fp::order):
+    // x for a clear sign bit, x ^ 0x7FFFFFFF for a set one.
+    void vorder_of(std::uint32_t local) {
         c_.get(local);
-        c_.vsplatc(0x80000000u);
-        c_.simd(kVAnd);
-        c_.get(local);
-        c_.get(local);
-        c_.vsplatc(0x7F800000u);
-        c_.simd(kVAnd);
-        c_.vsplatc(0);
-        c_.simd(kI32x4Eq);
-        c_.simd(kVBitselect);
-        c_.tee(kV4);
         c_.vsplatc(0x7FFFFFFFu);
-        c_.simd(kVAnd);
-        c_.tee(kV5);
-        c_.simd(kI32x4Neg);
-        c_.get(kV5);
-        c_.get(kV4);
+        c_.simd(kVXor);
+        c_.get(local);
+        c_.get(local);
         c_.vsplatc(0);
         c_.simd(kI32x4LtS);
         c_.simd(kVBitselect);
@@ -699,8 +689,8 @@ void Translator::upper_pre(const Up &u, bool flags_live) {
         c_.set(kV3);
         c_.get(kV2);
         c_.get(kV3);
-        vkey_of(kV2);
-        vkey_of(kV3);
+        vorder_of(kV2);
+        vorder_of(kV3);
         c_.simd(u.kind == Max ? kI32x4GeS : kI32x4LeS);
         c_.simd(kVBitselect);
         c_.set(kUv);

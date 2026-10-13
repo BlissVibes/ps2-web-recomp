@@ -118,8 +118,14 @@ inline std::int32_t key(std::uint32_t x) {
     return (x & kSign) ? -magnitude : magnitude;
 }
 
-inline std::uint32_t max(std::uint32_t a, std::uint32_t b) { return key(a) >= key(b) ? a : b; }
-inline std::uint32_t min(std::uint32_t a, std::uint32_t b) { return key(a) <= key(b) ? a : b; }
+// MAX and MIN do no arithmetic: they compare the two bit patterns as sign-magnitude integers and
+// hand one of them back untouched. Nothing is flushed, so a denormal is larger than zero and keeps
+// its bits, and -0 is below +0. Code relies on it to carry integers through float registers: VU
+// programs build GIF tags with MAXi against vf0 and an integer in the I register.
+inline std::int32_t order(std::uint32_t x) { return static_cast<std::int32_t>((x & kSign) ? x ^ kAbs : x); }
+
+inline std::uint32_t max(std::uint32_t a, std::uint32_t b) { return order(a) >= order(b) ? a : b; }
+inline std::uint32_t min(std::uint32_t a, std::uint32_t b) { return order(a) <= order(b) ? a : b; }
 
 inline std::uint32_t to_fixed(std::uint32_t x, int fraction) {
     const int e = static_cast<int>(exponent(x)) + fraction;
