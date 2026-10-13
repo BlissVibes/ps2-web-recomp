@@ -30,7 +30,7 @@ constexpr ImportType kImportTypes[kImports] = {
 };
 
 enum Local : std::uint32_t {
-    kR, kMem, kPend, kPendj, kEnding, kJpc, kPcw, kUclip, kUx, kUy, kUz, kUw, kTmp, kTmp2, kMacv, kStat, kSlot, kI32Locals,
+    kR, kMem, kPend, kPendj, kEnding, kJpc, kPcw, kUclip, kUx, kUy, kUz, kUw, kTmp, kTmp2, kMacv, kStat, kSlot, kQPend, kQLeft, kQOld, kPPend, kPLeft, kPOld, kI32Locals,
     kUv = kI32Locals, kV0, kV1, kV2, kV3, kV4, kV5, kShadow0
 };
 constexpr std::uint32_t kI32Count = kI32Locals - 2;
@@ -365,6 +365,128 @@ private:
             if (pl.jump || (word(prev + 4) & 0x40000000u)) s.push_back(-1);
         }
         return s;
+    }
+
+    // DIV, SQRT and RSQRT deliver Q, and the EFU instructions deliver P, a fixed number of
+    // instructions after they start, and some programs read the old value in between on purpose
+    // (vu_micro.cpp, Delayed). When a program can read Q or P inside such a window the generated
+    // code models the delay as the interpreter does: the result waits in a local with a countdown,
+    // which is stepped only at instructions that a pending result can reach. Programs that never
+    // read inside a window keep the direct write, which is equivalent for them.
+    bool delay_ = false;
+    std::set<std::uint32_t> tick_q_, tick_p_;
+
+    static std::uint32_t latency(std::uint32_t lo, bool &p) {
+        if ((lo >> 25) != 0x40u || (lo & 0x3Cu) != 0x3Cu) return 0;
+        const std::uint32_t index = ((lo >> 6) & 31u) * 4u + (lo & 3u);
+        p = index >= 0x70u;
+        switch (index) {
+        case 0x38: case 0x39: return 7;
+        case 0x3A: return 13;
+        case 0x70: return 11;
+        case 0x71: case 0x72: case 0x79: return 18;
+        case 0x73: return 24;
+        case 0x74: case 0x75: case 0x7D: return 54;
+        case 0x76: case 0x78: case 0x7A: return 12;
+        case 0x7C: return 29;
+        case 0x7E: return 44;
+        default: return 0;
+        }
+    }
+
+    static bool reads_q(std::uint32_t hi) {
+        const std::uint32_t op = hi & 63u;
+        const std::uint32_t index = op >= 0x3Cu ? ((hi >> 6) & 31u) * 4u + (op & 3u) : op;
+        return index == 0x1Cu || index == 0x20u || index == 0x21u || index == 0x24u || index == 0x25u;
+    }
+
+    // Marks every instruction a pending result can reach, and reports whether one of them reads it early.
+    bool find_windows() {
+        bool early = false;
+        for (std::uint32_t start : pcs_) {
+            if (word(start + 4) & 0x80000000u) continue;
+            bool p = false;
+            const std::uint32_t wait = latency(word(start), p);
+            if (!wait) continue;
+            std::set<std::uint32_t> frontier{start};
+            for (std::uint32_t step = 1; step <= wait && !frontier.empty(); ++step) {
+                std::set<std::uint32_t> next;
+                for (std::uint32_t at : frontier)
+                    for (std::int64_t to : successors(at))
+                        if (to >= 0 && in_.count(static_cast<std::uint32_t>(to))) next.insert(static_cast<std::uint32_t>(to));
+                for (std::uint32_t at : next) {
+                    (p ? tick_p_ : tick_q_).insert(at);
+                    if (step == wait) continue;
+                    const std::uint32_t hi = word(at + 4), lo = word(at);
+                    const bool immediate = hi & 0x80000000u;
+                    const bool mfp = !immediate && (lo >> 25) == 0x40u && (lo & 0x3Cu) == 0x3Cu && ((lo >> 6) & 31u) * 4u + (lo & 3u) == 0x64u;
+                    if (p ? mfp : reads_q(hi)) early = true;
+                }
+                frontier = std::move(next);
+            }
+        }
+        return early;
+    }
+
+    // if (left && --left == 0) register = pending;
+    void tick(std::uint32_t left, std::uint32_t pending, std::uint32_t offset) {
+        c_.get(left);
+        c_.open_if();
+        c_.get(left);
+        c_.i32c(1);
+        c_.op(kOpSub);
+        c_.tee(left);
+        c_.op(kOpEqz);
+        c_.open_if();
+        c_.get(kR);
+        c_.get(pending);
+        c_.store(offset);
+        c_.end();
+        c_.end();
+    }
+
+    // if (left) { register = pending; left = 0; }
+    void deliver(std::uint32_t left, std::uint32_t pending, std::uint32_t offset) {
+        c_.get(left);
+        c_.open_if();
+        c_.get(kR);
+        c_.get(pending);
+        c_.store(offset);
+        c_.i32c(0);
+        c_.set(left);
+        c_.end();
+    }
+
+    // Before the instruction that produces a result: remember what the register shows now.
+    void before_result(std::uint32_t old, std::uint32_t offset) {
+        if (!delay_) return;
+        c_.get(kR);
+        c_.load(offset);
+        c_.set(old);
+    }
+
+    // After it wrote the register directly: take the result back out and start its countdown. A
+    // result that was still pending is delivered first, as the hardware stalls for it.
+    void after_result(std::uint32_t left, std::uint32_t pending, std::uint32_t old, std::uint32_t offset, std::uint32_t wait) {
+        if (!delay_) return;
+        c_.get(kR);
+        c_.get(pending);
+        c_.get(old);
+        c_.get(left);
+        c_.byte(0x1B);              // select: the pending result if one was running, else the old value
+        c_.get(kR);
+        c_.load(offset);
+        c_.set(pending);
+        c_.store(offset);
+        c_.i32c(wait);
+        c_.set(left);
+    }
+
+    // Leaving the generated code: whatever is pending is delivered.
+    void leave() {
+        if (!delay_) return;
+        deliver(kQLeft, kQPend, kOffQ);
+        deliver(kPLeft, kPPend, kOffP);
     }
 
     bool out_live(std::uint32_t pc) {
@@ -886,23 +1008,31 @@ bool Translator::lower(std::uint32_t w, std::uint32_t pc) {
             lanes_store(dest, fs);
             break;
         case 0x38:
+            before_result(kQOld, kOffQ);
             c_.get(kR);
             mem_lane(fs, fsf);
             mem_lane(ft, ftf);
             c_.call(kDiv);
+            after_result(kQLeft, kQPend, kQOld, kOffQ, 7);
             break;
         case 0x39:
+            before_result(kQOld, kOffQ);
             c_.get(kR);
             mem_lane(ft, ftf);
             c_.call(kSqrt);
+            after_result(kQLeft, kQPend, kQOld, kOffQ, 7);
             break;
         case 0x3A:
+            before_result(kQOld, kOffQ);
             c_.get(kR);
             mem_lane(fs, fsf);
             mem_lane(ft, ftf);
             c_.call(kRsqrt);
+            after_result(kQLeft, kQPend, kQOld, kOffQ, 13);
             break;
-        case 0x3B: break;
+        case 0x3B:
+            if (delay_) deliver(kQLeft, kQPend, kOffQ);
+            break;
         case 0x3C: set_vi(it, [&] { mem_lane(fs, fsf); }); break;
         case 0x3D:
             if (ft) {
@@ -992,14 +1122,20 @@ bool Translator::lower(std::uint32_t w, std::uint32_t pc) {
             vi(is);
             c_.call(kKick);
             break;
-        case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x78: case 0x79: case 0x7A: case 0x7C: case 0x7D: case 0x7E:
+        case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x78: case 0x79: case 0x7A: case 0x7C: case 0x7D: case 0x7E: {
+            bool is_p = true;
+            before_result(kPOld, kOffP);
             c_.get(kR);
             c_.i32c(index);
             c_.i32c(fs);
             c_.i32c(fsf);
             c_.call(kEfu);
+            after_result(kPLeft, kPPend, kPOld, kOffP, latency(w, is_p));
             break;
-        case 0x7B: break;
+        }
+        case 0x7B:
+            if (delay_) deliver(kPLeft, kPPend, kOffP);
+            break;
         default: return false;
         }
         return true;
@@ -1239,6 +1375,7 @@ bool Translator::run(std::vector<std::uint8_t> &out) {
         any_flags = any_flags || l.reads_flags;
         lowers_[pc] = l;
     }
+    delay_ = find_windows();
     for (std::uint32_t pc : pcs_) live_in_[pc] = false;
     for (bool changed = true; changed;) {
         changed = false;
@@ -1310,12 +1447,15 @@ bool Translator::run(std::vector<std::uint8_t> &out) {
         c_.i32c(1);
         c_.op(kOpAdd);
         c_.store(0);
+        if (delay_ && tick_q_.count(pc)) tick(kQLeft, kQPend, kOffQ);
+        if (delay_ && tick_p_.count(pc)) tick(kPLeft, kPPend, kOffP);
         upper_pre(u, flags_live);
         if (hi & 0x80000000u) {
             c_.get(kR);
             c_.i32c(lo);
             c_.store(kOffI);
         } else if (!li.supported || !lower(lo, pc)) {
+            leave();
             c_.i32c(pc);
             c_.tail(kInterpret);
         }
@@ -1355,6 +1495,7 @@ bool Translator::run(std::vector<std::uint8_t> &out) {
             if (word(prev + 4) & 0x40000000u) {
                 c_.get(kEnding);
                 c_.open_if();
+                leave();
                 c_.get(kR);
                 c_.i32c((pc + 8u) & kMask);
                 c_.store(kOffTpc);
@@ -1388,11 +1529,13 @@ bool Translator::run(std::vector<std::uint8_t> &out) {
         }
         const std::uint32_t next = (pc + 8u) & kMask;
         if (!in_.count(next)) {
+            leave();
             c_.i32c(next);
             c_.tail(kInterpret);
         }
     }
     c_.byte(0x0B);
+    leave();
     c_.get(kPcw);
     c_.i32c(3);
     c_.op(kOpShl);
