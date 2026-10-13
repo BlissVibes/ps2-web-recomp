@@ -13,6 +13,7 @@
 
 #include "ps2/state.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -50,6 +51,15 @@ struct Timer {
 
 Timer g_timers[4];
 
+// The tick a timer's pending event stands for, counted in divider periods from Timer::base: the first
+// compare or overflow that raises an interrupt. Generated code stops for events only at a backward branch
+// after its time slice is used up, so an event runs late and the counter may be past that tick by then;
+// timer_event works from the tick, not from what the counter reads when it runs.
+// Not in the state file. No event is overdue when a state is written, so on loading the tick follows from
+// the timer and the time (timer_next_tick), for the timers the state has an event for.
+constexpr std::uint64_t kNoEvent = ~0ull, kEventFromState = kNoEvent - 1;
+std::uint64_t g_timer_due[4] = {kNoEvent, kNoEvent, kNoEvent, kNoEvent};
+
 std::uint64_t timer_divider(const Timer &t) {
     switch (t.mode & 3u) {
     case 0: return 2;
@@ -59,10 +69,12 @@ std::uint64_t timer_divider(const Timer &t) {
     }
 }
 
+std::uint64_t timer_tick(const Timer &t) { return (now() - t.base) / timer_divider(t); }
+
 std::uint32_t timer_count(int n) {
     const Timer &t = g_timers[n];
     if (!(t.mode & 0x80u)) return t.frozen;
-    return static_cast<std::uint32_t>(((now() - t.base) / timer_divider(t)) & 0xFFFFu);
+    return static_cast<std::uint32_t>(timer_tick(t) & 0xFFFFu);
 }
 
 void timer_set_count(int n, std::uint32_t value) {
@@ -73,38 +85,64 @@ void timer_set_count(int n, std::uint32_t value) {
 
 void timer_schedule(int n);
 
+// Raises the compares and overflows of every tick from the one the event was set for to the one the counter
+// has reached: each of them happened, however late the event runs.
 void timer_event(int n) {
     Timer &t = g_timers[n];
     if (!(t.mode & 0x80u)) return;
-    const std::uint32_t count = timer_count(n);
-    if (count == (t.comp & 0xFFFFu)) {
+    const std::uint64_t last = timer_tick(t), first = std::min(g_timer_due[n], last);
+    const std::uint32_t comp = t.comp & 0xFFFFu;
+    const bool restarts = t.mode & 0x40u;                                // the counter goes back to 0 at its compare
+    const std::uint64_t compare = first + ((comp - first) & 0xFFFFu);    // the first tick from `first` on that reads comp
+    const std::uint64_t wrap = first + ((0 - first) & 0xFFFFu);          // and the first that reads 0
+    const bool compared = compare <= last;
+    const bool overflowed = wrap <= (compared && restarts ? compare : last) && !(restarts && comp == 0);
+    if (compared) {
         t.mode |= 0x400u;
         if (t.mode & 0x100u) intc_raise(9u + static_cast<unsigned>(n));
-        if (t.mode & 0x40u) timer_set_count(n, 0);
+        if (restarts) {
+            // It went back to 0 at the compare and every `period` ticks after that. The count goes on from
+            // the last of those, so the lateness of the event does not stretch the timer's period.
+            const std::uint64_t period = comp ? comp : 0x10000u;
+            t.base += (last - (last - compare) % period) * timer_divider(t);
+        }
     }
-    if (count == 0 && !(t.mode & 0x40u && t.comp == 0)) {
+    if (overflowed) {
         t.mode |= 0x800u;
         if (t.mode & 0x200u) intc_raise(9u + static_cast<unsigned>(n));
     }
     timer_schedule(n);
 }
 
-void timer_schedule(int n) {
-    Timer &t = g_timers[n];
-    if (!(t.mode & 0x80u) || !(t.mode & 0x300u)) {
-        schedule(kEventTimer0 + n, ~0ull, [] {});
-        return;
-    }
-    const std::uint32_t count = timer_count(n);
+// The tick of the next compare or overflow that raises an interrupt; kNoEvent when the timer raises none.
+std::uint64_t timer_next_tick(const Timer &t) {
+    if (!(t.mode & 0x80u) || !(t.mode & 0x300u)) return kNoEvent;
+    const std::uint64_t tick = timer_tick(t);
+    const std::uint32_t count = static_cast<std::uint32_t>(tick & 0xFFFFu);
     std::uint32_t to_compare = ((t.comp & 0xFFFFu) - count) & 0xFFFFu;
     if (!to_compare) to_compare = 0x10000u;
     std::uint32_t to_overflow = 0x10000u - count;
     std::uint32_t ticks = to_compare;
     if ((t.mode & 0x200u) && to_overflow < ticks) ticks = to_overflow;
     if (!(t.mode & 0x100u)) ticks = to_overflow;
-    const std::uint64_t div = timer_divider(t);
-    const std::uint64_t at = t.base + ((now() - t.base) / div + ticks) * div;
-    schedule(kEventTimer0 + n, at, [n] { timer_event(n); });
+    return tick + ticks;
+}
+
+void timer_schedule(int n) {
+    Timer &t = g_timers[n];
+    g_timer_due[n] = timer_next_tick(t);
+    if (g_timer_due[n] == kNoEvent) {
+        schedule(kEventTimer0 + n, ~0ull, [] {});
+        return;
+    }
+    schedule(kEventTimer0 + n, t.base + g_timer_due[n] * timer_divider(t), [n] { timer_event(n); });
+}
+
+// A compare or overflow the counter is already past happened before whatever the game does to the timer
+// next, though its event has not run yet.
+void timer_catch_up(int n) {
+    const Timer &t = g_timers[n];
+    if ((t.mode & 0x80u) && g_timer_due[n] < kEventFromState && timer_tick(t) >= g_timer_due[n]) timer_event(n);
 }
 
 int timer_index(std::uint32_t a) { return static_cast<int>((a >> 11) & 3u); }
@@ -124,6 +162,7 @@ void reset() {
     ipu::reset();
     g_regs.clear();
     for (Timer &t : g_timers) t = Timer{};
+    for (std::uint64_t &due : g_timer_due) due = kNoEvent;
     g_timers[3].mode = 0x183u;
 }
 
@@ -263,6 +302,7 @@ void write32(std::uint32_t a, std::uint32_t v) {
     if (is_timer(a)) {
         const int n = timer_index(a);
         Timer &t = g_timers[n];
+        timer_catch_up(n);
         switch (a & 0x30u) {
         case 0x00: timer_set_count(n, v); break;
         case 0x10: {
@@ -324,7 +364,10 @@ namespace ps2::hw {
 
 std::function<void()> event_action(int id) {
     if (id == kEventVblankEnd) return [] { intc_raise(3); };
-    if (id >= kEventTimer0 && id <= kEventTimer3) return [n = id - kEventTimer0] { timer_event(n); };
+    if (id >= kEventTimer0 && id <= kEventTimer3) {
+        g_timer_due[id - kEventTimer0] = kEventFromState;   // state() works the tick out once the timers are loaded
+        return [n = id - kEventTimer0] { timer_event(n); };
+    }
     if (id >= kEventIntcArm0 && id <= kEventIntcArmEnd) return [cause = static_cast<unsigned>(id - kEventIntcArm0)] { intc_arm(cause); };
     return [] {};
 }
@@ -339,6 +382,9 @@ void state(ps2::state::Stream &s) {
     s.map(g_regs);
     s.pod(g_crt);
     s.pod(g_timers);
+    // The runtime loads its event list before this section and asks event_action for each event's action.
+    if (s.loading())
+        for (int n = 0; n < 4; ++n) g_timer_due[n] = g_timer_due[n] == kEventFromState ? timer_next_tick(g_timers[n]) : kNoEvent;
 }
 
 }
