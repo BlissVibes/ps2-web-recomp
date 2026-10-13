@@ -222,6 +222,10 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
     const std::uint32_t op = (cmd >> 24) & 0x7Fu, imm = cmd & 0xFFFFu, num = (cmd >> 16) & 0xFFu;
     u.code = cmd;
     if (!on_vu_thread()) ++g_commands[unit][op];
+    // MSKPATH3 off directly followed by MSKPATH3 on lets one PATH3 packet through (gif.cpp). Any
+    // VIF1 code that does work in between means PATH3 stayed open, so the rest of its queue goes
+    // too. No-ops and the flushes, which only wait, do not count.
+    if (unit == 1 && !on_vu_thread() && op != 0x00 && op != 0x06 && op != 0x10 && op != 0x11 && op != 0x13) gif::path3_advance();
     switch (op) {
     case 0x00: break;
     case 0x01: u.cycle = imm; break;

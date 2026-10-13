@@ -18,6 +18,7 @@ void render_reset();
 void scan_signals(int path, const std::uint8_t *data, std::uint32_t qwc);
 bool busy(int path);
 void set_path3_mask(bool masked);   // VIF1 MSKPATH3
+void path3_advance();               // time has passed on the EE side: an unmasked PATH3 drains what it holds
 std::uint32_t read(std::uint32_t a);
 void write(std::uint32_t a, std::uint32_t v);
 

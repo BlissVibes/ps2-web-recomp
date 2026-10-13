@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -150,6 +151,65 @@ void scan(Path &p, const std::uint8_t *data, std::uint32_t qwc) {
 
 Path g_scan[4];
 
+// PATH3 masking works on GS packets, not on bytes: a mask that arrives while a packet is on its way
+// takes effect when that packet ends (the tag with EOP and its data), and lifting the mask lets
+// the next packet start at once. A game can therefore queue many packets on the GIF channel and
+// meter them out one at a time with MSKPATH3 off/on pairs in the VIF1 stream, each pair releasing
+// exactly one packet (RenderWare does this with one batch of texture uploads per packet, all
+// into the same GS memory, each followed by the geometry that uses it).
+//
+// g_cut follows the PATH3 stream as it is let through, so that the end of the current packet can
+// be found. It lives in slot 0 of g_scan, which no path uses and which is already part of the
+// saved state, so the state layout does not change: active = inside a tag's data, nloop/loop =
+// that data in qwords and how much of it has passed, eop = the tag ends the packet,
+// address_data = a packet is open (some of it has passed and its end has not).
+Path &g_cut = g_scan[0];
+
+bool trace_path3() {
+    static const bool enabled = std::getenv("PS2_TRACE_PATH3") != nullptr;
+    return enabled;
+}
+
+// How many of the qwc qwords belong to the packet the stream is in, or to the next one when it is
+// between packets. Advances g_cut past them.
+std::uint32_t packet_span(const std::uint8_t *data, std::uint32_t qwc) {
+    Path &p = g_cut;
+    std::uint32_t i = 0;
+    while (i < qwc) {
+        if (!p.active) {
+            std::uint64_t tag;
+            std::memcpy(&tag, data + static_cast<std::size_t>(i) * 16, 8);
+            const std::uint32_t nloop = static_cast<std::uint32_t>(tag) & 0x7FFFu, flg = static_cast<std::uint32_t>(tag >> 58) & 3u;
+            std::uint32_t nreg = static_cast<std::uint32_t>(tag >> 60) & 0xFu;
+            if (!nreg) nreg = 16;
+            p.eop = (tag >> 15) & 1u;
+            p.nloop = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
+            p.loop = 0;
+            p.active = p.nloop != 0;
+            p.address_data = true;
+            ++i;
+        } else {
+            const std::uint32_t take = std::min(qwc - i, p.nloop - p.loop);
+            p.loop += take;
+            i += take;
+            if (p.loop >= p.nloop) p.active = false;
+        }
+        if (!p.active && p.eop) {
+            p.address_data = false;
+            return i;
+        }
+    }
+    return i;
+}
+
+void follow(const std::uint8_t *data, std::uint32_t qwc) {
+    while (qwc) {
+        const std::uint32_t n = packet_span(data, qwc);
+        data += static_cast<std::size_t>(n) * 16;
+        qwc -= n;
+    }
+}
+
 }
 
 void reset() {
@@ -157,6 +217,7 @@ void reset() {
     g_mask_vif1 = false;
     g_mode = 0;
     g_path3_held.clear();
+    g_cut = Path{};
     if (gs::queue::active()) {
         for (Path &p : g_scan) p = Path{};
         gs::queue::post(gs::queue::kGifReset, 0, 0, nullptr, 0);
@@ -185,21 +246,58 @@ void forward(int path, const std::uint8_t *data, std::uint32_t qwc) {
     gs::queue::post(gs::queue::kGif, static_cast<std::uint32_t>(path), qwc, data, qwc * 16);
 }
 
+// Everything held goes to the GS: PATH3 has been open long enough to drain.
 void release_path3() {
     if (g_path3_held.empty()) return;
     std::vector<std::uint8_t> held = std::move(g_path3_held);
     g_path3_held.clear();
-    forward(3, held.data(), static_cast<std::uint32_t>(held.size() / 16));
+    const std::uint32_t qwc = static_cast<std::uint32_t>(held.size() / 16);
+    if (trace_path3()) std::fprintf(stderr, "[gif] path3 open: all %u held qwords pass\n", qwc);
+    follow(held.data(), qwc);
+    forward(3, held.data(), qwc);
+}
+
+// The mask has just been lifted: the first held packet starts, and nothing can stop it any more.
+void start_path3() {
+    if (g_path3_held.empty()) return;
+    const std::uint32_t total = static_cast<std::uint32_t>(g_path3_held.size() / 16);
+    const std::uint32_t n = packet_span(g_path3_held.data(), total);
+    if (trace_path3()) std::fprintf(stderr, "[gif] path3 unmasked: one packet of %u qwords passes, %u stay held\n", n, total - n);
+    if (n == total) {
+        std::vector<std::uint8_t> held = std::move(g_path3_held);
+        g_path3_held.clear();
+        forward(3, held.data(), n);
+        return;
+    }
+    forward(3, g_path3_held.data(), n);
+    g_path3_held.erase(g_path3_held.begin(), g_path3_held.begin() + static_cast<std::ptrdiff_t>(n) * 16);
 }
 
 }
 
 void transfer(int path, const std::uint8_t *data, std::uint32_t qwc) {
-    if (path == 3 && path3_masked()) {
-        g_path3_held.insert(g_path3_held.end(), data, data + static_cast<std::size_t>(qwc) * 16);
+    if (path != 3) {
+        forward(path, data, qwc);
         return;
     }
-    forward(path, data, qwc);
+    if (!path3_masked()) {
+        release_path3();
+        follow(data, qwc);
+        forward(3, data, qwc);
+        return;
+    }
+    // Masked. The rest of a packet that was already on its way still passes; whole packets wait.
+    if (g_path3_held.empty() && g_cut.address_data) {
+        const std::uint32_t n = packet_span(data, qwc);
+        forward(3, data, n);
+        data += static_cast<std::size_t>(n) * 16;
+        qwc -= n;
+    }
+    g_path3_held.insert(g_path3_held.end(), data, data + static_cast<std::size_t>(qwc) * 16);
+}
+
+void path3_advance() {
+    if (!g_path3_held.empty() && !path3_masked()) release_path3();
 }
 
 void scan_signals(int path, const std::uint8_t *data, std::uint32_t qwc) { scan(g_scan[path], data, qwc); }
@@ -214,12 +312,15 @@ void stats() {
 }
 
 void set_path3_mask(bool masked) {
+    const bool was = path3_masked();
     g_mask_vif1 = masked;
-    if (!path3_masked()) release_path3();
+    if (trace_path3()) std::fprintf(stderr, "[gif] mskpath3 %d, %zu qwords held\n", masked ? 1 : 0, g_path3_held.size() / 16);
+    if (was && !path3_masked()) start_path3();
 }
 
 std::uint32_t read(std::uint32_t a) {
     if ((a & 0xF0u) != 0x20u) return 0;
+    path3_advance();   // the EE had time to come and look: an open PATH3 has drained
     const std::uint32_t held = static_cast<std::uint32_t>(g_path3_held.size() / 16);
     const std::uint32_t fqc = std::min(held, kGifFifoQwords);
     return g_stat | (g_mode & 5u) | (g_mask_vif1 ? 2u : 0u) | (held ? (1u << 6) : 0u) | (fqc << 24);
@@ -228,8 +329,9 @@ std::uint32_t read(std::uint32_t a) {
 void write(std::uint32_t a, std::uint32_t v) {
     if ((a & 0xF0u) == 0x00u && (v & 1u)) reset();
     if ((a & 0xF0u) == 0x10u) {
+        const bool was = path3_masked();
         g_mode = v & 5u;
-        if (!path3_masked()) release_path3();
+        if (was && !path3_masked()) start_path3();
     }
 }
 
