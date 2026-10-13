@@ -30,6 +30,22 @@ constexpr std::uint32_t kInputHalf = 0x100;
 // MMIX, from bit 11 down: voices, input and external input (core 0's output, on core 1) into the core's
 // output, each as dry left, dry right, effects left, effects right.
 constexpr std::uint32_t kVmixl = 0x188, kVmixel = 0x18C, kVmixr = 0x190, kVmixer = 0x194, kMmix = 0x198;
+// Reverb registers of a core. The work area is SPU2 RAM from ESA to the end of the 64K block EEA names.
+// From kReverbAddress on, 22 offsets into the work area (two halfwords each, high first), named here as
+// in the published description of the PlayStation SPU reverb: d = a source, m = a destination.
+constexpr std::uint32_t kEsa = 0x2E0, kReverbAddress = 0x2E4, kEea = 0x33C;
+enum ReverbAddress {
+    kApf1Size, kApf2Size, kSameDst, kSameDstR, kComb1, kComb1R, kComb2, kComb2R, kSameSrc, kSameSrcR, kDiffDst, kDiffDstR,
+    kComb3, kComb3R, kComb4, kComb4R, kDiffSrc, kDiffSrcR, kApf1Dst, kApf1DstR, kApf2Dst, kApf2DstR, kReverbAddresses
+};
+// The ten reverb gains follow the volumes in a core's volume block (0x774 for core 0, 0x79C for core 1).
+enum ReverbGain { kIirGain, kComb1Gain, kComb2Gain, kComb3Gain, kComb4Gain, kWallGain, kApf1Gain, kApf2Gain, kInputGain, kInputGainR, kReverbGains };
+// The reverb runs at half the sample rate, one side per output sample. This half-band filter halves the
+// rate of its input and doubles the rate of its output (every second coefficient is 0).
+constexpr int kReverbTaps = 39;
+constexpr std::int32_t kReverbFilter[kReverbTaps] = {-1, 0, 2, 0, -10, 0, 35, 0, -103, 0, 266, 0, -616, 0, 1332, 0, -2960, 0, 10246, 16384,
+                                                     10246, 0, -2960, 0, 1332, 0, -616, 0, 266, 0, -103, 0, 35, 0, -10, 0, 2, 0, -1};
+constexpr unsigned kReverbHistory = 64;
 constexpr unsigned kSpuLine = 9;
 // The mixer's write-back areas in SPU2 RAM (halfword addresses). Every output sample each core
 // stores voice 1 and voice 3 (after ADSR) and its dry and wet L/R voice mixes, and core 0 stores its
@@ -74,6 +90,12 @@ struct Voice {
     std::uint32_t position = 0;
 };
 
+struct Reverb {
+    std::uint16_t gain[kReverbGains] = {};
+    std::int16_t down[2][kReverbHistory] = {}, up[2][kReverbHistory] = {};   // [side]: input and output of the half-rate network
+    std::uint32_t at = 0;                                                    // newest entry of the histories
+};
+
 struct Transfer {
     std::uint32_t madr = 0, bytes = 0;
     int channel = -1;
@@ -89,6 +111,7 @@ struct Core {
     unsigned input_read = 0, input_count = 0;   // input_count: frames ahead of the output position that auto-DMA has filled
     std::deque<Transfer> transfers;
     std::uint16_t regs[0x200] = {};
+    Reverb reverb;
 };
 
 std::vector<std::uint16_t> g_ram(kRamWords);
@@ -100,6 +123,7 @@ std::function<void(const std::int16_t *, std::size_t)> g_sink;
 std::uint64_t g_next_tick = 0;
 bool g_tick_pending = false;
 std::uint32_t g_out_pos = 0;
+std::uint32_t g_samples = 0;   // output samples since reset: the reverb's clock
 
 void check_irq(std::uint32_t address, std::uint32_t words) {
     for (Core &k : g_cores) {
@@ -246,6 +270,75 @@ std::int16_t clamp16(std::int32_t value) { return static_cast<std::int16_t>(std:
 
 std::uint32_t switches(const Core &k, std::uint32_t off) { return k.regs[off >> 1] | static_cast<std::uint32_t>(k.regs[(off + 2) >> 1]) << 16; }
 
+std::int32_t scale(std::int32_t value, std::int32_t gain) { return static_cast<std::int32_t>((static_cast<std::int64_t>(value) * gain) >> 15); }
+
+std::int32_t reverb_filter(const std::int16_t *history, unsigned newest) {
+    std::int32_t sum = kReverbFilter[kReverbTaps / 2] * history[(newest - kReverbTaps / 2) % kReverbHistory];
+    for (int i = 0; i < kReverbTaps; i += 2) sum += kReverbFilter[i] * history[(newest - (kReverbTaps - 1) + i) % kReverbHistory];
+    return sum;
+}
+
+// A core's reverb for one batch: in is its effects mix, out what comes back (before EVOL). Each output
+// sample one side of the network runs, left on even samples: two reflection filters (same side, and
+// fed from the other side), four combs and two all-pass filters, all in the work area, whose origin
+// moves on one halfword every two samples. The network always runs and is heard; it writes to the work
+// area, and tests the address IRQ there, only while the core's effects are enabled (ATTR bit 7).
+void render_reverb(Core &k, const std::int32_t (*in)[2], std::int32_t (*out)[2]) {
+    const std::uint32_t start = (static_cast<std::uint32_t>(k.regs[kEsa >> 1]) << 16 | k.regs[(kEsa + 2) >> 1]) & kRamMask;
+    const std::uint32_t end = (static_cast<std::uint32_t>(k.regs[kEea >> 1]) << 16 | 0xFFFFu) & kRamMask;
+    const bool enabled = k.attr & 0x80u;
+    if (start >= end || (!enabled && !k.evol[0] && !k.evol[1])) return;
+    const std::int64_t size = end - start + 1;
+    std::int64_t offset[kReverbAddresses];
+    for (int i = 0; i < kReverbAddresses; ++i)
+        offset[i] = static_cast<std::uint32_t>(k.regs[(kReverbAddress + i * 4) >> 1]) << 16 | k.regs[(kReverbAddress + i * 4 + 2) >> 1];
+    bool watched = false;
+    for (const Core &other : g_cores) watched = watched || (enabled && (other.attr & 0x40u) && !other.irq && other.irqa >= start && other.irqa <= end);
+    Reverb &r = k.reverb;
+    std::int32_t gain[kReverbGains];
+    for (int i = 0; i < kReverbGains; ++i) gain[i] = static_cast<std::int16_t>(r.gain[i]);
+    for (unsigned n = 0; n < kBatch; ++n) {
+        const std::uint32_t clock = g_samples + n;
+        const int side = clock & 1;
+        const std::int64_t origin = clock >> 1;
+        const auto at = [&](std::int64_t relative) {
+            const std::uint32_t address = start + static_cast<std::uint32_t>((((origin + relative) % size) + size) % size);
+            if (watched) check_irq(address, 1);
+            return address;
+        };
+        r.at = (r.at + 1) % kReverbHistory;
+        r.down[0][r.at] = clamp16(in[n][0]);
+        r.down[1][r.at] = clamp16(in[n][1]);
+        const std::int32_t input = scale(clamp16(reverb_filter(r.down[side], r.at) >> 15), gain[kInputGain + side]);
+        const auto sample = [&](std::uint32_t address) { return static_cast<std::int32_t>(static_cast<std::int16_t>(g_ram[address])); };
+        const std::uint32_t same_dst = at(offset[kSameDst + side]), same_old = at(offset[kSameDst + side] - 1);
+        const std::uint32_t diff_dst = at(offset[kDiffDst + side]), diff_old = at(offset[kDiffDst + side] - 1);
+        const std::int32_t same = scale(input + scale(sample(at(offset[kSameSrc + side])), gain[kWallGain]) - sample(same_old), gain[kIirGain]) + sample(same_old);
+        const std::int32_t diff = scale(input + scale(sample(at(offset[kDiffSrc + (side ^ 1)])), gain[kWallGain]) - sample(diff_old), gain[kIirGain]) + sample(diff_old);
+        std::int32_t mix = 0;
+        for (int comb = 0; comb < 4; ++comb) {
+            static const int kSource[4] = {kComb1, kComb2, kComb3, kComb4};
+            mix += scale(sample(at(offset[kSource[comb] + side])), gain[kComb1Gain + comb]);
+        }
+        const std::uint32_t apf1_dst = at(offset[kApf1Dst + side]), apf1_src = at(offset[kApf1Dst + side] - offset[kApf1Size]);
+        const std::uint32_t apf2_dst = at(offset[kApf2Dst + side]), apf2_src = at(offset[kApf2Dst + side] - offset[kApf2Size]);
+        const std::int32_t apf1 = mix - scale(sample(apf1_src), gain[kApf1Gain]);
+        mix = sample(apf1_src) + scale(apf1, gain[kApf1Gain]);
+        const std::int32_t apf2 = mix - scale(sample(apf2_src), gain[kApf2Gain]);
+        mix = sample(apf2_src) + scale(apf2, gain[kApf2Gain]);
+        if (enabled) {
+            g_ram[same_dst] = static_cast<std::uint16_t>(clamp16(same));
+            g_ram[diff_dst] = static_cast<std::uint16_t>(clamp16(diff));
+            g_ram[apf1_dst] = static_cast<std::uint16_t>(clamp16(apf1));
+            g_ram[apf2_dst] = static_cast<std::uint16_t>(clamp16(apf2));
+        }
+        r.up[side][r.at] = clamp16(mix);
+        r.up[side ^ 1][r.at] = 0;
+        out[n][0] = clamp16(reverb_filter(r.up[0], r.at) >> 14);
+        out[n][1] = clamp16(reverb_filter(r.up[1], r.at) >> 14);
+    }
+}
+
 void write_area(std::uint32_t area, const std::int16_t *values) {
     const std::uint32_t at = area + g_out_pos;
     check_irq(at, kBatch);
@@ -289,17 +382,22 @@ void tick() {
         check_irq(input, kBatch);
         check_irq(input + kOutputRing, kBatch);
         const std::uint16_t mmix = k.regs[kMmix >> 1];
+        std::int32_t mix[kBatch][2] = {}, effects[kBatch][2] = {}, returned[kBatch][2] = {};
         for (unsigned n = 0; n < kBatch; ++n)
             for (int side = 0; side < 2; ++side) {
-                std::int32_t mix = 0;
-                if (mmix & (0x800u >> side)) mix += dry[c][side][n];
-                if (mmix & (0x080u >> side)) mix += static_cast<std::int16_t>(g_ram[input + side * kOutputRing + n]) * static_cast<std::int16_t>(k.bvol[side]) >> 15;
-                if (c == 1 && (mmix & (0x008u >> side))) mix += core0[side][n] * static_cast<std::int16_t>(k.avol[side]) >> 15;
-                // The effects mix (the same three sources by their effects switches) would come back here
-                // through the reverb, scaled by EVOL. Reverb is not modelled, so nothing comes back.
-                mix = mix * master(k.mvol[side]) >> 15;
-                if (c == 0) core0[side][n] = clamp16(mix);
-                else out[n * 2 + side] = clamp16(mix);
+                const std::int32_t sources[3] = {dry[c][side][n], static_cast<std::int16_t>(g_ram[input + side * kOutputRing + n]) * static_cast<std::int16_t>(k.bvol[side]) >> 15,
+                                                 c == 1 ? core0[side][n] * static_cast<std::int16_t>(k.avol[side]) >> 15 : 0};
+                for (int source = 0; source < 3; ++source) {
+                    if (mmix & (0x800u >> (source * 4 + side))) mix[n][side] += sources[source];
+                    if (mmix & (0x200u >> (source * 4 + side))) effects[n][side] += source ? sources[source] : wet[c][side][n];
+                }
+            }
+        render_reverb(k, effects, returned);
+        for (unsigned n = 0; n < kBatch; ++n)
+            for (int side = 0; side < 2; ++side) {
+                const std::int32_t sum = (mix[n][side] + scale(returned[n][side], static_cast<std::int16_t>(k.evol[side]))) * master(k.mvol[side]) >> 15;
+                if (c == 0) core0[side][n] = clamp16(sum);
+                else out[n * 2 + side] = clamp16(sum);
             }
     }
     if (count && ++ticks % 15000 == 0)
@@ -321,6 +419,7 @@ void tick() {
         g_cores[c].input_count -= std::min(g_cores[c].input_count, kBatch);
     }
     g_out_pos = (g_out_pos + kBatch) % kOutputRing;
+    g_samples += kBatch;
     feed_input(0);
     feed_input(1);
     g_next_tick += kBatch * kCyclesPerSample;
@@ -477,7 +576,7 @@ std::uint16_t *master_reg(int core, std::uint32_t off) {
     case 0xA: return &k.avol[1];
     case 0xC: return &k.bvol[0];
     case 0xE: return &k.bvol[1];
-    default: return nullptr;
+    default: return off >= 0x14u ? &k.reverb.gain[(off - 0x14u) >> 1] : nullptr;
     }
 }
 
@@ -512,7 +611,10 @@ void reset() {
             k.regs[(off + 2) >> 1] = 0x00FF;
         }
         k.regs[kMmix >> 1] = 0xFFCF;
+        k.regs[kEsa >> 1] = k.regs[kEea >> 1] = static_cast<std::uint16_t>(0xE + (&k - g_cores));
+        k.regs[(kEsa + 2) >> 1] = 0xFFF8;
     }
+    g_samples = 0;
     g_spdif_out = g_spdif_mode = g_spdif_media = 0;
     g_audio.clear();
     g_record = std::getenv("PS2_DUMP_AUDIO") != nullptr;
@@ -546,6 +648,8 @@ void write(std::uint32_t a, std::uint32_t v, unsigned size) {
     v &= 0xFFFFu;
     if (off < 0x760u) write_core((off & 0x400u) ? 1 : 0, off & 0x3FEu, v);
     else if (off < 0x7B0u) {
+        static const bool trace = std::getenv("PS2_TRACE_SPU2") != nullptr;
+        if (trace) std::fprintf(stderr, "[spu2] core %u volume block 0x%02X = 0x%04X\n", (off - 0x760u) / 0x28, (off - 0x760u) % 0x28, v);
         if (std::uint16_t *reg = master_reg((off - 0x760u) / 0x28, (off - 0x760u) % 0x28)) *reg = static_cast<std::uint16_t>(v);
     } else write_global(off, v);
 }
@@ -625,6 +729,8 @@ void state(ps2::state::Stream &s) {
             s.pod(t.channel);
         });
         s.pod(k.regs);
+        if (s.version >= 5) s.pod(k.reverb);
+        else if (s.loading()) k.reverb = Reverb{};
     }
     s.pod(g_spdif_out);
     s.pod(g_spdif_mode);
@@ -632,6 +738,8 @@ void state(ps2::state::Stream &s) {
     s.pod(g_next_tick);
     s.pod(g_tick_pending);
     s.pod(g_out_pos);
+    if (s.version >= 5) s.pod(g_samples);
+    else if (s.loading()) g_samples = 0;
 }
 
 }

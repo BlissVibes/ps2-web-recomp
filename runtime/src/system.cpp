@@ -216,7 +216,6 @@ bool halted() { return g_halted; }
 namespace {
 
 constexpr char kStateMagic[8] = {'P', 'S', '2', 'S', 'T', 'A', 'T', 'E'};
-constexpr std::uint32_t kStateVersion = 4;
 
 std::function<void()> event_action(int id) {
     if (id == hw::kEventVblank) return vblank;
@@ -238,10 +237,11 @@ void machine_state(state::Stream &s) {
     char magic[8];
     std::memcpy(magic, kStateMagic, sizeof magic);
     s.bytes(magic, sizeof magic);
-    std::uint32_t version = kStateVersion;
+    std::uint32_t version = state::kVersion;
     s.pod(version);
     if (std::memcmp(magic, kStateMagic, sizeof magic) != 0) throw std::runtime_error("not a state file");
-    if (version != kStateVersion) throw std::runtime_error("state file from another version");
+    if (version < state::kOldestVersion || version > state::kVersion) throw std::runtime_error("state file from another version");
+    s.version = version;
     s.tag("ee");
     s.pod(g_cpu);
     s.bytes(g_ram, kRamSize);
@@ -311,7 +311,7 @@ bool load_state(const std::string &path) {
 }
 
 std::uint64_t frame_count() { return g_frames; }
-std::uint32_t state_version() { return kStateVersion; }
+std::uint32_t state_version() { return state::kVersion; }
 
 bool load_elf(const std::string &path, std::uint32_t &entry) {
     std::ifstream file(path, std::ios::binary);

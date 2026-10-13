@@ -13,8 +13,13 @@
 
 namespace ps2::state {
 
+// The version state files are written with, and the oldest one still read. A section whose layout has
+// grown tests Stream::version for the fields that older files do not have.
+inline constexpr std::uint32_t kVersion = 5, kOldestVersion = 4;
+
 class Stream {
 public:
+    std::uint32_t version = kVersion;   // of the file being read; kVersion when saving
     explicit Stream(bool saving) : saving_(saving) {}
     virtual ~Stream() = default;
     bool saving() const { return saving_; }
