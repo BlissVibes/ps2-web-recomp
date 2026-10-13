@@ -22,12 +22,20 @@ constexpr std::uint32_t kRamMask = kRamWords - 1;
 constexpr std::uint64_t kCyclesPerSample = 768;
 constexpr unsigned kBatch = 32;
 constexpr unsigned kInputFrames = 512;
+// A core's sound-data input area in SPU2 RAM: a ring of 0x200 left samples, then 0x200 right samples. The mixer
+// plays it at the output position, whoever wrote it; auto-DMA fills it a half (0x100 frames) at a time.
 constexpr std::uint32_t kInputBase[2] = {0x2000u, 0x2400u};
+constexpr std::uint32_t kInputHalf = 0x100;
+// Mix switches of a core. VMIX*: one bit per voice, to the dry mix (L, R) and to the effects (EL, ER).
+// MMIX, from bit 11 down: voices, input and external input (core 0's output, on core 1) into the core's
+// output, each as dry left, dry right, effects left, effects right.
+constexpr std::uint32_t kVmixl = 0x188, kVmixel = 0x18C, kVmixr = 0x190, kVmixer = 0x194, kMmix = 0x198;
 constexpr unsigned kSpuLine = 9;
 // The mixer's write-back areas in SPU2 RAM (halfword addresses). Every output sample each core
-// stores voice 1 and voice 3 (after ADSR) and its dry and wet L/R mixes, and core 0 stores its final
-// L/R output, each at area + output position (a 0x200-halfword ring). Software uses these as a clock
-// by pointing IRQA into one of them; the address IRQ fires when the mixer writes there.
+// stores voice 1 and voice 3 (after ADSR) and its dry and wet L/R voice mixes, and core 0 stores its
+// final L/R output, each at area + output position (a 0x200-halfword ring). Software uses these as a
+// clock by pointing IRQA into one of them (the address IRQ fires when the mixer writes there), and
+// reads the mixes back by DMA to process them itself.
 constexpr std::uint32_t kOutputRing = 0x200;
 constexpr std::uint32_t kVoice1Area[2] = {0x0400u, 0x0C00u};
 constexpr std::uint32_t kVoice3Area[2] = {0x0600u, 0x0E00u};
@@ -77,8 +85,8 @@ struct Core {
     std::uint32_t irqa = 0x800u, tsa = 0;
     std::uint16_t mvol[2] = {0x3FFF, 0x3FFF}, bvol[2] = {0x7FFF, 0x7FFF}, avol[2] = {0x7FFF, 0x7FFF}, evol[2] = {};
     bool irq = false;
-    std::int16_t input[kInputFrames][2] = {};
-    unsigned input_read = 0, input_count = 0;
+    std::int16_t input[kInputFrames][2] = {};   // not used any more; kept, with input_read, so saved states keep their layout
+    unsigned input_read = 0, input_count = 0;   // input_count: frames ahead of the output position that auto-DMA has filled
     std::deque<Transfer> transfers;
     std::uint16_t regs[0x200] = {};
 };
@@ -176,14 +184,17 @@ std::int32_t volume(std::uint16_t reg, Envelope &e) {
     return e.level;
 }
 
-void render_voice(Voice &v, std::int32_t (*sum)[2], std::int16_t *capture) {
+// One batch of a voice: its left and right samples after the envelope and the voice volumes. The volume
+// sweeps step every sample whether the voice plays or not.
+void render_voice(Voice &v, std::int32_t (*voice)[2], std::int16_t *capture) {
     if (v.key_on) key_on(v);
     const std::uint32_t step = std::min<std::uint32_t>(v.pitch, 0x3FFFu);
     const bool sweep_l = v.voll & 0x8000u, sweep_r = v.volr & 0x8000u;
     const std::int32_t fixed_l = static_cast<std::int16_t>(v.voll << 1), fixed_r = static_cast<std::int16_t>(v.volr << 1);
     std::uint32_t position = v.position;
     for (unsigned n = 0; n < kBatch; ++n) {
-        if (v.phase == kOff) break;
+        const std::int32_t left = sweep_l ? volume(v.voll, v.vol[0]) : fixed_l, right = sweep_r ? volume(v.volr, v.vol[1]) : fixed_r;
+        if (v.phase == kOff) continue;
         const std::uint32_t index = position >> 12, frac = position & 0xFFFu;
         const std::int32_t sample = (v.buffer[index] * static_cast<std::int32_t>(0x1000 - frac) + v.buffer[index + 1] * static_cast<std::int32_t>(frac)) >> 12;
         position += step;
@@ -198,54 +209,42 @@ void render_voice(Voice &v, std::int32_t (*sum)[2], std::int16_t *capture) {
         update_envelope(v);
         const std::int32_t out = sample * v.env.level >> 15;
         if (capture) capture[n] = static_cast<std::int16_t>(std::clamp(out, -32768, 32767));
-        sum[n][0] += out * (sweep_l ? volume(v.voll, v.vol[0]) : fixed_l) >> 15;
-        sum[n][1] += out * (sweep_r ? volume(v.volr, v.vol[1]) : fixed_r) >> 15;
+        voice[n][0] = out * left >> 15;
+        voice[n][1] = out * right >> 15;
     }
     v.position = position;
 }
 
+// Auto-DMA: each block of a transfer (0x100 left samples, then 0x100 right) goes into the half of the
+// input area that is not being played, one block per half.
 void feed_input(int core) {
     Core &k = g_cores[core];
-    while (!k.transfers.empty() && k.input_count + 256 <= kInputFrames) {
-        Transfer &t = k.transfers.front();
-        const std::uint32_t chunk = std::min<std::uint32_t>(t.bytes, 1024);
-        const std::uint32_t frames = std::max<std::uint32_t>(chunk / 4, 1);
-        const std::uint8_t *src = ram_ptr(t.madr);
-        for (std::uint32_t i = 0; i < frames; ++i) {
-            std::int16_t l, r;
-            std::memcpy(&l, src + i * 2, 2);
-            std::memcpy(&r, src + chunk / 2 + i * 2, 2);
-            const unsigned slot = (k.input_read + k.input_count + i) % kInputFrames;
-            k.input[slot][0] = l;
-            k.input[slot][1] = r;
-            g_ram[kInputBase[core] + slot] = static_cast<std::uint16_t>(l);
-            g_ram[kInputBase[core] + 0x200 + slot] = static_cast<std::uint16_t>(r);
-        }
-        k.input_count += frames;
-        t.madr += chunk;
-        t.bytes -= chunk;
-        if (!t.bytes) {
-            const int channel = t.channel;
-            k.transfers.pop_front();
-            if (channel >= 0) kernel::schedule(kernel::now() + 32, kernel::Job{kernel::kJobDmaDone, static_cast<std::uint32_t>(channel)});
-        }
+    const std::uint32_t rest = kInputHalf - g_out_pos % kInputHalf;   // frames left in the half being played
+    if (k.transfers.empty() || k.input_count > rest) return;
+    Transfer &t = k.transfers.front();
+    const std::uint32_t chunk = std::min<std::uint32_t>(t.bytes, 1024);
+    const std::uint32_t frames = std::max<std::uint32_t>(chunk / 4, 1);
+    const std::uint32_t at = kInputBase[core] + (g_out_pos / kInputHalf ^ 1u) * kInputHalf;
+    const std::uint8_t *src = ram_ptr(t.madr);
+    for (std::uint32_t i = 0; i < frames; ++i) {
+        std::memcpy(&g_ram[at + i], src + i * 2, 2);
+        std::memcpy(&g_ram[at + kOutputRing + i], src + chunk / 2 + i * 2, 2);
     }
-}
-
-void render_input(int core, std::int32_t &left, std::int32_t &right) {
-    Core &k = g_cores[core];
-    if (!k.input_count) return;
-    const unsigned slot = k.input_read;
-    check_irq(kInputBase[core] + slot, 1);
-    left += k.input[slot][0] * static_cast<std::int16_t>(k.bvol[0]) >> 15;
-    right += k.input[slot][1] * static_cast<std::int16_t>(k.bvol[1]) >> 15;
-    k.input_read = (k.input_read + 1) % kInputFrames;
-    --k.input_count;
+    k.input_count = rest + frames;
+    t.madr += chunk;
+    t.bytes -= chunk;
+    if (!t.bytes) {
+        const int channel = t.channel;
+        k.transfers.pop_front();
+        if (channel >= 0) kernel::schedule(kernel::now() + 32, kernel::Job{kernel::kJobDmaDone, static_cast<std::uint32_t>(channel)});
+    }
 }
 
 std::int32_t master(std::uint16_t reg) { return reg & 0x8000u ? 0x7FFF : static_cast<std::int16_t>(reg << 1); }
 
 std::int16_t clamp16(std::int32_t value) { return static_cast<std::int16_t>(std::clamp(value, -32768, 32767)); }
+
+std::uint32_t switches(const Core &k, std::uint32_t off) { return k.regs[off >> 1] | static_cast<std::uint32_t>(k.regs[(off + 2) >> 1]) << 16; }
 
 void write_area(std::uint32_t area, const std::int16_t *values) {
     const std::uint32_t at = area + g_out_pos;
@@ -255,43 +254,53 @@ void write_area(std::uint32_t area, const std::int16_t *values) {
 
 void tick() {
     std::int16_t out[kBatch * 2];
-    std::int32_t sum[2][kBatch][2] = {};
     std::int16_t raw[2][2][kBatch] = {};   // [core][voice 1, voice 3][sample], 0 while the voice is off
-    std::int16_t dry[2][2][kBatch] = {};   // [core][left, right][sample], the voice mix before the input
-    std::int16_t wet[2][kBatch] = {};      // reverb is not modelled, so the wet mixes are silence
-    std::int16_t core0[2][kBatch] = {};    // core 0 output after its master volume
+    std::int16_t dry[2][2][kBatch];        // [core][left, right][sample], the voices switched to the dry mix
+    std::int16_t wet[2][2][kBatch];        // the voices switched to the effects
+    std::int16_t core0[2][kBatch] = {};    // core 0 output after its master volume: the external input of core 1
     static const bool count = std::getenv("PS2_SPU2_COUNT") != nullptr;
     static std::uint64_t ticks = 0, active = 0, phases[5] = {};
     for (int c = 0; c < 2; ++c) {
+        Core &k = g_cores[c];
+        const std::uint32_t to[4] = {switches(k, kVmixl), switches(k, kVmixr), switches(k, kVmixel), switches(k, kVmixer)};
+        std::int32_t sum[kBatch][4] = {};   // dry left, dry right, effects left, effects right
         for (int i = 0; i < 24; ++i) {
-            Voice &v = g_cores[c].voices[i];
-            if (!v.key_on && v.phase == kOff) continue;
-            if (count) {
+            Voice &v = k.voices[i];
+            const bool playing = v.key_on || v.phase != kOff;
+            if (!playing && !((v.voll | v.volr) & 0x8000u)) continue;
+            if (count && playing) {
                 ++active;
                 ++phases[v.phase];
             }
-            render_voice(v, sum[c], i == 1 ? raw[c][0] : i == 3 ? raw[c][1] : nullptr);
-        }
-        for (unsigned n = 0; n < kBatch; ++n) {
-            dry[c][0][n] = clamp16(sum[c][n][0]);
-            dry[c][1][n] = clamp16(sum[c][n][1]);
-        }
-        for (unsigned n = 0; n < kBatch; ++n) render_input(c, sum[c][n][0], sum[c][n][1]);
-    }
-    for (unsigned n = 0; n < kBatch; ++n) {
-        std::int32_t mix[2] = {};
-        for (int c = 0; c < 2; ++c) {
-            const std::int32_t left = sum[c][n][0] * master(g_cores[c].mvol[0]) >> 15;
-            const std::int32_t right = sum[c][n][1] * master(g_cores[c].mvol[1]) >> 15;
-            if (c == 0) {
-                core0[0][n] = clamp16(left);
-                core0[1][n] = clamp16(right);
+            std::int32_t voice[kBatch][2] = {};
+            render_voice(v, voice, i == 1 ? raw[c][0] : i == 3 ? raw[c][1] : nullptr);
+            if (!playing) continue;
+            for (int m = 0; m < 4; ++m) {
+                if (!(to[m] & (1u << i))) continue;
+                for (unsigned n = 0; n < kBatch; ++n) sum[n][m] += voice[n][m & 1];
             }
-            mix[0] += left;
-            mix[1] += right;
         }
-        out[n * 2] = static_cast<std::int16_t>(std::clamp(mix[0], -32768, 32767));
-        out[n * 2 + 1] = static_cast<std::int16_t>(std::clamp(mix[1], -32768, 32767));
+        for (unsigned n = 0; n < kBatch; ++n)
+            for (int side = 0; side < 2; ++side) {
+                dry[c][side][n] = clamp16(sum[n][side]);
+                wet[c][side][n] = clamp16(sum[n][2 + side]);
+            }
+        const std::uint32_t input = kInputBase[c] + g_out_pos;
+        check_irq(input, kBatch);
+        check_irq(input + kOutputRing, kBatch);
+        const std::uint16_t mmix = k.regs[kMmix >> 1];
+        for (unsigned n = 0; n < kBatch; ++n)
+            for (int side = 0; side < 2; ++side) {
+                std::int32_t mix = 0;
+                if (mmix & (0x800u >> side)) mix += dry[c][side][n];
+                if (mmix & (0x080u >> side)) mix += static_cast<std::int16_t>(g_ram[input + side * kOutputRing + n]) * static_cast<std::int16_t>(k.bvol[side]) >> 15;
+                if (c == 1 && (mmix & (0x008u >> side))) mix += core0[side][n] * static_cast<std::int16_t>(k.avol[side]) >> 15;
+                // The effects mix (the same three sources by their effects switches) would come back here
+                // through the reverb, scaled by EVOL. Reverb is not modelled, so nothing comes back.
+                mix = mix * master(k.mvol[side]) >> 15;
+                if (c == 0) core0[side][n] = clamp16(mix);
+                else out[n * 2 + side] = clamp16(mix);
+            }
     }
     if (count && ++ticks % 15000 == 0)
         std::fprintf(stderr, "[spu2] %.1f voices per batch (attack %.1f decay %.1f sustain %.1f release %.1f)\n", static_cast<double>(active) / ticks,
@@ -303,12 +312,13 @@ void tick() {
         write_area(kVoice3Area[c], raw[c][1]);
         write_area(kDryArea[c][0], dry[c][0]);
         write_area(kDryArea[c][1], dry[c][1]);
-        write_area(kWetArea[c][0], wet[0]);
-        write_area(kWetArea[c][1], wet[1]);
+        write_area(kWetArea[c][0], wet[c][0]);
+        write_area(kWetArea[c][1], wet[c][1]);
         if (c == 0) {
             write_area(kCore0OutArea[0], core0[0]);
             write_area(kCore0OutArea[1], core0[1]);
         }
+        g_cores[c].input_count -= std::min(g_cores[c].input_count, kBatch);
     }
     g_out_pos = (g_out_pos + kBatch) % kOutputRing;
     feed_input(0);
@@ -495,7 +505,14 @@ void write_global(std::uint32_t off, std::uint32_t value) {
 void reset() {
     kernel::register_job(kernel::kJobSpuTick, [](const kernel::Job &) { tick(); });
     std::fill(g_ram.begin(), g_ram.end(), 0);
-    for (Core &k : g_cores) k = Core{};
+    for (Core &k : g_cores) {
+        k = Core{};
+        for (std::uint32_t off : {kVmixl, kVmixel, kVmixr, kVmixer}) {
+            k.regs[off >> 1] = 0xFFFF;
+            k.regs[(off + 2) >> 1] = 0x00FF;
+        }
+        k.regs[kMmix >> 1] = 0xFFCF;
+    }
     g_spdif_out = g_spdif_mode = g_spdif_media = 0;
     g_audio.clear();
     g_record = std::getenv("PS2_DUMP_AUDIO") != nullptr;
@@ -536,6 +553,10 @@ void write(std::uint32_t a, std::uint32_t v, unsigned size) {
 void dma(int core, std::uint32_t madr, std::uint32_t words, bool to_spu, int channel) {
     keep_ticking();
     Core &k = g_cores[core];
+    static const bool trace = std::getenv("PS2_TRACE_SPU2") != nullptr;
+    if (trace)
+        std::fprintf(stderr, "[spu2] core %d dma %s 0x%05X, %u halfwords%s, output position 0x%03X\n", core, to_spu ? "write to" : "read from", k.tsa, words * 2,
+                     to_spu && (k.admas & (1u << core)) ? " (auto)" : "", g_out_pos);
     if (to_spu && (k.admas & (1u << core))) {
         k.transfers.push_back(Transfer{madr, words * 4, channel});
         feed_input(core);
