@@ -337,9 +337,9 @@ void fast_upper(Vu0Regs &r, const Decoded &d, UpperOut &o) {
         o.value.w[2] = fout(norm(fin(s.w[0]) * fin(t.w[1])));
         return;
     case kOpmsub:
-        o.value.w[0] = fout(fin(r.acc.w[0]) - norm(fin(s.w[1]) * fin(t.w[2])));
-        o.value.w[1] = fout(fin(r.acc.w[1]) - norm(fin(s.w[2]) * fin(t.w[0])));
-        o.value.w[2] = fout(fin(r.acc.w[2]) - norm(fin(s.w[0]) * fin(t.w[1])));
+        o.value.w[0] = fout(vuops::add_vu(fin(r.acc.w[0]), -norm(fin(s.w[1]) * fin(t.w[2]))));
+        o.value.w[1] = fout(vuops::add_vu(fin(r.acc.w[1]), -norm(fin(s.w[2]) * fin(t.w[0]))));
+        o.value.w[2] = fout(vuops::add_vu(fin(r.acc.w[2]), -norm(fin(s.w[0]) * fin(t.w[1]))));
         return;
     default: break;
     }
@@ -351,11 +351,11 @@ void fast_upper(Vu0Regs &r, const Decoded &d, UpperOut &o) {
     case kI: for (int i = 0; i < 4; ++i) b[i] = r.i; break;
     }
     switch (d.kind) {
-    case kAdd: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(fin(s.w[i]) + fin(b[i])); break;
-    case kSub: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(fin(s.w[i]) - fin(b[i])); break;
+    case kAdd: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(vuops::add_vu(fin(s.w[i]), fin(b[i]))); break;
+    case kSub: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(vuops::add_vu(fin(s.w[i]), -fin(b[i]))); break;
     case kMul: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(fin(s.w[i]) * fin(b[i])); break;
-    case kMadd: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(fin(r.acc.w[i]) + norm(fin(s.w[i]) * fin(b[i]))); break;
-    case kMsub: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(fin(r.acc.w[i]) - norm(fin(s.w[i]) * fin(b[i]))); break;
+    case kMadd: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(vuops::add_vu(fin(r.acc.w[i]), norm(fin(s.w[i]) * fin(b[i])))); break;
+    case kMsub: for (int i = 0; i < 4; ++i) o.value.w[i] = fout(vuops::add_vu(fin(r.acc.w[i]), -norm(fin(s.w[i]) * fin(b[i])))); break;
     case kMax: for (int i = 0; i < 4; ++i) o.value.w[i] = fp::max(s.w[i], b[i]); break;
     case kMin: for (int i = 0; i < 4; ++i) o.value.w[i] = fp::min(s.w[i], b[i]); break;
     default: break;

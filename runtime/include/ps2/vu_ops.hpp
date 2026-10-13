@@ -113,11 +113,51 @@ PS2_VU_INLINE std::uint32_t fout(float f) {
 }
 
 PS2_VU_INLINE float norm(float f) { return fin(fout(f)); }
-PS2_VU_INLINE std::uint32_t add(std::uint32_t a, std::uint32_t b) { return fout(fin(a) + fin(b)); }
-PS2_VU_INLINE std::uint32_t sub(std::uint32_t a, std::uint32_t b) { return fout(fin(a) - fin(b)); }
+
+// The VU adder (fp::add is the exact model) keeps one guard bit: the smaller operand is cut off below
+// half a unit in the last place of the larger, the two are added or subtracted, and the result is
+// truncated. The host rounds the exact sum to nearest instead, and WebAssembly has no rounding mode to
+// set, so the host sum is corrected by at most one unit in the last place. Its exact error comes from
+// Knuth's two-sum. With s the host sum and "away" meaning it was rounded away from zero:
+//   - same signs: the adder truncates the exact sum, so step back if away;
+//   - opposite signs, exact difference below the larger operand's power of two: the dropped bits make
+//     the adder's difference too large, so step forward unless away;
+//   - opposite signs otherwise: the adder gives the nearest value, and the lower one on a tie, so step
+//     back if away on a tie (the sum plus twice the error is then exact).
+// Programs depend on it: adding and then subtracting a large constant to drop a fraction gives the
+// integer toward zero on a VU and the nearest one on the host.
+// Multiplication is left as the host rounds it (at most one unit in the last place from the VU's).
+PS2_VU_INLINE float add_vu(float a, float b) {
+    const float s = a + b;
+    const float bv = s - a, av = s - bv;
+    const float err = (a - av) + (b - bv);
+    if (!(err != 0.0f) || err != err) return s;
+    std::uint32_t xa, xb, xs, xe;
+    std::memcpy(&xa, &a, 4);
+    std::memcpy(&xb, &b, 4);
+    std::memcpy(&xs, &s, 4);
+    std::memcpy(&xe, &err, 4);
+    const bool away = ((xs ^ xe) & 0x80000000u) != 0;
+    if (!((xa ^ xb) & 0x80000000u)) {
+        if (away) --xs;
+    } else {
+        const std::uint32_t ma = xa & 0x7FFFFFFFu, mb = xb & 0x7FFFFFFFu, power = (ma > mb ? ma : mb) & 0x7F800000u, ms = xs & 0x7FFFFFFFu;
+        if (ms < power || (ms == power && away)) {
+            if (!away) ++xs;
+        } else if (away) {
+            const float twice = err + err;
+            if ((s + twice) - s == twice) --xs;
+        }
+    }
+    float r;
+    std::memcpy(&r, &xs, 4);
+    return r;
+}
+PS2_VU_INLINE std::uint32_t add(std::uint32_t a, std::uint32_t b) { return fout(add_vu(fin(a), fin(b))); }
+PS2_VU_INLINE std::uint32_t sub(std::uint32_t a, std::uint32_t b) { return fout(add_vu(fin(a), -fin(b))); }
 PS2_VU_INLINE std::uint32_t mul(std::uint32_t a, std::uint32_t b) { return fout(fin(a) * fin(b)); }
-PS2_VU_INLINE std::uint32_t madd(std::uint32_t acc, std::uint32_t a, std::uint32_t b) { return fout(fin(acc) + norm(fin(a) * fin(b))); }
-PS2_VU_INLINE std::uint32_t msub(std::uint32_t acc, std::uint32_t a, std::uint32_t b) { return fout(fin(acc) - norm(fin(a) * fin(b))); }
+PS2_VU_INLINE std::uint32_t madd(std::uint32_t acc, std::uint32_t a, std::uint32_t b) { return fout(add_vu(fin(acc), norm(fin(a) * fin(b)))); }
+PS2_VU_INLINE std::uint32_t msub(std::uint32_t acc, std::uint32_t a, std::uint32_t b) { return fout(add_vu(fin(acc), -norm(fin(a) * fin(b)))); }
 PS2_VU_INLINE std::uint32_t max(std::uint32_t a, std::uint32_t b) { return fp::max(a, b); }
 PS2_VU_INLINE std::uint32_t min(std::uint32_t a, std::uint32_t b) { return fp::min(a, b); }
 
@@ -142,11 +182,29 @@ PS2_VU_INLINE v4f vin(v4u x) { return (v4f)vfix(x); }
 PS2_VU_INLINE v4u vout(v4f f) { return vfix((v4u)f); }
 PS2_VU_INLINE v4f vnorm(v4f f) { return (v4f)vfix((v4u)f); }
 // The n variants take operands that already went through vfix.
-PS2_VU_INLINE v4u vaddn(v4u a, v4u b) { return vout((v4f)a + (v4f)b); }
-PS2_VU_INLINE v4u vsubn(v4u a, v4u b) { return vout((v4f)a - (v4f)b); }
+// add_vu on four lanes: the three corrections as masks, added to the sum's bits.
+PS2_VU_INLINE v4f vadd_vu(v4f a, v4f b) {
+    const v4f s = a + b;
+    const v4f bv = s - a, av = s - bv;
+    const v4f err = (a - av) + (b - bv);
+    const v4f zero = {0.0f, 0.0f, 0.0f, 0.0f};
+    const v4i inexact = (v4i)(err != zero) & (v4i)(err == err);
+    const v4i away = (v4i)((v4u)s ^ (v4u)err) < 0;
+    const v4i opposite = (v4i)((v4u)a ^ (v4u)b) < 0;
+    const v4i ma = (v4i)((v4u)a & 0x7FFFFFFFu), mb = (v4i)((v4u)b & 0x7FFFFFFFu), ms = (v4i)((v4u)s & 0x7FFFFFFFu);
+    const v4i power = __builtin_elementwise_max(ma, mb) & (v4i){0x7F800000, 0x7F800000, 0x7F800000, 0x7F800000};
+    const v4i below = (v4i)(ms < power) | ((v4i)(ms == power) & away);
+    const v4f twice = err + err;
+    const v4i tie = (v4i)(((s + twice) - s) == twice);
+    const v4i back = away & (~opposite | (~below & tie));
+    const v4i forward = opposite & below & ~away;
+    return (v4f)((v4i)s + (inexact & (back - forward)));
+}
+PS2_VU_INLINE v4u vaddn(v4u a, v4u b) { return vout(vadd_vu((v4f)a, (v4f)b)); }
+PS2_VU_INLINE v4u vsubn(v4u a, v4u b) { return vout(vadd_vu((v4f)a, (v4f)(b ^ 0x80000000u))); }
 PS2_VU_INLINE v4u vmuln(v4u a, v4u b) { return vout((v4f)a * (v4f)b); }
-PS2_VU_INLINE v4u vmaddn(v4u acc, v4u a, v4u b) { return vout((v4f)acc + vnorm((v4f)a * (v4f)b)); }
-PS2_VU_INLINE v4u vmsubn(v4u acc, v4u a, v4u b) { return vout((v4f)acc - vnorm((v4f)a * (v4f)b)); }
+PS2_VU_INLINE v4u vmaddn(v4u acc, v4u a, v4u b) { return vout(vadd_vu((v4f)acc, vnorm((v4f)a * (v4f)b))); }
+PS2_VU_INLINE v4u vmsubn(v4u acc, v4u a, v4u b) { return vout(vadd_vu((v4f)acc, (v4f)(vfix((v4u)((v4f)a * (v4f)b)) ^ 0x80000000u))); }
 PS2_VU_INLINE v4u vadd(v4u a, v4u b) { return vaddn(vfix(a), vfix(b)); }
 PS2_VU_INLINE v4u vsub(v4u a, v4u b) { return vsubn(vfix(a), vfix(b)); }
 PS2_VU_INLINE v4u vmul(v4u a, v4u b) { return vmuln(vfix(a), vfix(b)); }
