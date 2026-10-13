@@ -29,8 +29,8 @@ int usage() {
                  "              [--press frame:button[+button][:frames]]... [--window]\n"
                  "              [--save-state frame:file] [--load-state file]\n"
                  "              [--snapshot-every n --snapshot-dir dir]\n"
-                 "              [--call addr --snapshot file [--a0..--a3 --t0..--t3 v] [--f12..--f19 v] [--gp v] [--sp v]\n"
-                 "               [--stack-reserve n] [--buf reg:size[:hex]] [--poke addr:hex] [--budget n] [--trace-calls]\n"
+                 "              [--call addr --snapshot file [--a0..--a3 --t0..--t3 v|x64:hex] [--f12..--f19 v] [--gp v] [--sp v]\n"
+                 "               [--fcr31 hex] [--stack-reserve n] [--buf reg:size[:hex]] [--poke addr:hex] [--budget n] [--trace-calls]\n"
                  "               [--hook name|addr] [--hooks all] [--out file.json]]\n");
     return 2;
 }

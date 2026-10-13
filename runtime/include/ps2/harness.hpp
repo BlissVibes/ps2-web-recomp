@@ -20,9 +20,11 @@ struct Buffer {
 // One call of a recompiled (or hooked) function on a loaded snapshot.
 struct Request {
     std::uint32_t address = 0;                // entry address as the game calls it
-    std::optional<std::uint32_t> gpr[8];      // a0-a3, t0-t3 (r4-r11); unset keeps the snapshot value
+    std::optional<std::uint32_t> gpr[8];      // a0-a3, t0-t3 (r4-r11), sign-extended; unset keeps the snapshot value
+    std::optional<std::uint64_t> gpr64[8];    // the same registers given as all 64 bits (wins over gpr)
     std::optional<std::uint32_t> fpr[8];      // f12-f19
     std::optional<std::uint32_t> gp, sp;      // r28; r29 is the top below which the frame is carved
+    std::optional<std::uint32_t> fcr31;       // FPU control/status before the call (0 clears the sticky flags)
     std::uint32_t stack_reserve = 0x1000;     // bytes carved below sp: the frame, and the buffers above it
     std::int32_t budget = 500'000'000;        // EE cycles before the call counts as hung (1.7 s of EE time)
     std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>> pokes;   // bytes stored before the call

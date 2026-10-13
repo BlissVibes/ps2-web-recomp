@@ -180,9 +180,11 @@ Result call(const Request &q) {
     // as results while the function's own frame does not.
     for (int i = 0; i < 8; ++i) {
         if (q.gpr[i]) c.r[4 + i].sd[0] = static_cast<std::int32_t>(*q.gpr[i]);
+        if (q.gpr64[i]) c.r[4 + i].d[0] = *q.gpr64[i];
         if (q.fpr[i]) c.f[12 + i] = *q.fpr[i];
     }
     if (q.gp) c.r[28].sd[0] = static_cast<std::int32_t>(*q.gp);
+    if (q.fcr31) c.fcr31 = *q.fcr31;
     std::uint32_t top = q.sp ? *q.sp : c.r[29].w[0];
     if (!q.sp && (kernel::current_thread() == 0 || top < q.stack_reserve + 0x1000u || top > kRamSize)) top = kFallbackStackTop;
     if (top > kRamSize || top < q.stack_reserve + 0x1000u) {
@@ -298,11 +300,17 @@ bool write(const Result &r, const std::string &path) {
 bool parse_option(const std::string &flag, const char *value, Request &q) {
     static const char *const kGpr[8] = {"--a0", "--a1", "--a2", "--a3", "--t0", "--t1", "--t2", "--t3"};
     for (int i = 0; i < 8; ++i) {
-        if (flag == kGpr[i]) { q.gpr[i] = parse_u32(value); return true; }
+        if (flag == kGpr[i]) {
+            // x64:HEX gives all 64 bits of the register; anything else is 32 bits, sign-extended.
+            if (std::strncmp(value, "x64:", 4) == 0) q.gpr64[i] = std::strtoull(value + 4, nullptr, 16);
+            else q.gpr[i] = parse_u32(value);
+            return true;
+        }
         if (flag == "--f" + std::to_string(12 + i)) { q.fpr[i] = parse_u32(value); return true; }
     }
     if (flag == "--gp") { q.gp = parse_u32(value); return true; }
     if (flag == "--sp") { q.sp = parse_u32(value); return true; }
+    if (flag == "--fcr31") { q.fcr31 = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 16)); return true; }
     if (flag == "--stack-reserve") { q.stack_reserve = parse_u32(value); return true; }
     if (flag == "--budget") { q.budget = static_cast<std::int32_t>(std::strtol(value, nullptr, 0)); return true; }
     const std::string text = value;
