@@ -1,9 +1,15 @@
+#include "disc_cache.hpp"
+#include "pace.hpp"
+#include "sha256.hpp"
+
 #include "ps2/disc.hpp"
 #include "ps2/system.hpp"
 
 #include <emscripten.h>
+#include <emscripten/stack.h>
 #include <emscripten/threading.h>
 #include <pthread.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -102,8 +108,22 @@ EM_JS(void, ps2web_frame_done, (), {
     requestAnimationFrame(() => Module.shownChannel.port2.postMessage(0));
     if (Module.onFrame) Module.onFrame();
 });
-EM_ASYNC_JS(void, ps2web_wait_shown, (), {
-    if (Module.shownPending) await new Promise((resolve) => Module.shownWaiters.push(resolve));
+// Waits until the display has shown the last frame presented, for `limit_ms` at the most (0: not at all,
+// Infinity: however long). 1 when it has been shown, 0 when the wait was given up.
+EM_ASYNC_JS(int, ps2web_wait_shown, (double limit_ms), {
+    if (!Module.shownPending) return 1;
+    if (!(limit_ms > 0)) return 0;
+    if (limit_ms === Infinity) {
+        await new Promise((resolve) => Module.shownWaiters.push(resolve));
+        return 1;
+    }
+    let timer = 0;
+    const shown = await new Promise((resolve) => {
+        Module.shownWaiters.push(() => resolve(1));
+        timer = setTimeout(() => resolve(0), Math.ceil(limit_ms));
+    });
+    clearTimeout(timer);
+    return shown;
 });
 EM_JS(void, ps2web_blit, (const std::uint32_t *rgba, int width, int height), {
     const canvas = Module.canvas;
@@ -135,19 +155,9 @@ EM_JS(void, ps2web_blit, (const std::uint32_t *rgba, int width, int height), {
 
 namespace {
 
-constexpr std::size_t kChunk = 256u << 10;
-constexpr std::uint32_t kSlots = 256;
-constexpr std::uint64_t kReadAhead = 16;
+using ps2web::kChunk, ps2web::kWanted, ps2web::kLoading, ps2web::kReady, ps2web::kFailed, ps2web::Slot;
+
 constexpr std::uint32_t kAudioFrames = 1u << 14;
-
-enum : std::uint32_t { kEmpty, kWanted, kLoading, kReady, kFailed };
-
-struct Slot {
-    std::atomic<std::uint32_t> state{kEmpty};
-    std::uint64_t index = 0, used = 0;
-    std::uint32_t size = 0;
-    std::uint8_t *data = nullptr;
-};
 
 struct AudioRing {
     std::atomic<std::uint32_t> write{0}, read{0};
@@ -157,53 +167,54 @@ struct AudioRing {
 };
 
 AudioRing g_audio;
-Slot g_slots[kSlots];
-std::uint64_t g_disc_size = 0, g_use_clock = 0, g_last_chunk = ~0ull, g_run = 0;
+std::atomic<const char *> g_emu_waits{"nothing"};   // what the emulation thread is waiting for, for ps2web_describe
+void mark_sleep(useconds_t us) {
+    struct M { const char *was = g_emu_waits.exchange("a sleep in pace, the audio wait or a disc retry"); ~M() { g_emu_waits.store(was); } } m;
+    usleep(us);
+}
+
+struct Waiting {
+    const char *was;
+    explicit Waiting(const char *what) : was(g_emu_waits.exchange(what)) {}
+    ~Waiting() { g_emu_waits.store(was); }
+};
+ps2web::DiscCache g_cache;
+std::uint64_t &g_disc_size = g_cache.disc_size;
 char *g_disc_url = nullptr;
 char *g_state_url = nullptr;
-
-Slot *find_slot(std::uint64_t index) {
-    for (Slot &s : g_slots)
-        if (s.state.load(std::memory_order_acquire) != kEmpty && s.index == index) return &s;
-    return nullptr;
-}
-
-Slot *want(std::uint64_t index) {
-    if (index * kChunk >= g_disc_size) return nullptr;
-    if (Slot *s = find_slot(index)) return s;
-    Slot *victim = nullptr;
-    for (Slot &s : g_slots) {
-        const std::uint32_t state = s.state.load(std::memory_order_acquire);
-        if (state == kEmpty) {
-            victim = &s;
-            break;
-        }
-        if ((state == kReady || state == kFailed) && (!victim || s.used < victim->used)) victim = &s;
-    }
-    if (!victim) return nullptr;
-    if (!victim->data) victim->data = new std::uint8_t[kChunk];
-    victim->index = index;
-    victim->size = static_cast<std::uint32_t>(std::min<std::uint64_t>(kChunk, g_disc_size - index * kChunk));
-    victim->used = ++g_use_clock;
-    victim->state.store(kWanted, std::memory_order_release);
-    ps2::wake_render_thread();
-    return victim;
-}
+// Module.paceOld (the page's ?pace=old): wait as the page did before PresentGate and AudioStall, to compare the two.
+bool g_old_pacing = false;
+// Where the time of each thread goes, in ms. The emulation thread is idle while it sleeps in pace(), held
+// while post_present() stops it until frames it has posted are drawn, and reads the disc in read_disc().
+// Only the idle part is time to spare.
+std::atomic<double> g_emulation_idle{0.0}, g_emulation_held{0.0}, g_disc_wait{0.0}, g_render_idle{0.0};
 
 const Slot *chunk(std::uint64_t index) {
-    Slot *s = want(index);
-    if (index == g_last_chunk + 1) ++g_run;
-    else if (index != g_last_chunk) g_run = 0;
-    g_last_chunk = index;
-    for (std::uint64_t k = 1; k <= std::min(g_run * 2, kReadAhead); ++k) want(index + k);
+    Slot *s = g_cache.read(index);
+    if (g_cache.asked) {
+        g_cache.asked = false;
+        ps2::wake_render_thread();
+    }
+    // With every slot wanted or loading there is none to give up: wait for a fetch to end (up to five
+    // seconds) rather than fail the read, which the disc layer would fill with zeros.
+    for (int waited = 0; !s && index * kChunk < g_disc_size && waited < 5000; ++waited) {
+        mark_sleep(1000);
+        s = g_cache.want(index);
+        if (g_cache.asked) {
+            g_cache.asked = false;
+            ps2::wake_render_thread();
+        }
+    }
     for (int attempt = 0; s && attempt < 4; ++attempt) {
-        for (std::uint32_t state = s->state.load(); state != kReady && state != kFailed; state = s->state.load())
+        for (std::uint32_t state = s->state.load(); state != kReady && state != kFailed; state = s->state.load()) {
+            Waiting mark("a disc chunk to arrive");
             emscripten_futex_wait(&s->state, state, INFINITY);
+        }
         if (s->state.load() == kReady) {
-            s->used = ++g_use_clock;
+            if (s->index != index) break;   // cannot happen (disc_cache keeps the slot being read); never hand over another chunk's bytes
             return s;
         }
-        usleep(100000);
+        mark_sleep(100000);
         s->state.store(kWanted, std::memory_order_release);
         ps2::wake_render_thread();
     }
@@ -215,7 +226,9 @@ std::size_t read_disc(std::uint64_t offset, void *out, std::size_t size) {
     auto *to = static_cast<std::uint8_t *>(out);
     while (done < size && offset + done < g_disc_size) {
         const std::uint64_t at = offset + done;
+        const double asked = emscripten_get_now();
         const Slot *c = chunk(at / kChunk);
+        g_disc_wait.store(g_disc_wait.load() + emscripten_get_now() - asked);
         if (!c) break;
         const std::size_t within = static_cast<std::size_t>(at % kChunk);
         const std::size_t take = std::min<std::size_t>(size - done, c->size - within);
@@ -226,14 +239,21 @@ std::size_t read_disc(std::uint64_t offset, void *out, std::size_t size) {
 }
 
 void service_disc() {
-    for (Slot &s : g_slots) {
+    for (Slot &s : g_cache.slots) {
         std::uint32_t expected = kWanted;
         if (s.state.compare_exchange_strong(expected, kLoading, std::memory_order_acq_rel))
             ps2web_fetch(g_disc_url, static_cast<double>(s.index * kChunk), static_cast<int>(s.size), s.data, &s.state);
     }
 }
 
+bool g_audio_stopped = false;   // the device has stopped taking samples (pace() noticed); emulation thread only
+
 void push_audio(const std::int16_t *samples, std::size_t frames) {
+    // A stopped device empties nothing: sound added now would only be played late when it starts again.
+    if (g_audio_stopped) {
+        if (!g_audio.active.load()) return;
+        g_audio_stopped = false;
+    }
     std::uint32_t write = g_audio.write.load(std::memory_order_relaxed);
     const std::uint32_t read = g_audio.read.load(std::memory_order_acquire);
     for (std::size_t i = 0; i < frames && write - read < kAudioFrames; ++i, ++write) {
@@ -247,40 +267,120 @@ void push_audio(const std::int16_t *samples, std::size_t frames) {
 double audio_queued_ms() { return static_cast<double>(g_audio.write.load() - g_audio.read.load()) / 48.0; }
 
 double g_next_frame = 0.0;
-std::atomic<double> g_emulation_idle{0.0}, g_render_idle{0.0};
+
+double frame_ms() { return ps2::g_options.pal ? 20.0 : 1000.0 / 59.94; }
 
 void pace() {
-    ps2::post_present();
     if (g_audio.active.load()) {
-        while (audio_queued_ms() > 80.0) usleep(1000);
-        g_next_frame = 0.0;
-        return;
+        // The audio device sets the pace: sleep while more than 80 ms of sound is queued.
+        ps2web::AudioStall stall(g_audio.read.load());
+        bool stopped = false;
+        while (audio_queued_ms() > 80.0 && !stopped) {
+            mark_sleep(1000);
+            stopped = !g_old_pacing && stall.stopped(g_audio.read.load());
+        }
+        if (!stopped) {
+            g_next_frame = 0.0;
+            return;
+        }
+        // Nothing has taken a sample for 200 ms. The clock sets the pace until the worklet marks the
+        // ring active again, which it does every time it runs.
+        g_audio.active.store(0);
+        g_audio_stopped = true;
+        std::fprintf(stderr, "[web] the audio device has stopped taking samples: pacing by the clock\n");
     }
-    const double period = ps2::g_options.pal ? 20.0 : 1000.0 / 59.94;
+    const double period = frame_ms();
     const double now = emscripten_get_now();
     if (g_next_frame == 0.0 || now - g_next_frame > 200.0) g_next_frame = now;
     g_next_frame += period;
-    if (g_next_frame > now) usleep(static_cast<useconds_t>((g_next_frame - now) * 1000.0));
+    if (g_next_frame > now) mark_sleep(static_cast<useconds_t>((g_next_frame - now) * 1000.0));
 }
 
 void on_vblank() {
     const double start = emscripten_get_now();
+    ps2::post_present();
+    const double posted = emscripten_get_now();
     pace();
-    g_emulation_idle.store(g_emulation_idle.load() + emscripten_get_now() - start);
+    const double end = emscripten_get_now();
+    g_emulation_held.store(g_emulation_held.load() + posted - start);
+    g_emulation_idle.store(g_emulation_idle.load() + end - posted);
 }
+
+// Where the stack of each thread lies, for ps2web_stack_used: emulation, main, VU (the order of ps2web_idle_ms).
+struct Stack {
+    std::atomic<std::uintptr_t> base{0}, end{0};
+};
+Stack g_stacks[3];
+// Stack sizes of the two threads made here (the main thread's is -sSTACK_SIZE in CMakeLists.txt). Nobody
+// has measured what they use: read ps2web_stack_used after a race before making one smaller.
+constexpr std::size_t kEmulationStack = 16u << 20, kVuStack = 16u << 20;
+
+void note_stack(int which) {
+    g_stacks[which].base.store(emscripten_stack_get_base());
+    g_stacks[which].end.store(emscripten_stack_get_end());
+}
+
+// The path the game boots from, as /game/boot.txt gives it (the disc's own name for its executable).
+std::string boot_program() {
+    std::string boot = "/game/core.elf";
+    if (std::FILE *f = std::fopen("/game/boot.txt", "rb")) {
+        char text[256] = {};
+        const std::size_t n = std::fread(text, 1, sizeof text - 1, f);
+        std::fclose(f);
+        std::string line(text, n);
+        line.erase(line.find_last_not_of(" \r\n\t") + 1);
+        if (!line.empty()) boot = line;
+    }
+    return boot;
+}
+
+#ifdef PS2_WEB_ELF_SHA256
+bool refuse(const std::string &why) {
+    std::fprintf(stderr, "[web] %s\n", why.c_str());
+    MAIN_THREAD_EM_ASM({ if (Module.ps2Fatal) Module.ps2Fatal(UTF8ToString($0)); }, why.c_str());
+    return false;
+}
+
+// A build with PS2_WEB_ELF_FROM_DISC leaves the executable out of the page's data. It is read from the
+// user's disc into the place load_elf reads, and only if it is byte for byte the file the game's code was
+// translated from: the page accepts a disc by the name of its boot program alone, and a disc read that
+// comes back short is padded with zeros without an error.
+bool executable_from_disc() {
+    const std::string boot = boot_program();
+    const auto file = ps2::disc::is_open() ? ps2::disc::find(boot) : std::nullopt;
+    if (!file || file->directory) return refuse("The disc has no " + boot);
+    const std::uint32_t sectors = (file->size + ps2::disc::kSector - 1) / ps2::disc::kSector;
+    std::vector<std::uint8_t> data(static_cast<std::size_t>(sectors) * ps2::disc::kSector);
+    if (file->size != PS2_WEB_ELF_SIZE || !ps2::disc::read(file->sector, sectors, data.data()) ||
+        ps2web::sha256_hex(data.data(), file->size) != PS2_WEB_ELF_SHA256)
+        return refuse("The executable on this disc is not the one this page was built from");
+    mkdir("/game", 0777);
+    std::FILE *out = std::fopen("/game/core.elf", "wb");
+    const bool stored = out && std::fwrite(data.data(), 1, file->size, out) == file->size;
+    if (out) std::fclose(out);
+    return stored || refuse("Cannot store the game executable");
+}
+#endif
 
 struct Launch {
     std::vector<std::string> args;
 };
 
 void *emulate(void *data) {
+    note_stack(0);
     const Launch &launch = *static_cast<const Launch *>(data);
     if (g_disc_size && !ps2::disc::open("disc", g_disc_size, read_disc)) std::fprintf(stderr, "[web] cannot read the disc image\n");
     std::uint32_t entry = 0;
+#ifdef PS2_WEB_ELF_SHA256
+    if (!executable_from_disc()) return nullptr;
+#endif
     if (!ps2::load_elf("/game/core.elf", entry)) {
         std::fprintf(stderr, "cannot load the game executable\n");
         return nullptr;
     }
+#ifdef PS2_WEB_ELF_SHA256
+    std::remove("/game/core.elf");   // the copy is in the game's memory now
+#endif
     ps2::boot(entry, launch.args);
     if (g_state_url) {
         const double size = ps2web_url_size(g_state_url);
@@ -314,12 +414,51 @@ extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_primitives() { return static_cast<
 extern "C" EMSCRIPTEN_KEEPALIVE void *ps2web_audio_ring() { return &g_audio; }
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_audio_queued_ms() { return audio_queued_ms(); }
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_vu_interpreted() { return static_cast<double>(ps2::vu1_interpreted_calls()); }
+// 0: the emulation thread asleep with time to spare, 1: the main thread waiting, 2: the VU thread waiting,
+// 3: the emulation thread held until frames it has posted are drawn, 4: the emulation thread reading the disc.
 extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_idle_ms(int which) {
     if (which == 2) return ps2::vu_thread_idle_ms();
+    if (which == 3) return g_emulation_held.load();
+    if (which == 4) return g_disc_wait.load();
     return which ? g_render_idle.load() : g_emulation_idle.load();
 }
 
+// The most a thread's stack has held so far, in bytes (0 emulation, 1 main, 2 VU). A stack grows downwards
+// through memory that was zeros when the thread started, so this is the distance from its base down to the
+// lowest byte that is not zero. If the stack got memory something else had used and freed, the answer is
+// too large, never too small. For measuring only: it reads the whole unused part of the stack.
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_stack_used(int which) {
+    if (which < 0 || which > 2) return 0.0;
+    const std::uintptr_t base = g_stacks[which].base.load(), end = g_stacks[which].end.load();
+    std::uintptr_t at = (end + 7) & ~static_cast<std::uintptr_t>(7);
+    while (at < base && *reinterpret_cast<const std::uint64_t *>(at) == 0) at += 8;
+    return static_cast<double>(base - std::min(at, base));
+}
+
+// How far the page's memory has been used, in bytes: the end of everything ever allocated (it never moves
+// back). The memory grows when this passes its size, so this is what -sINITIAL_MEMORY has to cover.
+// For a page that has stopped: what each thread may be waiting for, to the console (Module._ps2web_describe()).
+extern "C" EMSCRIPTEN_KEEPALIVE void ps2web_describe() {
+    ps2::describe_threads();
+    std::uint32_t wanted = 0, loading = 0, ready = 0, failed = 0;
+    for (const Slot &s : g_cache.slots) {
+        const std::uint32_t state = s.state.load();
+        wanted += state == kWanted;
+        loading += state == kLoading;
+        ready += state == kReady;
+        failed += state == kFailed;
+    }
+    std::fprintf(stderr, "[stuck] emulation thread waits for %s; disc slots wanted %u, loading %u, ready %u, failed %u; last chunk %llu\n", g_emu_waits.load(),
+                 wanted, loading, ready, failed, static_cast<unsigned long long>(g_cache.last_chunk));
+    std::fprintf(stderr, "[stuck] audio ring: %u frames queued, device taking samples %u, counted as stopped %d\n",
+                 g_audio.write.load() - g_audio.read.load(), g_audio.active.load(), g_audio_stopped ? 1 : 0);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE double ps2web_heap_top() { return static_cast<double>(reinterpret_cast<std::uintptr_t>(sbrk(0))); }
+
 int main(int argc, char **argv) {
+    note_stack(1);
+    g_old_pacing = EM_ASM_INT({ return Module.paceOld ? 1 : 0; });
     static Launch launch;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -330,18 +469,7 @@ int main(int argc, char **argv) {
             if (ps2::parse_press(argv[++i], press)) ps2::g_options.presses.push_back(press);
         }
     }
-    if (launch.args.empty()) {
-        std::string boot = "/game/core.elf";
-        if (std::FILE *f = std::fopen("/game/boot.txt", "rb")) {
-            char text[256] = {};
-            const std::size_t n = std::fread(text, 1, sizeof text - 1, f);
-            std::fclose(f);
-            std::string line(text, n);
-            line.erase(line.find_last_not_of(" \r\n\t") + 1);
-            if (!line.empty()) boot = line;
-        }
-        launch.args.push_back(boot);
-    }
+    if (launch.args.empty()) launch.args.push_back(boot_program());
     g_disc_size = static_cast<std::uint64_t>(ps2web_disc_size());
     g_disc_url = ps2web_disc_url();
     g_state_url = ps2web_state_url();
@@ -378,13 +506,16 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "[web] %s\n", surface ? "presenting through WebGPU" : copy ? "presenting through a 2D canvas copy" : "not presenting");
 
     ps2::start_render_thread();
-    pthread_attr_t attr;
+    pthread_attr_t attr, vu_attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 16u << 20);
+    pthread_attr_setstacksize(&attr, kEmulationStack);
+    pthread_attr_init(&vu_attr);
+    pthread_attr_setstacksize(&vu_attr, kVuStack);
     if (!std::getenv("PS2_NO_VU_THREAD")) {
         ps2::start_vu_thread();
         pthread_t vu_thread;
-        if (pthread_create(&vu_thread, &attr, [](void *) -> void * {
+        if (pthread_create(&vu_thread, &vu_attr, [](void *) -> void * {
+                note_stack(2);
                 ps2::run_vu_thread();
                 return nullptr;
             }, nullptr) != 0) {
@@ -401,6 +532,7 @@ int main(int argc, char **argv) {
         ps2web_blit(rgba, static_cast<int>(width), static_cast<int>(height));
     };
     const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> none;
+    static ps2web::PresentGate gate;
     const std::function<void()> wait_shown = [] {
         static int since_skip = 0;
         static double window_start = 0.0, window_gpu = 0.0, gpu_load = 1.0;
@@ -411,12 +543,19 @@ int main(int argc, char **argv) {
             window_start = start;
             window_gpu = gpu;
         }
-        if (++since_skip > 8 && gpu_load < 0.8 && g_audio.active.load() && audio_queued_ms() < 40.0) {
+        // A present goes ahead without the display only while the graphics card has time to spare.
+        const bool spare = gpu_load < 0.8;
+        if (++since_skip > 8 && spare && g_audio.active.load() && audio_queued_ms() < 40.0 &&
+            (g_old_pacing || gate.unshown < ps2web::PresentGate::kMaxUnshown)) {
             since_skip = 0;
+            gate.presented(start, false);
             return;
         }
-        ps2web_wait_shown();
-        g_render_idle.store(g_render_idle.load() + emscripten_get_now() - start);
+        const double limit = spare && !g_old_pacing ? gate.wait_limit(start, frame_ms()) : ps2web::kUntilShown;
+        const bool shown = ps2web_wait_shown(limit);
+        const double end = emscripten_get_now();
+        gate.presented(end, shown);
+        g_render_idle.store(g_render_idle.load() + end - start);
     };
     for (;;) {
         service_disc();
@@ -425,6 +564,7 @@ int main(int argc, char **argv) {
         if (rendered != ps2::Rendered::idle) {
             ps2::browser_yield();
         } else {
+            gate.queue_empty();
             const double start = emscripten_get_now();
             ps2::wait_render_work(50);
             g_render_idle.store(g_render_idle.load() + emscripten_get_now() - start);

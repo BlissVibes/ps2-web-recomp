@@ -107,15 +107,29 @@ if(PS2_GENERATED)
         set(PS2_WEB_ELF "" CACHE FILEPATH "Game executable preloaded as /game/core.elf")
         set(PS2_WEB_BOOT_FILE "" CACHE FILEPATH "Text file holding the argv[0] the game sees, preloaded as /game/boot.txt")
         set(PS2_WEB_SHELL "${CMAKE_SOURCE_DIR}/web/shell.html" CACHE FILEPATH "Emscripten shell HTML for the page")
-        add_executable(ps2web host/web.cpp)
+        # ON: the executable is left out of the page's data. The page reads it from the user's disc (the path in
+        # /game/boot.txt) and boots only if it has the size and SHA-256 of PS2_WEB_ELF. For a game whose
+        # executable is a file on its disc.
+        option(PS2_WEB_ELF_FROM_DISC "Read the executable from the user's disc instead of preloading PS2_WEB_ELF" OFF)
+        add_executable(ps2web host/web.cpp host/disc_cache.cpp host/pace.cpp host/sha256.cpp)
         if(PS2_WEB_BOOT_FILE)
             target_link_options(ps2web PRIVATE "SHELL:--preload-file ${PS2_WEB_BOOT_FILE}@/game/boot.txt")
         endif()
         target_link_libraries(ps2web PRIVATE $<$<BOOL:${PS2_HOOKS}>:ps2hooks> ps2game ps2runtime)
         target_link_options(ps2web PRIVATE --profiling-funcs -sJSPI -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=268435456 -sPTHREAD_POOL_SIZE=2 -sALLOW_TABLE_GROWTH=1 -lidbfs.js -sSTACK_SIZE=16777216 -sENVIRONMENT=web
-            -sEXPORTED_FUNCTIONS=_main,_ps2web_pad,_ps2web_resize,_ps2web_gpu_ms,_ps2web_frames,_ps2web_primitives,_ps2web_audio_ring,_ps2web_audio_queued_ms,_ps2web_idle_ms,_ps2web_vu_interpreted
+            -sEXPORTED_FUNCTIONS=_main,_ps2web_pad,_ps2web_resize,_ps2web_gpu_ms,_ps2web_frames,_ps2web_primitives,_ps2web_audio_ring,_ps2web_audio_queued_ms,_ps2web_idle_ms,_ps2web_vu_interpreted,_ps2web_stack_used,_ps2web_heap_top
             -sEXPORTED_RUNTIME_METHODS=callMain,addRunDependency,removeRunDependency,HEAPU8,ENV
-            --shell-file ${PS2_WEB_SHELL} --preload-file ${PS2_WEB_ELF}@/game/core.elf)
+            --shell-file ${PS2_WEB_SHELL})
+        if(PS2_WEB_ELF_FROM_DISC)
+            if(NOT PS2_WEB_ELF)
+                message(FATAL_ERROR "PS2_WEB_ELF_FROM_DISC needs PS2_WEB_ELF, the executable the disc's copy is checked against")
+            endif()
+            file(SHA256 "${PS2_WEB_ELF}" PS2_WEB_ELF_SHA256)
+            file(SIZE "${PS2_WEB_ELF}" PS2_WEB_ELF_SIZE)
+            target_compile_definitions(ps2web PRIVATE "PS2_WEB_ELF_SHA256=\"${PS2_WEB_ELF_SHA256}\"" PS2_WEB_ELF_SIZE=${PS2_WEB_ELF_SIZE})
+        elseif(PS2_WEB_ELF)
+            target_link_options(ps2web PRIVATE --preload-file ${PS2_WEB_ELF}@/game/core.elf)
+        endif()
         set_target_properties(ps2web PROPERTIES SUFFIX ".html" LINK_DEPENDS ${PS2_WEB_SHELL})
         return()
     endif()
