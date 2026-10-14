@@ -88,9 +88,9 @@ PS2_VU_INLINE v4u product(v4u a, v2d y0, v2d y1, v4u &bad) {
 //   - opposite signs, sum below the larger operand's power of two: step forward unless away;
 //   - opposite signs otherwise: step back if away on a tie.
 // The operands are put larger magnitude first, so the rounding error of s comes exactly from three
-// operations, and none of them can overflow while s is a number. (The two-sum of vuops::add_vu takes the
-// operands in any order with six operations, and one of those overflows beside the largest host float:
-// 0x73C00000 + 0xFF7FFFFF comes out one unit off there, and right here.)
+// operations, and none of them can overflow while s is a number. (A two-sum that takes the operands in any
+// order needs six operations, and one of those overflows beside the largest host float: 0x73C00000 +
+// 0xFF7FFFFF came out one unit off that way. vuops::add_vu and vadd_vu have the steps used here.)
 // bad: a host sum in the top binade, which covers an operand there. A sum too small for a float is exact
 // on the host and is flushed, as the model gives zero.
 PS2_VU_INLINE v4u sum(v4u a, v4u b, v4u &bad) {

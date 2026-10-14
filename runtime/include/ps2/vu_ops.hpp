@@ -117,8 +117,12 @@ PS2_VU_INLINE float norm(float f) { return fin(fout(f)); }
 // The VU adder (fp::add is the exact model) keeps one guard bit: the smaller operand is cut off below
 // half a unit in the last place of the larger, the two are added or subtracted, and the result is
 // truncated. The host rounds the exact sum to nearest instead, and WebAssembly has no rounding mode to
-// set, so the host sum is corrected by at most one unit in the last place. Its exact error comes from
-// Knuth's two-sum. With s the host sum and "away" meaning it was rounded away from zero:
+// set, so the host sum is corrected by at most one unit in the last place. Its exact error comes from three
+// operations once the operands are put larger magnitude first (Dekker's fast two-sum; none of them can
+// overflow while the sum is a number, where Knuth's two-sum in any order overflowed beside the largest
+// magnitude: 0x73C00000 + 0xFF7FFFFF was one unit off). A sum that overflows comes back as the largest
+// magnitude, as a step back from the infinity. With s the host sum and "away" meaning it was rounded away
+// from zero:
 //   - same signs: the adder truncates the exact sum, so step back if away;
 //   - opposite signs, exact difference below the larger operand's power of two: the dropped bits make
 //     the adder's difference too large, so step forward unless away;
@@ -128,20 +132,23 @@ PS2_VU_INLINE float norm(float f) { return fin(fout(f)); }
 // integer toward zero on a VU and the nearest one on the host.
 // Multiplication is left as the host rounds it (at most one unit in the last place from the VU's).
 PS2_VU_INLINE float add_vu(float a, float b) {
-    const float s = a + b;
-    const float bv = s - a, av = s - bv;
-    const float err = (a - av) + (b - bv);
-    if (!(err != 0.0f) || err != err) return s;
     std::uint32_t xa, xb, xs, xe;
     std::memcpy(&xa, &a, 4);
     std::memcpy(&xb, &b, 4);
+    if ((xa & 0x7FFFFFFFu) < (xb & 0x7FFFFFFFu)) {
+        std::swap(a, b);
+        std::swap(xa, xb);
+    }
+    const float s = a + b;
+    const float err = b - (s - a);
+    if (!(err != 0.0f)) return s;
     std::memcpy(&xs, &s, 4);
     std::memcpy(&xe, &err, 4);
     const bool away = ((xs ^ xe) & 0x80000000u) != 0;
     if (!((xa ^ xb) & 0x80000000u)) {
         if (away) --xs;
     } else {
-        const std::uint32_t ma = xa & 0x7FFFFFFFu, mb = xb & 0x7FFFFFFFu, power = (ma > mb ? ma : mb) & 0x7F800000u, ms = xs & 0x7FFFFFFFu;
+        const std::uint32_t power = xa & 0x7F800000u, ms = xs & 0x7FFFFFFFu;
         if (ms < power || (ms == power && away)) {
             if (!away) ++xs;
         } else if (away) {
@@ -182,18 +189,22 @@ PS2_VU_INLINE v4f vin(v4u x) { return (v4f)vfix(x); }
 PS2_VU_INLINE v4u vout(v4f f) { return vfix((v4u)f); }
 PS2_VU_INLINE v4f vnorm(v4f f) { return (v4f)vfix((v4u)f); }
 // The n variants take operands that already went through vfix.
-// add_vu on four lanes: the three corrections as masks, added to the sum's bits.
+// add_vu on four lanes: the operands put larger magnitude first (the bits that differ swapped where the second
+// is larger), the three corrections as masks, added to the sum's bits (vuexact::sum has the same steps).
 PS2_VU_INLINE v4f vadd_vu(v4f a, v4f b) {
-    const v4f s = a + b;
-    const v4f bv = s - a, av = s - bv;
-    const v4f err = (a - av) + (b - bv);
+    const v4u ab = (v4u)a ^ (v4u)b;
+    const v4u swap = ab & (v4u)((v4i)((v4u)a & 0x7FFFFFFFu) < (v4i)((v4u)b & 0x7FFFFFFFu));
+    const v4f x = (v4f)((v4u)a ^ swap), y = (v4f)((v4u)b ^ swap);
+    const v4f s = x + y;
+    const v4f err = y - (s - x);
     const v4f zero = {0.0f, 0.0f, 0.0f, 0.0f};
-    const v4i inexact = (v4i)(err != zero) & (v4i)(err == err);
+    const v4i inexact = (v4i)(err != zero);
     const v4i away = (v4i)((v4u)s ^ (v4u)err) < 0;
-    const v4i opposite = (v4i)((v4u)a ^ (v4u)b) < 0;
-    const v4i ma = (v4i)((v4u)a & 0x7FFFFFFFu), mb = (v4i)((v4u)b & 0x7FFFFFFFu), ms = (v4i)((v4u)s & 0x7FFFFFFFu);
-    const v4i power = __builtin_elementwise_max(ma, mb) & (v4i){0x7F800000, 0x7F800000, 0x7F800000, 0x7F800000};
-    const v4i below = (v4i)(ms < power) | ((v4i)(ms == power) & away);
+    const v4i opposite = (v4i)ab < 0;
+    const v4i ms = (v4i)((v4u)s & 0x7FFFFFFFu);
+    const v4i power = (v4i)((v4u)x & 0x7F800000u);
+    // away is 0 or -1: below the power, or the power itself reached by rounding up.
+    const v4i below = (ms + away) < power;
     const v4f twice = err + err;
     const v4i tie = (v4i)(((s + twice) - s) == twice);
     const v4i back = away & (~opposite | (~below & tie));
