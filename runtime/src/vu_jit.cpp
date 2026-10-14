@@ -2,6 +2,7 @@
 
 #include "ps2/vu_ops.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstring>
 #include <map>
@@ -46,6 +47,7 @@ constexpr std::uint32_t kOffMac = offsetof(Vu0Regs, mac);
 constexpr std::uint32_t kOffMh = offsetof(vuops::FlagPipe, mh), kOffMacTs = offsetof(vuops::FlagPipe, mac_ts), kOffMacV = offsetof(vuops::FlagPipe, mac_v),
                         kOffStatusV = offsetof(vuops::FlagPipe, status_v), kOffT = offsetof(vuops::FlagPipe, t);
 constexpr std::uint32_t kOffStatus = offsetof(Vu0Regs, status), kOffClip = offsetof(Vu0Regs, clip), kOffTpc = offsetof(Vu0Regs, tpc);
+constexpr std::uint32_t kOffCh = offsetof(vuops::FlagPipe, ch), kOffClipTs = offsetof(vuops::FlagPipe, clip_ts), kOffClipV = offsetof(vuops::FlagPipe, clip_v);
 
 bool lane(unsigned dest, int i) { return dest & (8u >> i); }
 
@@ -161,14 +163,15 @@ struct Code : Out {
 };
 
 enum : std::uint8_t {
-    kOpDrop = 0x1A, kOpEqz = 0x45, kOpEq = 0x46, kOpNe = 0x47, kOpLtS = 0x48, kOpGtS = 0x4A, kOpLeS = 0x4C, kOpGeS = 0x4E,
+    kOpDrop = 0x1A, kOpEqz = 0x45, kOpEq = 0x46, kOpNe = 0x47, kOpLtS = 0x48, kOpGtS = 0x4A, kOpGtU = 0x4B, kOpLeS = 0x4C, kOpGeS = 0x4E,
     kOpAdd = 0x6A, kOpSub = 0x6B, kOpMul = 0x6C, kOpAnd = 0x71, kOpOr = 0x72, kOpXor = 0x73, kOpShl = 0x74, kOpShrU = 0x76, kOpExt16 = 0xC1,
     kOpReturn = 0x0F, kOpBr = 0x0C, kOpUnreachable = 0x00,
 };
 
 enum : std::uint32_t {
-    kVSplat = 0x11, kVExtract = 0x1B, kI32x4Eq = 0x37, kI32x4LtS = 0x39, kI32x4LeS = 0x3D, kI32x4GeS = 0x3F, kF32x4Ge = 0x46,
+    kVSplat = 0x11, kVExtract = 0x1B, kI32x4Eq = 0x37, kI32x4Ne = 0x38, kI32x4LtS = 0x39, kI32x4GtS = 0x3B, kI32x4LeS = 0x3D, kI32x4GeS = 0x3F, kF32x4Ge = 0x46,
     kVAnd = 0x4E, kVOr = 0x50, kVXor = 0x51, kVBitselect = 0x52, kVNot = 0x4D, kVAndNot = 0x4F, kF32x4Eq = 0x41, kF32x4Ne = 0x42, kI32x4Neg = 0xA1, kI32x4Add = 0xAE, kI32x4Sub = 0xB1, kI32x4MinS = 0xB6, kI32x4MaxS = 0xB8, kF32x4Add = 0xE4, kF32x4Sub = 0xE5, kF32x4Mul = 0xE6,
+    kI32x4TruncSatF32x4S = 0xF8, kF32x4ConvertI32x4S = 0xFA,
 };
 
 enum Kind { Nop, Add, Sub, Madd, Msub, Max, Min, Mul, Abs, Ftoi, Itof, Clip, Opmula, Opmsub };
@@ -334,7 +337,8 @@ LowerInfo analyze_lower(std::uint32_t w, std::uint32_t pc) {
 
 class Translator {
 public:
-    Translator(const std::uint8_t *code, std::uint32_t entry, const Layout &layout) : code_(code), entry_(entry & kMask), layout_(layout) {}
+    Translator(const std::uint8_t *code, std::uint32_t entry, const Layout &layout, const Options &options)
+        : code_(code), entry_(entry & kMask), layout_(layout), opt_(options) {}
 
     bool run(std::vector<std::uint8_t> &out);
 
@@ -342,6 +346,7 @@ private:
     const std::uint8_t *code_;
     std::uint32_t entry_;
     Layout layout_;
+    Options opt_;
     Code c_;
     std::vector<std::uint32_t> pcs_;
     std::set<std::uint32_t> in_;
@@ -400,9 +405,25 @@ private:
         return index == 0x1Cu || index == 0x20u || index == 0x21u || index == 0x24u || index == 0x25u;
     }
 
+    // Whether the instruction at `at` reads Q (an upper with Q as an operand) or P (MFP).
+    bool reads(bool p, std::uint32_t at) {
+        const std::uint32_t hi = word(at + 4), lo = word(at);
+        if (!p) return reads_q(hi);
+        return !(hi & 0x80000000u) && (lo >> 25) == 0x40u && (lo & 0x3Cu) == 0x3Cu && ((lo >> 6) & 31u) * 4u + (lo & 3u) == 0x64u;
+    }
+
     // Marks every instruction a pending result can reach, and reports whether one of them reads it early.
+    // A register jump (JR, JALR) leaves the region unless it lands on one of the region's own return points,
+    // the instructions after a BAL's or JALR's delay slot, which is how a subroutine returns: there the
+    // generated code goes on in the region, so the window goes on at each of them. (The region holds no
+    // other target of a register jump: reachable() follows none.)
     bool find_windows() {
         bool early = false;
+        std::set<std::uint32_t> returns;
+        for (std::uint32_t pc : pcs_) {
+            const std::uint32_t op = word(pc) >> 25;
+            if (!(word(pc + 4) & 0x80000000u) && (op == 0x21u || op == 0x25u) && in_.count((pc + 16u) & kMask)) returns.insert((pc + 16u) & kMask);
+        }
         for (std::uint32_t start : pcs_) {
             if (word(start + 4) & 0x80000000u) continue;
             bool p = false;
@@ -411,16 +432,15 @@ private:
             std::set<std::uint32_t> frontier{start};
             for (std::uint32_t step = 1; step <= wait && !frontier.empty(); ++step) {
                 std::set<std::uint32_t> next;
-                for (std::uint32_t at : frontier)
+                for (std::uint32_t at : frontier) {
                     for (std::int64_t to : successors(at))
                         if (to >= 0 && in_.count(static_cast<std::uint32_t>(to))) next.insert(static_cast<std::uint32_t>(to));
+                    const std::uint32_t prev = (at - 8u) & kMask;
+                    if (in_.count(prev) && lowers_[prev].jump) next.insert(returns.begin(), returns.end());
+                }
                 for (std::uint32_t at : next) {
                     (p ? tick_p_ : tick_q_).insert(at);
-                    if (step == wait) continue;
-                    const std::uint32_t hi = word(at + 4), lo = word(at);
-                    const bool immediate = hi & 0x80000000u;
-                    const bool mfp = !immediate && (lo >> 25) == 0x40u && (lo & 0x3Cu) == 0x3Cu && ((lo >> 6) & 31u) * 4u + (lo & 3u) == 0x64u;
-                    if (p ? mfp : reads_q(hi)) early = true;
+                    if (step < wait && reads(p, at)) early = true;
                 }
                 frontier = std::move(next);
             }
@@ -498,139 +518,149 @@ private:
     void fl() { c_.i32c(layout_.flags); }
     std::uint32_t top_depth() const { return static_cast<std::uint32_t>(pcs_.size()) - case_index_ + c_.depth; }
 
+    // Vector constants. V8 builds a v128.const other than all zeros from immediates through a general register
+    // at every use, and every VU instruction is a br_table target of its own, so nothing is shared between
+    // instructions; a local is one register move. Every pattern but zero gets a local, set once at entry
+    // (consts_, in the order first used).
+    std::map<std::array<std::uint32_t, 4>, std::uint32_t> consts_;
+    std::uint32_t const_base_ = 0;
+
+    void vconst(std::uint32_t a, std::uint32_t b, std::uint32_t c, std::uint32_t d) {
+        if (!opt_.consts || (a | b | c | d) == 0) {
+            c_.vconst(a, b, c, d);
+            return;
+        }
+        const std::array<std::uint32_t, 4> key{a, b, c, d};
+        auto it = consts_.find(key);
+        if (it == consts_.end()) it = consts_.emplace(key, const_base_ + static_cast<std::uint32_t>(consts_.size())).first;
+        c_.get(it->second);
+    }
+    void vsplatc(std::uint32_t v) { vconst(v, v, v, v); }
+
     void vfix() {
         c_.tee(kV0);
-        c_.vsplatc(0x7FFFFFFFu);
+        vsplatc(0x7FFFFFFFu);
         c_.simd(kVAnd);
-        c_.vsplatc(0x7F7FFFFFu);
+        vsplatc(0x7F7FFFFFu);
         c_.simd(kI32x4MinS);
         c_.tee(kV1);
         c_.get(kV1);
-        c_.vsplatc(0x00800000u);
+        vsplatc(0x00800000u);
         c_.simd(kF32x4Ge);
         c_.simd(kVAnd);
         c_.get(kV0);
-        c_.vsplatc(0x80000000u);
+        vsplatc(0x80000000u);
         c_.simd(kVAnd);
         c_.simd(kVOr);
     }
 
-    // The VU adder (vuops::vadd_vu, same steps): replaces the two vectors on the stack by their sum as
-    // the VU gives it. kV2 a, kV3 b, kV4 the host sum, kV5 its exact error, kV6 away, kV7 below.
-    // Used for the ADD family only. SUB, MADD and MSUB go through the same adder on a VU, and the C++
-    // paths correct them too, but here they keep the host's rounding: the correction is about five
-    // times the work of the add, these three are two thirds of the adder's use in a race, and the VU
-    // thread has no room for them in the page (gap 013). Every sum corrected is the VU's; none is worse.
+    // The VU adder: replaces the two vectors on the stack, which went through vfix, by their sum as the VU
+    // gives it (fp::add; vuops::vadd_vu has another form with the same bits). fp::add puts the operands
+    // larger magnitude first, cuts the smaller one off below the larger one's guard bit (half a unit in its
+    // last place), adds, and truncates. Here the cut is a mask of the bits below the guard bit,
+    // 2^(d-1) - 1 for an exponent difference d, made without a shift per lane: 2^(d-1) is built as a
+    // float from its exponent and added to 2^23, whose last-place unit is 1. The host then adds the two
+    // exactly or rounds to nearest; the rounding error comes from two more operations (the larger magnitude
+    // comes first) and the sum steps back one unit where it was rounded away from zero. A sum that
+    // overflows steps back from the infinity to the largest magnitude, as the fast paths clamp it.
+    // Only denormals are left to flush. kV4 swap, then the sum; kV5 larger; kV6 smaller; kV7 the exponent
+    // difference, the mask, then the error; kV0 the result.
     void vadd_vu() {
         c_.set(kV3);
         c_.set(kV2);
         c_.get(kV2);
+        vsplatc(0x7FFFFFFFu);
+        c_.simd(kVAnd);
         c_.get(kV3);
-        c_.simd(kF32x4Add);
-        c_.tee(kV4);
-        c_.get(kV2);
-        c_.simd(kF32x4Sub);
-        c_.set(kV5);            // bv = s - a
-        c_.get(kV2);
-        c_.get(kV4);
-        c_.get(kV5);
-        c_.simd(kF32x4Sub);     // av = s - bv
-        c_.simd(kF32x4Sub);     // a - av
-        c_.get(kV3);
-        c_.get(kV5);
-        c_.simd(kF32x4Sub);     // b - bv
-        c_.simd(kF32x4Add);
-        c_.set(kV5);            // err
-        c_.get(kV4);
-        c_.get(kV5);
-        c_.simd(kVXor);
-        c_.vsplatc(0u);
+        vsplatc(0x7FFFFFFFu);
+        c_.simd(kVAnd);
         c_.simd(kI32x4LtS);
-        c_.set(kV6);            // away
-        // below: |s| under the larger operand's power of two, or on it and away
-        c_.get(kV4);
-        c_.vsplatc(0x7FFFFFFFu);
-        c_.simd(kVAnd);
-        c_.tee(kV7);            // |s| for now
-        c_.get(kV2);
-        c_.vsplatc(0x7FFFFFFFu);
-        c_.simd(kVAnd);
+        c_.set(kV4);            // swap: |a| < |b|
         c_.get(kV3);
-        c_.vsplatc(0x7FFFFFFFu);
+        c_.get(kV2);
+        c_.get(kV4);
+        c_.simd(kVBitselect);
+        c_.set(kV5);            // larger
+        c_.get(kV2);
+        c_.get(kV3);
+        c_.get(kV4);
+        c_.simd(kVBitselect);
+        c_.set(kV6);            // smaller
+        c_.get(kV5);
+        vsplatc(0x7F800000u);
         c_.simd(kVAnd);
+        c_.get(kV6);
+        vsplatc(0x7F800000u);
+        c_.simd(kVAnd);
+        c_.simd(kI32x4Sub);
+        c_.tee(kV7);            // d << 23
+        vsplatc(1u << 23);
         c_.simd(kI32x4MaxS);
-        c_.vsplatc(0x7F800000u);
-        c_.simd(kVAnd);
-        c_.tee(kV0);            // power
-        c_.simd(kI32x4LtS);     // |s| < power
+        vsplatc(126u << 23);
+        c_.simd(kI32x4Add);     // 2^(d-1) as a float, d >= 1
+        vsplatc(0x4B000000u);
+        c_.simd(kF32x4Add);     // + 2^23
+        vsplatc(0x4B000001u);
+        c_.simd(kI32x4Sub);     // 2^(d-1) - 1
         c_.get(kV7);
-        c_.get(kV0);
-        c_.simd(kI32x4Eq);
+        vsplatc(24u << 23);
+        c_.simd(kI32x4GtS);
+        c_.simd(kVOr);          // everything when d > 24
+        c_.set(kV7);
         c_.get(kV6);
-        c_.simd(kVAnd);
-        c_.simd(kVOr);
-        c_.set(kV7);            // below
-        // opposite signs
-        c_.get(kV2);
-        c_.get(kV3);
-        c_.simd(kVXor);
-        c_.vsplatc(0u);
-        c_.simd(kI32x4LtS);
-        c_.set(kV0);            // opposite
-        // back = away & (~opposite | (~below & tie))
-        c_.get(kV4);
-        c_.get(kV5);
-        c_.get(kV5);
-        c_.simd(kF32x4Add);
-        c_.tee(kV1);            // twice
-        c_.simd(kF32x4Add);
-        c_.get(kV4);
-        c_.simd(kF32x4Sub);
-        c_.get(kV1);
-        c_.simd(kF32x4Eq);      // tie
         c_.get(kV7);
-        c_.simd(kVAndNot);      // tie & ~below
-        c_.get(kV0);
-        c_.simd(kVNot);
-        c_.simd(kVOr);
-        c_.get(kV6);
-        c_.simd(kVAnd);         // back
-        // forward = opposite & below & ~away
-        c_.get(kV0);
-        c_.get(kV7);
-        c_.simd(kVAnd);
-        c_.get(kV6);
         c_.simd(kVAndNot);
-        c_.simd(kI32x4Sub);     // back - forward
-        // only where the sum is inexact (and the error is a number)
+        c_.tee(kV6);            // smaller, cut
         c_.get(kV5);
-        c_.vsplatc(0u);
-        c_.simd(kF32x4Ne);
-        c_.get(kV5);
-        c_.get(kV5);
-        c_.simd(kF32x4Eq);
-        c_.simd(kVAnd);
-        c_.simd(kVAnd);
+        c_.simd(kF32x4Add);
+        c_.tee(kV4);            // s
+        c_.get(kV6);
         c_.get(kV4);
-        c_.simd(kI32x4Add);
+        c_.get(kV5);
+        c_.simd(kF32x4Sub);
+        c_.simd(kF32x4Sub);
+        c_.tee(kV7);            // error: smaller - (s - larger)
+        c_.get(kV4);
+        c_.simd(kVXor);
+        vsplatc(0u);
+        c_.simd(kI32x4LtS);
+        c_.get(kV7);
+        vsplatc(0u);
+        c_.simd(kF32x4Ne);
+        c_.simd(kVAnd);         // away: an error of the other sign
+        c_.simd(kI32x4Add);     // s - 1 unit where away
+        c_.tee(kV0);
+        c_.get(kV0);
+        vsplatc(0x7F800000u);
+        c_.simd(kVAnd);
+        vsplatc(0u);
+        c_.simd(kI32x4Ne);
+        vsplatc(0x80000000u);
+        c_.simd(kVOr);
+        c_.simd(kVAnd);         // a denormal is a zero of its sign
+    }
+
+    void vneg() {
+        vsplatc(0x80000000u);
+        c_.simd(kVXor);
     }
 
     // The lanes of a local as the sign-magnitude integers MAX and MINI compare (fp::order):
     // x for a clear sign bit, x ^ 0x7FFFFFFF for a set one.
     void vorder_of(std::uint32_t local) {
         c_.get(local);
-        c_.vsplatc(0x7FFFFFFFu);
+        vsplatc(0x7FFFFFFFu);
         c_.simd(kVXor);
         c_.get(local);
         c_.get(local);
-        c_.vsplatc(0);
+        vsplatc(0);
         c_.simd(kI32x4LtS);
         c_.simd(kVBitselect);
     }
 
     void raw_vec(unsigned reg) {
         if (!reg) {
-            c_.vconst(0, 0, 0, kOne);
+            vconst(0, 0, 0, kOne);
             return;
         }
         c_.get(kR);
@@ -653,10 +683,153 @@ private:
 
     void shadow_vec(unsigned reg) {
         if (!reg) {
-            c_.vconst(0, 0, 0, kOne);
+            vconst(0, 0, 0, kOne);
             return;
         }
         c_.get(shadow_.at(static_cast<int>(reg)));
+    }
+
+    // A register as an operand of the arithmetic (through vfix): its shadow when it has one.
+    void operand(int reg) {
+        if (shadow_.count(reg)) {
+            c_.get(shadow_.at(reg));
+        } else if (reg == kAcc) {
+            c_.get(kR);
+            c_.vload(reg_off(kAcc));
+            vfix();
+        } else {
+            raw_vec(static_cast<unsigned>(reg));
+            if (reg) vfix();
+        }
+    }
+
+    // The lanes of the vector on the stack in another order (one i8x16.shuffle of it with itself).
+    void permute(unsigned l0, unsigned l1, unsigned l2, unsigned l3) {
+        c_.tee(kV1);
+        c_.get(kV1);
+        c_.simd(0x0D);
+        for (unsigned l : {l0, l1, l2, l3})
+            for (unsigned k = 0; k < 4; ++k) c_.byte(static_cast<std::uint8_t>(l * 4u + k));
+    }
+
+    // Converts the vector on the stack, which went through vfix, as fp::to_fixed does lane by lane: scaled
+    // by 2^frac, truncated toward zero, saturated past the range of an int (vuops::vftoi).
+    void ftoi(int frac) {
+        if (frac) {
+            vsplatc(static_cast<std::uint32_t>(127 + frac) << 23);
+            c_.simd(kF32x4Mul);
+        }
+        c_.simd(kI32x4TruncSatF32x4S);
+    }
+
+    // Converts the ints on the stack as fp::from_fixed does: the nearest float, one unit back toward zero
+    // where that rounded away (from_fixed truncates), scaled by 2^-frac (vuops::vitof). A conversion rounds
+    // away when the float, truncated back, is past the int on the side away from zero, or when it is 2^31.
+    void itof(int frac) {
+        c_.tee(kV2);
+        c_.simd(kF32x4ConvertI32x4S);
+        c_.tee(kV3);
+        c_.simd(kI32x4TruncSatF32x4S);
+        c_.tee(kV4);
+        c_.get(kV2);
+        c_.simd(kI32x4LtS);     // below the int: away for a negative one
+        c_.get(kV4);
+        c_.get(kV2);
+        c_.simd(kI32x4GtS);     // above it: away for a positive one
+        c_.get(kV2);
+        vsplatc(0u);
+        c_.simd(kI32x4LtS);
+        c_.simd(kVBitselect);
+        c_.get(kV3);
+        vsplatc(0x4F000000u);
+        c_.simd(kI32x4Eq);
+        c_.simd(kVOr);
+        c_.get(kV3);
+        c_.simd(kI32x4Add);
+        if (frac) {
+            vsplatc(static_cast<std::uint32_t>(127 - frac) << 23);
+            c_.simd(kF32x4Mul);
+        }
+    }
+
+    // CLIP's flags as vuops::clip_value gives them, into kUclip: for x, y and z, whether the value (flushed)
+    // is above +|w| or below -|w| (|w| flushed), compared as sign-magnitude integers, nothing clamped, after
+    // the flags of the three CLIPs before.
+    void clip_value(unsigned fs, unsigned ft) {
+        raw_lane(ft, 3);
+        c_.i32c(0x7FFFFFFFu);
+        c_.op(kOpAnd);
+        c_.tee(kTmp);
+        c_.i32c(0);
+        c_.get(kTmp);
+        c_.i32c(0x007FFFFFu);
+        c_.op(kOpGtU);
+        c_.byte(0x1B);          // select: |w|, or 0 for a denormal
+        c_.simd(kVSplat);
+        c_.set(kV2);
+        raw_vec(fs);
+        c_.tee(kV3);
+        vsplatc(0x7FFFFFFFu);
+        c_.simd(kVAnd);
+        c_.tee(kV4);
+        c_.get(kV4);
+        vsplatc(0x007FFFFFu);
+        c_.simd(kI32x4GtS);
+        c_.simd(kVAnd);         // |x|, a denormal as 0
+        c_.get(kV2);
+        c_.simd(kI32x4GtS);     // past |w|
+        vconst(2u, 8u, 32u, 0u);
+        vconst(1u, 4u, 16u, 0u);
+        c_.get(kV3);
+        vsplatc(0u);
+        c_.simd(kI32x4LtS);
+        c_.simd(kVBitselect);   // the flag of each side
+        c_.simd(kVAnd);
+        c_.tee(kV5);
+        c_.simd(kVExtract);
+        c_.byte(0);
+        c_.get(kV5);
+        c_.simd(kVExtract);
+        c_.byte(1);
+        c_.op(kOpOr);
+        c_.get(kV5);
+        c_.simd(kVExtract);
+        c_.byte(2);
+        c_.op(kOpOr);
+        c_.get(kR);
+        c_.load(kOffClip);
+        c_.i32c(6);
+        c_.op(kOpShl);
+        c_.op(kOpOr);
+        c_.i32c(0xFFFFFFu);
+        c_.op(kOpAnd);
+        c_.set(kUclip);
+    }
+
+    // r.clip = kUclip, and the clip pipeline takes it with the current time (FlagPipe::set_clip).
+    void clip_post() {
+        c_.get(kR);
+        c_.get(kUclip);
+        c_.store(kOffClip);
+        fl();
+        fl();
+        c_.load(kOffCh);
+        c_.tee(kSlot);
+        c_.i32c(1);
+        c_.op(kOpAdd);
+        c_.store(kOffCh);
+        c_.get(kSlot);
+        c_.i32c(7);
+        c_.op(kOpAnd);
+        c_.i32c(2);
+        c_.op(kOpShl);
+        c_.tee(kSlot);
+        fl();
+        c_.load(kOffT);
+        c_.store(layout_.flags + kOffClipTs);
+        c_.get(kSlot);
+        c_.get(kUclip);
+        c_.store(layout_.flags + kOffClipV);
     }
 
     void vi(unsigned i) {
@@ -726,31 +899,31 @@ private:
     }
 
     void lane_mask(unsigned d) {
-        c_.vconst(lane(d, 0) ? ~0u : 0u, lane(d, 1) ? ~0u : 0u, lane(d, 2) ? ~0u : 0u, lane(d, 3) ? ~0u : 0u);
+        vconst(lane(d, 0) ? ~0u : 0u, lane(d, 1) ? ~0u : 0u, lane(d, 2) ? ~0u : 0u, lane(d, 3) ? ~0u : 0u);
     }
 
     void flags_inline(unsigned d) {
         const auto bits = [&](unsigned shift) {
-            c_.vconst(lane(d, 0) ? 8u << shift : 0u, lane(d, 1) ? 4u << shift : 0u, lane(d, 2) ? 2u << shift : 0u, lane(d, 3) ? 1u << shift : 0u);
+            vconst(lane(d, 0) ? 8u << shift : 0u, lane(d, 1) ? 4u << shift : 0u, lane(d, 2) ? 2u << shift : 0u, lane(d, 3) ? 1u << shift : 0u);
         };
         c_.set(kV0);
         c_.get(kV0);
-        c_.vsplatc(0x7F800000u);
+        vsplatc(0x7F800000u);
         c_.simd(kVAnd);
-        c_.vsplatc(0);
+        vsplatc(0);
         c_.simd(kI32x4Eq);
         bits(0);
         c_.simd(kVAnd);
         c_.get(kV0);
-        c_.vsplatc(0);
+        vsplatc(0);
         c_.simd(kI32x4LtS);
         bits(4);
         c_.simd(kVAnd);
         c_.simd(kVOr);
         c_.get(kV0);
-        c_.vsplatc(0x7FFFFFFFu);
+        vsplatc(0x7FFFFFFFu);
         c_.simd(kVAnd);
-        c_.vsplatc(0x7FFFFFFFu);
+        vsplatc(0x7FFFFFFFu);
         c_.simd(kI32x4Eq);
         bits(12);
         c_.simd(kVAnd);
@@ -818,6 +991,11 @@ private:
         c_.store(layout_.flags + kOffStatusV);
     }
 
+    // An upper whose result upper_pre leaves as one vector in kUv (the rest leave lanes in kUx..kUw).
+    bool in_vector(const Up &u) const {
+        return vector(u.kind) || (opt_.inlined && (u.kind == Ftoi || u.kind == Itof || u.kind == Opmula || u.kind == Opmsub));
+    }
+
     void upper_pre(const Up &u, bool flags_live);
     void upper_post(const Up &u, bool flags_live);
     bool lower(std::uint32_t w, std::uint32_t pc);
@@ -825,6 +1003,10 @@ private:
 };
 
 void Translator::upper_pre(const Up &u, bool flags_live) {
+    if (u.kind == Clip && opt_.inlined) {
+        clip_value(u.fs, u.ft);
+        return;
+    }
     if (u.kind == Clip) {
         c_.get(kR);
         c_.i32c(u.fs);
@@ -846,7 +1028,7 @@ void Translator::upper_pre(const Up &u, bool flags_live) {
                 c_.byte(static_cast<std::uint8_t>(u.bc));
                 c_.simd(kVSplat);
             } else {
-                c_.vsplatc(u.bc == 3 ? kOne : 0u);
+                vsplatc(u.bc == 3 ? kOne : 0u);
             }
             break;
         case Q:
@@ -862,21 +1044,41 @@ void Translator::upper_pre(const Up &u, bool flags_live) {
             vfix();
             break;
         }
+        // Every instruction of the adder goes through vadd_vu; SUB and MSUB turn the sign of what they take
+        // away. Without Options::exact SUB, MADD and MSUB keep the host's rounding, as before gap 013 was
+        // closed for them.
         switch (u.kind) {
-        case Add: vadd_vu(); vfix(); break;
-        case Sub: c_.simd(kF32x4Sub); vfix(); break;
+        case Add: vadd_vu(); break;
+        case Sub:
+            if (opt_.exact) {
+                vneg();
+                vadd_vu();
+            } else {
+                c_.simd(kF32x4Sub);
+                vfix();
+            }
+            break;
         case Mul: c_.simd(kF32x4Mul); vfix(); break;
         case Madd:
             c_.simd(kF32x4Mul);
             vfix();
-            c_.simd(kF32x4Add);
-            vfix();
+            if (opt_.exact) {
+                vadd_vu();
+            } else {
+                c_.simd(kF32x4Add);
+                vfix();
+            }
             break;
         default:
             c_.simd(kF32x4Mul);
             vfix();
-            c_.simd(kF32x4Sub);
-            vfix();
+            if (opt_.exact) {
+                vneg();
+                vadd_vu();
+            } else {
+                c_.simd(kF32x4Sub);
+                vfix();
+            }
             break;
         }
         c_.set(kUv);
@@ -885,7 +1087,7 @@ void Translator::upper_pre(const Up &u, bool flags_live) {
     if (vector(u.kind)) {
         raw_vec(u.fs);
         if (u.kind == Abs) {
-            c_.vsplatc(0x7FFFFFFFu);
+            vsplatc(0x7FFFFFFFu);
             c_.simd(kVAnd);
             c_.set(kUv);
             return;
@@ -915,6 +1117,34 @@ void Translator::upper_pre(const Up &u, bool flags_live) {
         vorder_of(kV3);
         c_.simd(u.kind == Max ? kI32x4GeS : kI32x4LeS);
         c_.simd(kVBitselect);
+        c_.set(kUv);
+        return;
+    }
+    if (opt_.inlined) {
+        switch (u.kind) {
+        case Ftoi:
+            operand(static_cast<int>(u.fs));
+            ftoi(u.frac);
+            break;
+        case Itof:
+            raw_vec(u.fs);
+            itof(u.frac);
+            break;
+        default:
+            // OPMULA: ACC.xyz = fs.yzx * ft.zxy; OPMSUB: fd.xyz = ACC.xyz - fs.yzx * ft.zxy, through the adder.
+            if (u.kind == Opmsub) operand(kAcc);
+            operand(static_cast<int>(u.fs));
+            permute(1, 2, 0, 3);
+            operand(static_cast<int>(u.ft));
+            permute(2, 0, 1, 3);
+            c_.simd(kF32x4Mul);
+            vfix();
+            if (u.kind == Opmsub) {
+                vneg();
+                vadd_vu();
+            }
+            break;
+        }
         c_.set(kUv);
         return;
     }
@@ -950,6 +1180,10 @@ void Translator::upper_pre(const Up &u, bool flags_live) {
 }
 
 void Translator::upper_post(const Up &u, bool flags_live) {
+    if (u.kind == Clip && opt_.inlined) {
+        clip_post();
+        return;
+    }
     if (u.kind == Clip) {
         c_.get(kR);
         fl();
@@ -959,7 +1193,7 @@ void Translator::upper_post(const Up &u, bool flags_live) {
     }
     if (!active(u, flags_live)) return;
     const std::uint32_t dst = reg_off(u.target < 0 ? 0 : u.target);
-    if (vector(u.kind)) {
+    if (in_vector(u)) {
         if (u.target == 0) {
             c_.get(kUv);
             flags_inline(u.dest);
@@ -984,7 +1218,7 @@ void Translator::upper_post(const Up &u, bool flags_live) {
     }
     if (u.target == 0) {
         c_.i32c(layout_.scratch);
-        c_.vconst(0, 0, 0, 0);
+        vconst(0, 0, 0, 0);
         c_.vstore(0);
         for (unsigned l = 0; l < 4; ++l) {
             if (!lane(u.dest, static_cast<int>(l))) continue;
@@ -1496,6 +1730,7 @@ bool Translator::run(std::vector<std::uint8_t> &out) {
         for (int reg : shadow_reads(word(pc + 4))) shadowed.insert(reg);
     std::uint32_t next_local = kShadow0;
     for (int reg : shadowed) shadow_[reg] = next_local++;
+    const_base_ = next_local;
 
     fl();
     c_.get(kR);
@@ -1565,7 +1800,7 @@ bool Translator::run(std::vector<std::uint8_t> &out) {
         }
         const bool target_active = active(u, flags_live) && u.target > 0;
         if (target_active && u.target != lower_write && shadow_.count(u.target)) {
-            const bool normalized = vector(u.kind) && arithmetic(u.kind);
+            const bool normalized = (vector(u.kind) && arithmetic(u.kind)) || (in_vector(u) && (u.kind == Opmula || u.kind == Opmsub));
             if (!normalized) {
                 c_.get(kR);
                 c_.vload(reg_off(u.target));
@@ -1698,12 +1933,19 @@ bool Translator::run(std::vector<std::uint8_t> &out) {
     es.u32(kImports);
     m.section(7, es);
 
+    // The constants' locals are set before anything else runs.
+    Code entry;
+    for (const auto &[value, local] : consts_) {
+        entry.vconst(value[0], value[1], value[2], value[3]);
+        entry.set(local);
+    }
     Out body;
     body.u32(2);
     body.u32(kI32Count);
     body.byte(0x7F);
-    body.u32(kVecTemps + static_cast<std::uint32_t>(shadow_.size()));
+    body.u32(kVecTemps + static_cast<std::uint32_t>(shadow_.size() + consts_.size()));
     body.byte(0x7B);
+    body.b.insert(body.b.end(), entry.b.begin(), entry.b.end());
     body.b.insert(body.b.end(), c_.b.begin(), c_.b.end());
     Out cs;
     cs.u32(1);
@@ -1717,8 +1959,8 @@ bool Translator::run(std::vector<std::uint8_t> &out) {
 
 }
 
-bool translate(const std::uint8_t *code, std::uint32_t entry, const Layout &layout, std::vector<std::uint8_t> &out) {
-    Translator t(code, entry, layout);
+bool translate(const std::uint8_t *code, std::uint32_t entry, const Layout &layout, std::vector<std::uint8_t> &out, const Options &options) {
+    Translator t(code, entry, layout, options);
     return t.run(out);
 }
 

@@ -4,6 +4,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -34,6 +35,21 @@ int mode() {
 
 namespace {
 
+// PS2_VU_JIT_OFF: the parts of the translation to leave out, comma-separated (vu_jit.hpp, Options).
+Options options() {
+    static const Options value = [] {
+        Options o;
+        const char *env = std::getenv("PS2_VU_JIT_OFF");
+        const std::string off = std::string(",") + (env ? env : "") + ",";
+        const auto named = [&](const char *name) { return off.find(std::string(",") + name + ",") != std::string::npos; };
+        o.consts = !named("consts");
+        o.exact = !named("exact");
+        o.inlined = !named("inline");
+        return o;
+    }();
+    return value;
+}
+
 struct State {
     vuops::FlagPipe fl;
     Reg128 scratch;
@@ -63,7 +79,7 @@ ProgramFn compile(const std::uint8_t *code, std::uint32_t entry) {
     std::vector<std::uint8_t> bytes;
     const Layout layout{static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(&g_state.fl)),
                         static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(&g_state.scratch))};
-    if (!translate(code, entry, layout, bytes)) return nullptr;
+    if (!translate(code, entry, layout, bytes, options())) return nullptr;
     const int index = ps2jit_instantiate(bytes.data(), static_cast<int>(bytes.size()));
     if (!index) return nullptr;
     return reinterpret_cast<ProgramFn>(static_cast<std::uintptr_t>(index));
