@@ -29,8 +29,8 @@ namespace ps2::gs::gpu {
 
 namespace {
 
-enum Pipeline { kUpload, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kPipelines };
-const char *const kEntryPoints[kPipelines] = {"upload", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve"};
+enum Pipeline { kUpload, kCopyRead, kCopyWrite, kLoadClut, kDisplay, kRaster, kResolve, kSnapshot, kPipelines };
+const char *const kEntryPoints[kPipelines] = {"upload", "copy_read", "copy_write", "load_clut", "display", "raster", "resolve", "snapshot"};
 
 constexpr std::uint32_t kParamStride = 256;
 constexpr std::uint32_t kClutSlots = 2048;
@@ -52,6 +52,19 @@ WGPUBindGroup g_blit_group = nullptr;
 WGPUBuffer g_blit_params = nullptr;
 std::uint32_t g_field = 0, g_last_width = 0, g_last_height = 0;
 bool g_have_previous = false;
+std::uint64_t g_feedback = 0;   // primitives that sample memory they draw into
+std::unordered_map<std::uint64_t, std::uint32_t> g_feedback_frames;   // with PS2_TRACE_FEEDBACK: how many in each frame
+
+bool trace_feedback() {
+    static const bool on = std::getenv("PS2_TRACE_FEEDBACK") != nullptr;
+    return on;
+}
+
+// PS2_NO_FEEDBACK_COPY: such primitives are drawn in their batch from memory as it is, as before (for an A/B).
+bool feedback_copy_off() {
+    static const bool off = std::getenv("PS2_NO_FEEDBACK_COPY") != nullptr;
+    return off;
+}
 std::uint32_t g_scale = 1, g_copy_words = 1u << 20, g_field_words = 1u << 19;
 
 std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1u) * g_field_words; }
@@ -129,6 +142,9 @@ struct Batch {
     bool zte = false, zwrite = false;
     int rx0 = 0, ry0 = 0, rx1 = -2, ry1 = -2;
     Range fb_range, z_range;
+    // A batch of one primitive that samples memory it draws into: the texels it reads were copied to scratch
+    // just before it (snap_w x snap_h from snap_x, snap_y, in texture coordinates; snap_w 0 for none).
+    std::uint32_t snap_x = 0, snap_y = 0, snap_w = 0, snap_h = 0;
 } g_batch;
 
 struct SetupCache {
@@ -331,6 +347,7 @@ void flush_batch() {
     Batch &b = g_batch;
     if (b.prims.empty()) {
         b.key = ~0ull;
+        b.snap_w = b.snap_h = 0;
         return;
     }
     const std::uint32_t prims = static_cast<std::uint32_t>(b.prims.size() / kPrimWords);
@@ -378,8 +395,9 @@ void flush_batch() {
         }
     }
     for (std::uint32_t t : g_touched) g_tile_count[t] = 0;
-    const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset});
+    const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, b.snap_w ? 1u : 0u, b.snap_x, b.snap_y, b.snap_w, b.snap_h});
     g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
+    b.snap_w = b.snap_h = 0;
     b.prims.clear();
     b.setups.clear();
     b.boxes.clear();
@@ -731,7 +749,8 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) 
     return flags;
 }
 
-bool texel_range(const std::uint32_t *setup, const Vertex *v, int count, std::uint32_t prim, bool fst, Range &out) {
+// The texels a primitive may sample, as a rectangle of texture coordinates (one texel of margin each way).
+bool texel_rect(const std::uint32_t *setup, const Vertex *v, int count, std::uint32_t prim, bool fst, int &ua, int &va, int &ub, int &vb) {
     const int tw = 1 << (setup[15] & 0xFFu), th = 1 << (setup[15] >> 8);
     float u0 = 1e30f, v0 = 1e30f, u1 = -1e30f, v1 = -1e30f;
     for (int i = 0; i < count; ++i) {
@@ -774,9 +793,18 @@ bool texel_range(const std::uint32_t *setup, const Vertex *v, int count, std::ui
         default: return false;
         }
     };
-    int ua, ub, va, vb;
     if (!axis((setup[7] >> 24) & 3u, u0, u1, tw, setup[18], ua, ub) || !axis((setup[7] >> 26) & 3u, v0, v1, th, setup[19], va, vb)) return false;
-    out = region(setup[12], setup[13], setup[14], std::max(ua, 0), std::max(va, 0), std::max(ub, 0), std::max(vb, 0));
+    ua = std::max(ua, 0);
+    va = std::max(va, 0);
+    ub = std::max(ub, 0);
+    vb = std::max(vb, 0);
+    return true;
+}
+
+bool texel_range(const std::uint32_t *setup, const Vertex *v, int count, std::uint32_t prim, bool fst, Range &out) {
+    int ua, ub, va, vb;
+    if (!texel_rect(setup, v, count, prim, fst, ua, va, ub, vb)) return false;
+    out = region(setup[12], setup[13], setup[14], ua, va, ub, vb);
     return true;
 }
 
@@ -1046,6 +1074,71 @@ void draw(const State &st, const Vertex *v, int count) {
     maxy = std::min(maxy, 2047);
     if (minx > maxx || miny > maxy) return;
 
+    // A primitive that samples memory it draws into (the game's speed blur draws the frame onto itself, PCSX2's
+    // GameDB has "autoFlush: 1 # Fixes blur" for it). In one raster dispatch every pixel is drawn by an
+    // invocation of its own, so what such a primitive reads would depend on which pixels the GPU had drawn
+    // already. It is drawn alone, from a copy of its texels taken just before it: it sees the memory as it was
+    // before it, as PCSX2's hardware renderer gives it.
+    int ua = 0, va = 0, ub = 0, vb = 0;
+    bool feedback = false;
+    if (flags & 2u) {
+        // Which bits of a word each side touches, where both are formats of whole 32-bit words: a texture in
+        // the top byte of the words of a 24-bit Z buffer (PSMT8H, the race's road) shares no bit with it.
+        const auto read_bits = [](std::uint32_t psm) {
+            switch (psm) {
+            case PSMT8H: return 0xFF000000u;
+            case PSMT4HL: return 0x0F000000u;
+            case PSMT4HH: return 0xF0000000u;
+            case PSMCT24: case PSMZ24: return 0x00FFFFFFu;
+            default: return 0xFFFFFFFFu;
+            }
+        };
+        const std::uint32_t tbits = read_bits(setup[14]);
+        const std::uint32_t fbits = setup[4] == 0xFFFFFFFFu ? 0u : setup[3] == PSMCT32 ? ~setup[4] : setup[3] == PSMCT24 ? 0x00FFFFFFu & ~setup[4] : 0xFFFFFFFFu;
+        const std::uint32_t zbits = setup[6] == PSMZ24 ? 0x00FFFFFFu : 0xFFFFFFFFu;
+        const bool color = (fbits & tbits) != 0, depth = (flags & 512u) && !(flags & 32u) && (zbits & tbits) != 0;
+        const Range f = region(setup[1], setup[2], setup[3], minx, miny, maxx, maxy), z = region(setup[5], setup[2], setup[6], minx, miny, maxx, maxy);
+        if ((color && cache.tex.overlaps(f.lo, f.hi)) || (depth && cache.tex.overlaps(z.lo, z.hi))) {
+            if (!texel_rect(setup, v, count, prim, fst, ua, va, ub, vb)) {
+                ua = va = 0;
+                ub = (1 << (setup[15] & 0xFFu)) - 1;
+                vb = (1 << (setup[15] >> 8)) - 1;
+            }
+            const auto layout = [](std::uint32_t psm) { return psm == PSMCT24 ? PSMCT32 : psm; };
+            const Range t = region(setup[12], setup[13], setup[14], ua, va, ub, vb);
+            if (setup[12] == setup[1] && setup[13] == setup[2] && layout(setup[14]) == layout(setup[3]))
+                feedback = color && ua <= maxx && minx <= ub && va <= maxy && miny <= vb;   // the frame as a texture: the rectangles tell
+            else
+                feedback = color && t.overlaps(f.lo, f.hi);
+            feedback = feedback || (depth && t.overlaps(z.lo, z.hi));
+        }
+        if (feedback) {
+            ++g_feedback;
+            if (trace_feedback()) {
+                // three of each kind (target, texture, primitive type), and a count per frame
+                static std::unordered_map<std::uint64_t, int> kinds;
+                const std::uint64_t kind = static_cast<std::uint64_t>(setup[1]) | static_cast<std::uint64_t>(setup[3]) << 16 | static_cast<std::uint64_t>(setup[12]) << 24 |
+                                           static_cast<std::uint64_t>(setup[14]) << 40 | static_cast<std::uint64_t>(prim) << 48 | static_cast<std::uint64_t>(depth) << 52;
+                ++g_feedback_frames[frames_run()];
+                if (kinds.size() < 256 && ++kinds[kind] <= 3) {
+                    std::fprintf(stderr, "[feedback] frame %llu prim %u fb %u/%u/%02X msk %08X z %d tex %u/%u/%02X %ux%u box %d,%d-%d,%d texels %d,%d-%d,%d fst %d bilinear %d abe %d\n",
+                                 static_cast<unsigned long long>(frames_run()), prim, setup[1], setup[2], setup[3], setup[4], depth ? 1 : 0, setup[12], setup[13], setup[14],
+                                 1u << (setup[15] & 0xFFu), 1u << (setup[15] >> 8), minx, miny, maxx, maxy, ua, va, ub, vb, fst ? 1 : 0, (flags & 16384u) ? 1 : 0, (flags & 8u) ? 1 : 0);
+                }
+            }
+            feedback = !feedback_copy_off();
+        }
+    }
+    if (feedback) {
+        emit_all();
+        const std::uint32_t w = static_cast<std::uint32_t>(ub - ua + 1), h = static_cast<std::uint32_t>(vb - va + 1);
+        dispatch_linear(kSnapshot, w * h * g_scale * g_scale, push_params({setup[14], setup[12], setup[13], static_cast<std::uint32_t>(ua), static_cast<std::uint32_t>(va), w, h}));
+        g_batch.snap_x = static_cast<std::uint32_t>(ua);
+        g_batch.snap_y = static_cast<std::uint32_t>(va);
+        g_batch.snap_w = w;
+        g_batch.snap_h = h;
+    }
+
     Batch &b = g_batch;
     const bool zte = flags & 512u;
     const std::uint64_t key = cache.key;
@@ -1097,7 +1190,7 @@ void draw(const State &st, const Vertex *v, int count) {
     b.miny = std::min(b.miny, miny);
     b.maxx = std::max(b.maxx, maxx);
     b.maxy = std::max(b.maxy, maxy);
-    if (b.prims.size() >= kPrimWords * 65536) emit_all();
+    if (feedback || b.prims.size() >= kPrimWords * 65536) emit_all();
 }
 
 void image_begin(const State &s) {
@@ -1229,6 +1322,16 @@ void stats() {
     std::fprintf(stderr, "[gpu] %llu submits, dispatches:", static_cast<unsigned long long>(g_submits));
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");
+    if (g_feedback)
+        std::fprintf(stderr, "[gpu] %llu primitives sampled memory they draw into%s\n", static_cast<unsigned long long>(g_feedback),
+                     feedback_copy_off() ? "" : ", each drawn alone from a copy of its texels");
+    if (!g_feedback_frames.empty()) {
+        std::uint32_t most = 0;
+        std::uint64_t at = 0;
+        for (const auto &[frame, n] : g_feedback_frames)
+            if (n > most) most = n, at = frame;
+        std::fprintf(stderr, "[gpu] they were in %zu frames, at most %u in one (frame %llu)\n", g_feedback_frames.size(), most, static_cast<unsigned long long>(at));
+    }
     std::fprintf(stderr, "[gpu] upload cache: %zu entries, %llu uploads found, %llu stored, %llu refused (an entry in use was in the way)\n", g_cache_book.entries(),
                  static_cast<unsigned long long>(g_cache_book.hits()), static_cast<unsigned long long>(g_cache_book.inserts()),
                  static_cast<unsigned long long>(g_cache_book.refused()));

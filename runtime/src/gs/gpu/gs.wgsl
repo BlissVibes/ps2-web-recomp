@@ -546,8 +546,22 @@ fn texel_y(s: Setup, yi: i32) -> u32 {
     return u32(wrap_coord(yi, 1 << s.th, mode(s, 26u, 2u), s.minv, s.maxv));
 }
 
+// A raster dispatch whose parameter 5 is not 0 draws one primitive that samples memory it draws into. Its
+// texels come from the copy the snapshot dispatch took just before it (parameters 6 to 9: the rectangle of
+// texture coordinates copied), so that every pixel sees the memory as it was before the primitive, whatever
+// order the pixels are drawn in.
 fn fetch(s: Setup, xi: i32, yi: i32, k: u32) -> u32 {
-    return convert(s, load_at(addr(s.tf, texel_x(s, xi), texel_y(s, yi)), k));
+    let tx = texel_x(s, xi);
+    let ty = texel_y(s, yi);
+    let l = addr(s.tf, tx, ty);
+    if (prm(5u) != 0u) {
+        let dx = tx - prm(6u);
+        let dy = ty - prm(7u);
+        if (dx < prm(8u) && dy < prm(9u)) {
+            return convert(s, (scratch[(dy * prm(8u) + dx) * SCALE * SCALE + k] >> l.shift) & l.mask);
+        }
+    }
+    return convert(s, load_at(l, k));
 }
 
 fn convert(s: Setup, raw: u32) -> u32 {
@@ -1061,6 +1075,20 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
         }
     }
     plot(s, x, y, k, at);
+}
+
+// The words under a rectangle of texels (parameters: psm, bp, bw, x, y, width, height), every sample of
+// each, into scratch, for a primitive that samples memory it draws into (fetch).
+@compute @workgroup_size(64)
+fn snapshot(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + gid.y * 64u * 1024u;
+    let n = SCALE * SCALE;
+    if (i >= prm(5u) * prm(6u) * n) {
+        return;
+    }
+    let texel = i / n;
+    let l = addr(fmt_of(prm(0u), prm(1u), prm(2u)), prm(3u) + texel % prm(5u), prm(4u) + texel / prm(5u));
+    scratch[i] = atomicLoad(&vram[l.word * SCALE * SCALE + i % n]);
 }
 
 @compute @workgroup_size(64)
