@@ -70,8 +70,11 @@ void run_vu(int unit, std::uint32_t address) {
     vu::run(unit, address);
 }
 
-template <std::uint32_t Bits, std::uint32_t Components, bool Usn>
-void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num) {
+// An unpack without the mask flag, every write cycle filled (cl >= wl). Offset: STMOD 1, the row added to
+// every lane (wrapping), the row left as it is.
+template <std::uint32_t Bits, std::uint32_t Components, bool Usn, bool Offset>
+void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std::uint32_t wl, std::uint32_t skip, const std::uint8_t *bytes, std::uint32_t num,
+                 const std::uint32_t *row) {
     std::uint32_t cycle = 0;
     for (std::uint32_t n = 0; n < num; ++n) {
         std::uint32_t value[4];
@@ -95,6 +98,8 @@ void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std:
         } else if constexpr (Components == 3) {
             value[3] = 0;
         }
+        if constexpr (Offset)
+            for (std::uint32_t j = 0; j < 4; ++j) value[j] += row[j];
         std::memcpy(mem + (addr & mask) * 16, value, 16);
         ++addr;
         if (++cycle >= wl) {
@@ -104,23 +109,24 @@ void unpack_fast(std::uint8_t *mem, std::uint32_t mask, std::uint32_t addr, std:
     }
 }
 
-using FastUnpack = void (*)(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, const std::uint8_t *, std::uint32_t);
+using FastUnpack = void (*)(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, const std::uint8_t *, std::uint32_t, const std::uint32_t *);
 
-template <std::uint32_t Bits>
+template <std::uint32_t Bits, bool Offset>
 constexpr FastUnpack fast_pair(std::uint32_t components, bool usn) {
     switch (components) {
-    case 1: return usn ? unpack_fast<Bits, 1, true> : unpack_fast<Bits, 1, false>;
-    case 2: return usn ? unpack_fast<Bits, 2, true> : unpack_fast<Bits, 2, false>;
-    case 3: return usn ? unpack_fast<Bits, 3, true> : unpack_fast<Bits, 3, false>;
-    default: return usn ? unpack_fast<Bits, 4, true> : unpack_fast<Bits, 4, false>;
+    case 1: return usn ? unpack_fast<Bits, 1, true, Offset> : unpack_fast<Bits, 1, false, Offset>;
+    case 2: return usn ? unpack_fast<Bits, 2, true, Offset> : unpack_fast<Bits, 2, false, Offset>;
+    case 3: return usn ? unpack_fast<Bits, 3, true, Offset> : unpack_fast<Bits, 3, false, Offset>;
+    default: return usn ? unpack_fast<Bits, 4, true, Offset> : unpack_fast<Bits, 4, false, Offset>;
     }
 }
 
+template <bool Offset>
 constexpr FastUnpack kFastUnpack[4][4][2] = {
-    {{fast_pair<32>(1, false), fast_pair<32>(1, true)}, {fast_pair<32>(2, false), fast_pair<32>(2, true)}, {fast_pair<32>(3, false), fast_pair<32>(3, true)}, {fast_pair<32>(4, false), fast_pair<32>(4, true)}},
-    {{fast_pair<16>(1, false), fast_pair<16>(1, true)}, {fast_pair<16>(2, false), fast_pair<16>(2, true)}, {fast_pair<16>(3, false), fast_pair<16>(3, true)}, {fast_pair<16>(4, false), fast_pair<16>(4, true)}},
-    {{fast_pair<8>(1, false), fast_pair<8>(1, true)}, {fast_pair<8>(2, false), fast_pair<8>(2, true)}, {fast_pair<8>(3, false), fast_pair<8>(3, true)}, {fast_pair<8>(4, false), fast_pair<8>(4, true)}},
-    {{fast_pair<16>(1, false), fast_pair<16>(1, true)}, {fast_pair<16>(2, false), fast_pair<16>(2, true)}, {fast_pair<16>(3, false), fast_pair<16>(3, true)}, {fast_pair<16>(4, false), fast_pair<16>(4, true)}},
+    {{fast_pair<32, Offset>(1, false), fast_pair<32, Offset>(1, true)}, {fast_pair<32, Offset>(2, false), fast_pair<32, Offset>(2, true)}, {fast_pair<32, Offset>(3, false), fast_pair<32, Offset>(3, true)}, {fast_pair<32, Offset>(4, false), fast_pair<32, Offset>(4, true)}},
+    {{fast_pair<16, Offset>(1, false), fast_pair<16, Offset>(1, true)}, {fast_pair<16, Offset>(2, false), fast_pair<16, Offset>(2, true)}, {fast_pair<16, Offset>(3, false), fast_pair<16, Offset>(3, true)}, {fast_pair<16, Offset>(4, false), fast_pair<16, Offset>(4, true)}},
+    {{fast_pair<8, Offset>(1, false), fast_pair<8, Offset>(1, true)}, {fast_pair<8, Offset>(2, false), fast_pair<8, Offset>(2, true)}, {fast_pair<8, Offset>(3, false), fast_pair<8, Offset>(3, true)}, {fast_pair<8, Offset>(4, false), fast_pair<8, Offset>(4, true)}},
+    {{fast_pair<16, Offset>(1, false), fast_pair<16, Offset>(1, true)}, {fast_pair<16, Offset>(2, false), fast_pair<16, Offset>(2, true)}, {fast_pair<16, Offset>(3, false), fast_pair<16, Offset>(3, true)}, {fast_pair<16, Offset>(4, false), fast_pair<16, Offset>(4, true)}},
 };
 
 void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data) {
@@ -153,8 +159,9 @@ void unpack(int unit, std::uint32_t cmd, const std::uint32_t *data) {
     std::uint32_t cycle = 0;
     std::uint8_t *mem = dry ? g_dry_run : vu_data(unit);
     const std::uint32_t wrap = vu_qwords(unit);
-    if (!masked && u.mode == 0 && !(wl > cl) && !(vn == 3 && vl == 3)) {
-        kFastUnpack[vl][vn][usn ? 1 : 0](mem, wrap - 1, addr, wl, cl - wl, reinterpret_cast<const std::uint8_t *>(data), num);
+    if (!masked && u.mode <= 1 && !(wl > cl) && !(vn == 3 && vl == 3)) {
+        const FastUnpack fast = u.mode ? kFastUnpack<true>[vl][vn][usn ? 1 : 0] : kFastUnpack<false>[vl][vn][usn ? 1 : 0];
+        fast(mem, wrap - 1, addr, wl, cl - wl, reinterpret_cast<const std::uint8_t *>(data), num, u.row);
         u.num = 0;
         return;
     }
@@ -277,6 +284,16 @@ std::size_t run(int unit, const std::uint32_t *words, std::size_t count) {
     std::size_t pos = 0;
     while (pos < count && !u.stalled) {
         const std::uint32_t cmd = words[pos];
+        // A run of NOPs without the interrupt bit (58% of the codes of a race) does nothing but leave the
+        // last one in CODE: passed over at once.
+        if (!(cmd & 0xFF000000u)) {
+            std::size_t end = pos + 1;
+            while (end < count && !(words[end] & 0xFF000000u)) ++end;
+            u.code = words[end - 1];
+            if (!on_vu_thread()) g_commands[unit][0] += end - pos;
+            pos = end;
+            continue;
+        }
         const std::size_t start = pos + 1;
         const std::uint32_t need = data_words(unit, cmd);
         if (start + need > count) break;
