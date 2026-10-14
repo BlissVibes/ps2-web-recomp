@@ -1,3 +1,4 @@
+#include "ps2/disc.hpp"
 #include "ps2/harness.hpp"
 #include "ps2/hook.hpp"
 #include "ps2/system.hpp"
@@ -24,7 +25,7 @@ namespace {
 int usage() {
     std::fprintf(stderr,
                  "usage: ps2run <elf> [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
-                 "              [--disc image.iso] [--memcard card.ps2] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
+                 "              [--disc image.iso [--disc-log file]] [--memcard card.ps2] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
                  "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n]\n"
                  "              [--press frame:button[+button][:frames]]... [--window]\n"
                  "              [--save-state frame:file] [--load-state file]\n"
@@ -34,6 +35,31 @@ int usage() {
                  "               [--hook name|addr] [--hooks all] [--out file.json]]\n"
                  "              [--shadow N]   with hooks: compare every Nth call of each hook with the recompiled function\n");
     return 2;
+}
+
+// --disc-log: the disc is read as --disc reads it, and every read is also written to `log_path` as a line
+// "frame offset bytes". The page reads the same disc through its chunk cache (host/disc_cache.cpp); a log of
+// a route lets that cache be tried with other sizes without a browser (scripts/disc_replay.cpp).
+bool open_logged_disc(const std::string &path, const std::string &log_path) {
+    std::FILE *file = std::fopen(path.c_str(), "rb");
+    std::FILE *log = std::fopen(log_path.c_str(), "w");
+    if (!file || !log) return false;
+#if defined(_WIN32)
+    _fseeki64(file, 0, SEEK_END);
+    const std::uint64_t size = static_cast<std::uint64_t>(_ftelli64(file));
+#else
+    fseeko(file, 0, SEEK_END);
+    const std::uint64_t size = static_cast<std::uint64_t>(ftello(file));
+#endif
+    return ps2::disc::open(path, size, [file, log](std::uint64_t offset, void *out, std::size_t bytes) {
+        std::fprintf(log, "%llu %llu %zu\n", static_cast<unsigned long long>(ps2::frames_run()), static_cast<unsigned long long>(offset), bytes);
+#if defined(_WIN32)
+        _fseeki64(file, static_cast<long long>(offset), SEEK_SET);
+#else
+        fseeko(file, static_cast<off_t>(offset), SEEK_SET);
+#endif
+        return std::fread(out, 1, bytes, file);
+    });
 }
 
 }
@@ -48,6 +74,7 @@ int main(int argc, char **argv) {
     std::vector<std::string> hooks;
     bool all_hooks = false;
     std::uint32_t shadow = 0;
+    std::string disc_log;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--arg" && i + 1 < argc) args.push_back(argv[++i]);
@@ -61,6 +88,7 @@ int main(int argc, char **argv) {
         else if (a == "--trace-io") ps2::g_options.trace_io = true;
         else if (a == "--trace-threads") ps2::g_options.trace_threads = true;
         else if (a == "--disc" && i + 1 < argc) ps2::g_options.disc_path = argv[++i];
+        else if (a == "--disc-log" && i + 1 < argc) disc_log = argv[++i];
         else if (a == "--memcard" && i + 1 < argc) ps2::g_options.memcard_path = argv[++i];
         else if (a == "--trace-iop") ps2::g_options.trace_iop_modules = true;
         else if (a == "--trace-iop-hle") ps2::g_options.trace_iop_hle = true;
@@ -116,6 +144,13 @@ int main(int argc, char **argv) {
     if (call.address && load_path.empty()) {
         std::fprintf(stderr, "--call needs --snapshot\n");
         return 2;
+    }
+    if (!disc_log.empty()) {
+        if (ps2::g_options.disc_path.empty() || !open_logged_disc(ps2::g_options.disc_path, disc_log)) {
+            std::fprintf(stderr, "--disc-log needs a --disc that opens and a log file that can be written\n");
+            return 2;
+        }
+        ps2::g_options.disc_path.clear();   // open already: boot must not open it again without the log
     }
     std::uint32_t entry = 0;
     if (!ps2::load_elf(argv[1], entry)) {
