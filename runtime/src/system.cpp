@@ -438,6 +438,7 @@ int run() {
     gif::stats();
     if (idle_calls_taken()) std::fprintf(stderr, "[ee] %llu turns of waiting loops skipped (idle calls)\n", static_cast<unsigned long long>(idle_calls_taken()));
     vif::stats();
+    vu::stats();
     std::fprintf(stderr, "[ee] stopped after %llu frames, %llu cycles: %s\n",
                  static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(now()), g_halt_reason.c_str());
     return 0;

@@ -7,17 +7,21 @@
 #include "ps2/fpu.hpp"
 #include "ps2/system.hpp"
 #include "ps2/vu.hpp"
+#include "ps2/vu_exact.hpp"
 #include "ps2/vu_ops.hpp"
 
 #include "ps2/state.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -34,11 +38,13 @@ struct Unit {
     std::uint32_t data_qwords;
     std::uint32_t tpc;
     vuops::FlagPipe *pipe = nullptr;
+    bool dry = false;   // XGKICK sends nothing: the call is run a second time, for real
 };
 
 Vu0Regs g_vu1;
 std::uint32_t g_top = 0, g_itop = 0;
 std::uint64_t g_reported = 0;
+Vu0Counters g_vu0{};
 
 Unit unit_of(int n) {
     if (n == 0) return Unit{&g_cpu.vu0, g_vu0_code, g_vu0_mem, 4095u, 256u, g_cpu.vu0.tpc};
@@ -522,7 +528,10 @@ void lower(Unit &u, std::uint32_t w, std::uint32_t pc, std::uint32_t &npc, bool 
         case 0x64: if (ft) for (int i = 0; i < 4; ++i) if (dest & (8u >> i)) r.vf[ft].w[i] = r.p; break;
         case 0x68: store_vi(r, it, g_top); break;
         case 0x69: store_vi(r, it, g_itop); break;
-        case 0x6C: xgkick(u, r.vi[is]); break;
+        case 0x6C:
+            if (u.dry) ++g_vu0.kicks_skipped;
+            else xgkick(u, r.vi[is]);
+            break;
         case 0x70: case 0x71: case 0x72: case 0x73: {
             const float x = u2f(r.vf[fs].w[0]), y = u2f(r.vf[fs].w[1]), z = u2f(r.vf[fs].w[2]);
             const float sum = x * x + y * y + z * z;
@@ -978,13 +987,11 @@ void run_fast(int n, std::uint32_t address) {
     std::fprintf(stderr, "[vu%d] program at 0x%04X did not end\n", n, address);
 }
 
-void run(int n, std::uint32_t address) {
-    static const bool exact = std::getenv("PS2_VU_EXACT") != nullptr;
-    if (n == 1 && !exact) {
-        interpret(n, address);
-        return;
-    }
+// The exact loop: every instruction is fetched and decoded as it is met, and upper() computes each lane with
+// the integer model (ps2/fpu.hpp). Returns the number of instructions it ran.
+std::uint32_t run_exact(int n, std::uint32_t address, bool dry = false) {
     Unit u = unit_of(n);
+    u.dry = dry;
     Vu0Regs &r = *u.regs;
     vuops::FlagPipe pipe;
     pipe.start(r);
@@ -1025,11 +1032,547 @@ void run(int n, std::uint32_t address) {
         if (ending) {
             delayed.finish(r);
             r.tpc = pc;
-            return;
+            return steps + 1;
         }
         if (hi & 0x40000000u) ending = true;
     }
     std::fprintf(stderr, "[vu%d] program at 0x%04X did not end\n", n, address);
+    return 1'000'000;
+}
+
+namespace {
+
+using vuops::v4i;
+using vuops::v4u;
+using vuops::vload;
+using vuops::vsel;
+using vuops::vsplat;
+using vuops::vstore;
+
+Vu0Mode g_vu0_mode = Vu0Mode::Fast;
+bool g_vu0_mode_set = false;
+void (*g_vu0_tamper)(Vu0Regs &, std::uint8_t *) = nullptr;
+
+// What the fast loop does for the upper of an instruction pair, how it puts the result away once the lower
+// has run, and which lowers it runs itself. V: the second operand is ft, lane by lane. S: it is one value
+// for every lane (one lane of ft, Q or I). One: that value is the w of vf0, which is 1.0, so the product
+// is the first operand. 1: the instruction has one lane, which the model computes sooner than four lanes
+// of host floats are set up.
+enum Vu0Upper : std::uint8_t {
+    kUpNone, kUpAddV, kUpAddS, kUpSubV, kUpSubS, kUpMulV, kUpMulS, kUpMaddV, kUpMaddS, kUpMsubV, kUpMsubS,
+    kUpMaxV, kUpMaxS, kUpMinV, kUpMinS, kUpAbs, kUpFtoi, kUpItof, kUpClip, kUpOpmula, kUpOpmsub,
+    kUpMulOne, kUpMaddOne, kUpMsubOne, kUpAdd1, kUpSub1, kUpMul1, kUpMadd1, kUpMsub1,
+};
+enum Vu0Commit : std::uint8_t { kPutNothing, kPutLanesFlags, kPutLanes, kPutFlags, kPutLane, kPutClip };
+enum Vu0Lower : std::uint8_t {
+    kLoGeneric, kLoNone, kLoI, kLoIaddiu, kLoIsubiu, kLoIadd, kLoIand, kLoIor, kLoLq, kLoSq, kLoFmand, kLoFmor, kLoB, kLoIbeq, kLoIbne, kLoIbgtz, kLoIblez,
+};
+
+// One instruction pair as the fast loop runs it, decoded once per code image.
+struct Vu0Op {
+    std::uint32_t lo, hi;
+    std::uint8_t upper, commit, lower;          // Vu0Upper, Vu0Commit, Vu0Lower
+    std::uint8_t dest, target, fs, ft;          // the upper's lanes and registers; target kAcc is ACC
+    std::uint8_t frac;                          // FTOI and ITOF: fraction bits
+    std::uint8_t lane;                          // the lane of a one-lane form, 0 for x to 3 for w
+    bool end;                                   // the E bit
+    std::uint8_t it, is, id, ldest, lft, lfs;   // the lower's fields
+    std::uint16_t second;                       // where an S form's second operand is, as an offset into Vu0Regs
+    std::uint16_t branch;                       // where a relative branch goes
+    std::uint32_t imm;                          // the lower's immediate: 11 bits with their sign (LQ, SQ) or 15 bits (IADDIU, ISUBIU)
+    std::uint32_t mac_lanes;                    // the upper's lanes in each group of four MAC bits
+};
+
+Vu0Op decode_vu0(std::uint32_t lo, std::uint32_t hi, std::uint32_t pc) {
+    Vu0Op op{};
+    op.lo = lo;
+    op.hi = hi;
+    op.end = (hi & 0x40000000u) != 0;
+    const Decoded d = decode_upper(lo, hi);
+    op.dest = d.dest;
+    op.target = d.target;
+    op.fs = d.fs;
+    op.ft = d.ft;
+    op.frac = d.frac;
+    op.mac_lanes = d.dest * 0x1111u;
+    switch (d.source) {
+    case kVec: break;
+    case kBc: op.second = static_cast<std::uint16_t>(offsetof(Vu0Regs, vf) + d.ft * 16u + d.bc * 4u); break;
+    case kQ: op.second = static_cast<std::uint16_t>(offsetof(Vu0Regs, q)); break;
+    case kI: op.second = static_cast<std::uint16_t>(offsetof(Vu0Regs, i)); break;
+    }
+    const bool one = d.source != kVec;
+    switch (d.kind) {
+    case kNop: op.upper = kUpNone; break;
+    case kAdd: op.upper = one ? kUpAddS : kUpAddV; break;
+    case kSub: op.upper = one ? kUpSubS : kUpSubV; break;
+    case kMul: op.upper = one ? kUpMulS : kUpMulV; break;
+    case kMadd: op.upper = one ? kUpMaddS : kUpMaddV; break;
+    case kMsub: op.upper = one ? kUpMsubS : kUpMsubV; break;
+    case kMax: op.upper = one ? kUpMaxS : kUpMaxV; break;
+    case kMin: op.upper = one ? kUpMinS : kUpMinV; break;
+    case kAbs: op.upper = kUpAbs; break;
+    case kFtoi: op.upper = kUpFtoi; break;
+    case kItof: op.upper = kUpItof; break;
+    case kClip: op.upper = kUpClip; break;
+    case kOpmula: op.upper = kUpOpmula; break;
+    case kOpmsub: op.upper = kUpOpmsub; break;
+    }
+    const bool arithmetic = d.kind == kAdd || d.kind == kSub || d.kind == kMul || d.kind == kMadd || d.kind == kMsub;
+    if (arithmetic && std::popcount(static_cast<unsigned>(d.dest)) == 1) {
+        op.lane = static_cast<std::uint8_t>(std::countl_zero(static_cast<std::uint8_t>(d.dest)) - 4);
+        if (d.source == kVec) op.second = static_cast<std::uint16_t>(offsetof(Vu0Regs, vf) + d.ft * 16u + op.lane * 4u);
+        op.upper = d.kind == kAdd ? kUpAdd1 : d.kind == kSub ? kUpSub1 : d.kind == kMul ? kUpMul1 : d.kind == kMadd ? kUpMadd1 : kUpMsub1;
+    } else if (d.source == kBc && d.ft == 0 && d.bc == 3) {
+        // vf0 is (0, 0, 0, 1.0) when the loop starts and nothing writes it, and fp::mul(s, 1.0) is s with
+        // a denormal flushed, for every s: no multiply is needed.
+        if (d.kind == kMul) op.upper = kUpMulOne;
+        if (d.kind == kMadd) op.upper = kUpMaddOne;
+        if (d.kind == kMsub) op.upper = kUpMsubOne;
+    }
+    // An upper that sets no flags and writes vf0 leaves nothing behind.
+    if (op.upper != kUpClip && !d.flags && d.target == 0) op.upper = kUpNone;
+    op.commit = op.upper == kUpNone ? kPutNothing : op.upper == kUpClip ? kPutClip : op.upper >= kUpAdd1 ? kPutLane : !d.flags ? kPutLanes : d.target ? kPutLanesFlags : kPutFlags;
+
+    // The lowers the loop runs itself, transcribed from lower(): the common ones that touch neither Q nor
+    // P. Every other one goes through lower().
+    op.it = (lo >> 16) & 15u;
+    op.is = (lo >> 11) & 15u;
+    op.id = (lo >> 6) & 15u;
+    op.ldest = (lo >> 21) & 15u;
+    op.lft = (lo >> 16) & 31u;
+    op.lfs = (lo >> 11) & 31u;
+    const std::int32_t imm11 = static_cast<std::int32_t>(lo << 21) >> 21;
+    op.imm = static_cast<std::uint32_t>(imm11);
+    op.branch = static_cast<std::uint16_t>((pc + 8u + static_cast<std::uint32_t>(imm11) * 8u) & 4095u);
+    op.lower = kLoGeneric;
+    if (hi & 0x80000000u) {
+        op.lower = kLoI;
+    } else if ((lo >> 25) == 0x40u) {
+        const unsigned funct = lo & 63u;
+        if (funct == 0x30) op.lower = kLoIadd;
+        else if (funct == 0x34) op.lower = kLoIand;
+        else if (funct == 0x35) op.lower = kLoIor;
+        // MOVE with nothing to move: what an instruction with only an upper has as its lower.
+        else if (funct >= 0x3C && ((lo >> 6) & 31u) * 4u + (funct & 3u) == 0x30 && (!op.lft || !op.ldest || op.lft == op.lfs)) op.lower = kLoNone;
+    } else {
+        switch (lo >> 25) {
+        case 0x00: op.lower = kLoLq; break;
+        case 0x01: op.lower = kLoSq; break;
+        case 0x08: op.lower = kLoIaddiu; op.imm = ((lo >> 10) & 0x7800u) | (lo & 0x7FFu); break;
+        case 0x09: op.lower = kLoIsubiu; op.imm = ((lo >> 10) & 0x7800u) | (lo & 0x7FFu); break;
+        case 0x1A: op.lower = kLoFmand; break;
+        case 0x1B: op.lower = kLoFmor; break;
+        case 0x20: op.lower = kLoB; break;
+        case 0x28: op.lower = kLoIbeq; break;
+        case 0x29: op.lower = kLoIbne; break;
+        case 0x2D: op.lower = kLoIbgtz; break;
+        case 0x2E: op.lower = kLoIblez; break;
+        default: break;
+        }
+    }
+    return op;
+}
+
+// The code VU0 holds, decoded. VIF0 swaps a few programs in and out many times a frame, so the decoded
+// forms of the last 16 code images are kept, most recently used first. An image is looked for, by
+// comparing the code, only after code_changed(0) said the code is another.
+struct Vu0Image {
+    std::uint8_t code[4096];
+    Vu0Op ops[512];
+};
+
+std::vector<std::unique_ptr<Vu0Image>> g_vu0_images;
+Vu0Image *g_vu0_image = nullptr;
+std::uint32_t g_vu0_image_generation = 0;
+
+__attribute__((noinline)) Vu0Image &find_image() {
+    ++g_vu0.lookups;
+    g_vu0_image_generation = g_generation[0];
+    for (std::size_t i = 0; i < g_vu0_images.size(); ++i)
+        if (std::memcmp(g_vu0_images[i]->code, g_vu0_code, sizeof g_vu0_code) == 0) {
+            std::rotate(g_vu0_images.begin(), g_vu0_images.begin() + i, g_vu0_images.begin() + i + 1);
+            return *(g_vu0_image = g_vu0_images[0].get());
+        }
+    // Not kept: a new image, or the one used longest ago, goes to the front and is decoded.
+    if (g_vu0_images.size() < 16) g_vu0_images.push_back(std::make_unique<Vu0Image>());
+    std::rotate(g_vu0_images.begin(), g_vu0_images.end() - 1, g_vu0_images.end());
+    Vu0Image &image = *g_vu0_images[0];
+    std::memcpy(image.code, g_vu0_code, sizeof image.code);
+    for (std::uint32_t pc = 0; pc < sizeof image.code; pc += 8) {
+        std::uint32_t lo, hi;
+        std::memcpy(&lo, image.code + pc, 4);
+        std::memcpy(&hi, image.code + pc + 4, 4);
+        image.ops[pc >> 3] = decode_vu0(lo, hi, pc);
+    }
+    ++g_vu0.images;
+    return *(g_vu0_image = &image);
+}
+
+PS2_VU_INLINE Vu0Image &current_image() {
+    if (g_vu0_image && g_vu0_image_generation == g_generation[0]) return *g_vu0_image;
+    return find_image();
+}
+
+// Check modes: the image the fast loop holds as current is no longer the code in memory. Some writer of
+// VU0 code did not call code_changed(0), and the fast loop ran what was there before.
+bool image_stale() {
+    return g_vu0_image && g_vu0_image_generation == g_generation[0] && std::memcmp(g_vu0_image->code, g_vu0_code, sizeof g_vu0_code) != 0;
+}
+
+alignas(16) const std::uint32_t kLaneMasks[16][4] = {
+    {0, 0, 0, 0}, {0, 0, 0, ~0u}, {0, 0, ~0u, 0}, {0, 0, ~0u, ~0u}, {0, ~0u, 0, 0}, {0, ~0u, 0, ~0u}, {0, ~0u, ~0u, 0}, {0, ~0u, ~0u, ~0u},
+    {~0u, 0, 0, 0}, {~0u, 0, 0, ~0u}, {~0u, 0, ~0u, 0}, {~0u, 0, ~0u, ~0u}, {~0u, ~0u, 0, 0}, {~0u, ~0u, 0, ~0u}, {~0u, ~0u, ~0u, 0}, {~0u, ~0u, ~0u, ~0u},
+};
+
+// All ones in the lanes of a dest field (x in bit 3 down to w in bit 0).
+PS2_VU_INLINE v4u lane_mask(unsigned dest) {
+    v4u m;
+    std::memcpy(&m, kLaneMasks[dest], 16);
+    return m;
+}
+
+PS2_VU_INLINE v4u load_qword(const std::uint8_t *q) {
+    v4u v;
+    std::memcpy(&v, q, 16);
+    return v;
+}
+
+PS2_VU_INLINE std::uint32_t second_operand(const Vu0Regs &r, const Vu0Op &op) {
+    std::uint32_t b;
+    std::memcpy(&b, reinterpret_cast<const std::uint8_t *>(&r) + op.second, 4);
+    return b;
+}
+
+// The exact loop's routine for one upper: for an instruction with a lane that host floats cannot compute.
+__attribute__((noinline)) v4u model_upper(Vu0Regs &r, const Vu0Op &op) {
+    ++g_vu0.slow;
+    return vload(upper(r, op.hi).value);
+}
+
+// set_flags() from its MAC flags on: the status bits and their sticky copies.
+PS2_VU_INLINE void put_flags(Vu0Regs &r, std::uint32_t mac) {
+    r.mac = mac;
+    std::uint32_t status = r.status & 0xFF0u;
+    if (mac & 0x000Fu) status |= 0x1u;
+    if (mac & 0x00F0u) status |= 0x2u;
+    if (mac & 0x0F00u) status |= 0x4u;
+    if (mac & 0xF000u) status |= 0x8u;
+    status |= (status & 0xFu) << 6;
+    r.status = (status & ~0x30u) | (r.status & 0x30u);
+}
+
+// The fast loop: the exact loop's steps in the exact loop's order, over instructions decoded once per code
+// image, with the arithmetic on four lanes of host floats (ps2/vu_exact.hpp gives the model's bits or says
+// which lanes it cannot compute). Flags, Q and P go through the same FlagPipe and Delayed, and every lower
+// through the same lower(). Returns the number of instructions it ran.
+std::uint32_t run_vu0(std::uint32_t address, bool dry) {
+    Unit u = unit_of(0);
+    u.dry = dry;
+    Vu0Regs &r = *u.regs;
+    // No instruction writes vf0 or vi0, so the exact loop's setting them after every instruction matters
+    // only when a call starts with them wrong: such a call goes to the exact loop.
+    if (r.vf[0].d[0] != 0 || r.vf[0].w[2] != 0 || r.vf[0].w[3] != fp::kOne || r.vi[0] != 0) {
+        ++g_vu0.guarded;
+        return run_exact(0, address, dry);
+    }
+    const Vu0Op *ops = current_image().ops;
+    vuops::FlagPipe pipe;
+    pipe.start(r);
+    u.pipe = &pipe;
+    std::uint32_t pc = address & u.code_mask, npc = (pc + 8u) & u.code_mask;
+    bool ending = false;
+    Delayed delayed;
+    for (std::uint32_t steps = 0; steps < 1'000'000; ++steps) {
+        const Vu0Op &op = ops[pc >> 3];
+        const std::uint32_t current = pc;
+        pc = npc;
+        npc = (npc + 8u) & u.code_mask;
+        ++pipe.t;
+        delayed.tick(r);
+        // The upper's result, from the registers as they are before the lower runs.
+        const v4u lanes = lane_mask(op.dest);
+        v4u value = {0, 0, 0, 0}, bad = {0, 0, 0, 0};
+        std::uint32_t one = 0, clip = 0;
+        switch (op.upper) {
+        case kUpNone: break;
+        case kUpAdd1: one = fp::add(r.vf[op.fs].w[op.lane], second_operand(r, op)); break;
+        case kUpSub1: one = fp::sub(r.vf[op.fs].w[op.lane], second_operand(r, op)); break;
+        case kUpMul1: one = fp::mul(r.vf[op.fs].w[op.lane], second_operand(r, op)); break;
+        case kUpMadd1: one = fp::add(r.acc.w[op.lane], fp::mul(r.vf[op.fs].w[op.lane], second_operand(r, op))); break;
+        case kUpMsub1: one = fp::sub(r.acc.w[op.lane], fp::mul(r.vf[op.fs].w[op.lane], second_operand(r, op))); break;
+        case kUpMulOne: value = vuexact::vflush(vload(r.vf[op.fs])); break;
+        case kUpMaddOne: value = vuexact::add(vload(r.acc), vload(r.vf[op.fs]), bad); break;
+        case kUpMsubOne: value = vuexact::sub(vload(r.acc), vload(r.vf[op.fs]), bad); break;
+        case kUpAddV: value = vuexact::add(vload(r.vf[op.fs]), vload(r.vf[op.ft]), bad); break;
+        case kUpAddS: value = vuexact::add(vload(r.vf[op.fs]), vsplat(second_operand(r, op)), bad); break;
+        case kUpSubV: value = vuexact::sub(vload(r.vf[op.fs]), vload(r.vf[op.ft]), bad); break;
+        case kUpSubS: value = vuexact::sub(vload(r.vf[op.fs]), vsplat(second_operand(r, op)), bad); break;
+        case kUpMulV: value = vuexact::mul(vload(r.vf[op.fs]), vload(r.vf[op.ft]), bad); break;
+        case kUpMulS: value = vuexact::mul1(vload(r.vf[op.fs]), second_operand(r, op), bad); break;
+        case kUpMaddV: value = vuexact::madd(vload(r.acc), vload(r.vf[op.fs]), vload(r.vf[op.ft]), bad); break;
+        case kUpMaddS: value = vuexact::madd1(vload(r.acc), vload(r.vf[op.fs]), second_operand(r, op), bad); break;
+        case kUpMsubV: value = vuexact::msub(vload(r.acc), vload(r.vf[op.fs]), vload(r.vf[op.ft]), bad); break;
+        case kUpMsubS: value = vuexact::msub1(vload(r.acc), vload(r.vf[op.fs]), second_operand(r, op), bad); break;
+        case kUpMaxV: value = vuops::vmax(vload(r.vf[op.fs]), vload(r.vf[op.ft])); break;
+        case kUpMaxS: value = vuops::vmax(vload(r.vf[op.fs]), vsplat(second_operand(r, op))); break;
+        case kUpMinV: value = vuops::vmin(vload(r.vf[op.fs]), vload(r.vf[op.ft])); break;
+        case kUpMinS: value = vuops::vmin(vload(r.vf[op.fs]), vsplat(second_operand(r, op))); break;
+        case kUpAbs: value = vuops::vabs(vload(r.vf[op.fs])); break;
+        case kUpFtoi: {
+            Reg128 o;
+            for (int i = 0; i < 4; ++i) o.w[i] = fp::to_fixed(r.vf[op.fs].w[i], op.frac);
+            value = vload(o);
+            break;
+        }
+        case kUpItof: {
+            Reg128 o;
+            for (int i = 0; i < 4; ++i) o.w[i] = fp::from_fixed(r.vf[op.fs].sw[i], op.frac);
+            value = vload(o);
+            break;
+        }
+        case kUpClip: clip = vuops::clip_value(r, r.vf[op.fs], r.vf[op.ft].w[3]); break;
+        case kUpOpmula: {
+            const v4u s = vload(r.vf[op.fs]), t = vload(r.vf[op.ft]);
+            value = vuexact::mul(__builtin_shufflevector(s, s, 1, 2, 0, 3), __builtin_shufflevector(t, t, 2, 0, 1, 3), bad);
+            break;
+        }
+        case kUpOpmsub: {
+            const v4u s = vload(r.vf[op.fs]), t = vload(r.vf[op.ft]);
+            value = vuexact::msub(vload(r.acc), __builtin_shufflevector(s, s, 1, 2, 0, 3), __builtin_shufflevector(t, t, 2, 0, 1, 3), bad);
+            break;
+        }
+        }
+        if (vuexact::vbits((v4i)(bad & lanes))) value = model_upper(r, op);
+        switch (op.lower) {
+        case kLoGeneric: {
+            bool branch = false;
+            std::uint32_t target = npc;
+            const std::uint32_t q_before = r.q, p_before = r.p;
+            lower(u, op.lo, current, target, branch);
+            delayed.issued(r, op.lo, q_before, p_before);
+            if (branch) npc = target;
+            break;
+        }
+        case kLoNone: break;
+        case kLoI: r.i = op.lo; break;
+        case kLoIaddiu: store_vi(r, op.it, r.vi[op.is] + op.imm); break;
+        case kLoIsubiu: store_vi(r, op.it, r.vi[op.is] - op.imm); break;
+        case kLoIadd: store_vi(r, op.id, r.vi[op.is] + r.vi[op.it]); break;
+        case kLoIand: store_vi(r, op.id, r.vi[op.is] & r.vi[op.it]); break;
+        case kLoIor: store_vi(r, op.id, r.vi[op.is] | r.vi[op.it]); break;
+        case kLoLq: {
+            const std::uint8_t *q = qword(u, r.vi[op.is] + op.imm);
+            if (op.lft) vstore(r.vf[op.lft], vsel(vload(r.vf[op.lft]), load_qword(q), lane_mask(op.ldest)));
+            break;
+        }
+        case kLoSq: {
+            std::uint8_t *q = qword(u, r.vi[op.it] + op.imm);
+            const v4u merged = vsel(load_qword(q), vload(r.vf[op.lfs]), lane_mask(op.ldest));
+            std::memcpy(q, &merged, 16);
+            break;
+        }
+        case kLoFmand: store_vi(r, op.it, pipe.mac() & r.vi[op.is]); break;
+        case kLoFmor: store_vi(r, op.it, (pipe.mac() | r.vi[op.is]) & 0xFFFFu); break;
+        case kLoB: npc = op.branch; break;
+        case kLoIbeq: if (r.vi[op.is] == r.vi[op.it]) npc = op.branch; break;
+        case kLoIbne: if (r.vi[op.is] != r.vi[op.it]) npc = op.branch; break;
+        case kLoIbgtz: if (static_cast<std::int16_t>(r.vi[op.is]) > 0) npc = op.branch; break;
+        case kLoIblez: if (static_cast<std::int16_t>(r.vi[op.is]) <= 0) npc = op.branch; break;
+        }
+        // commit() and the flag pushes of the exact loop, by what the upper leaves behind.
+        switch (op.commit) {
+        case kPutNothing: break;
+        case kPutLanesFlags: {
+            Reg128 &dst = op.target == kAcc ? r.acc : r.vf[op.target];
+            vstore(dst, vsel(vload(dst), value, lanes));
+            put_flags(r, vuexact::mac(value, op.mac_lanes));
+            pipe.set_mac(r.mac, r.status);
+            break;
+        }
+        case kPutLanes: {
+            Reg128 &dst = r.vf[op.target];
+            vstore(dst, vsel(vload(dst), value, lanes));
+            break;
+        }
+        case kPutFlags:
+            put_flags(r, vuexact::mac(value, op.mac_lanes));
+            pipe.set_mac(r.mac, r.status);
+            break;
+        case kPutLane: {
+            if (op.target) (op.target == kAcc ? r.acc : r.vf[op.target]).w[op.lane] = one;
+            Reg128 result{};
+            result.w[op.lane] = one;
+            set_flags(r, result, op.dest);
+            pipe.set_mac(r.mac, r.status);
+            break;
+        }
+        case kPutClip:
+            r.clip = clip;
+            pipe.set_clip(clip, pipe.t);
+            break;
+        }
+        if (ending) {
+            delayed.finish(r);
+            r.tpc = pc;
+            return steps + 1;
+        }
+        ending = op.end;
+    }
+    std::fprintf(stderr, "[vu0] program at 0x%04X did not end\n", address);
+    return 1'000'000;
+}
+
+// The fast loop's arithmetic gives the model's bits only on a host that rounds to nearest and keeps
+// denormals (ps2/vu_exact.hpp). A few sums and products against the model show a thread that was set up
+// otherwise. The operands are read through volatile, so the compiler cannot work the answers out itself.
+bool host_floats_fit() {
+    static volatile std::uint32_t operands[8] = {0x00800000u, 0x00BFFFFFu, 0x73C00000u, 0xFF7FFFFFu, 0x3FAAAAABu, 0x40490FDBu, 0x3F800001u, 0xB3800000u};
+    Reg128 a, b;
+    for (int i = 0; i < 4; ++i) {
+        a.w[i] = operands[i * 2];
+        b.w[i] = operands[i * 2 + 1];
+    }
+    v4u bad_sum, bad_difference, bad_product, bad_both;
+    const v4u sum = vuexact::add(vload(a), vload(b), bad_sum), difference = vuexact::sub(vload(a), vload(b), bad_difference);
+    const v4u product = vuexact::mul(vload(a), vload(b), bad_product), both = vuexact::madd(vload(b), vload(a), vload(b), bad_both);
+    for (int i = 0; i < 4; ++i) {
+        if (!bad_sum[i] && sum[i] != fp::add(a.w[i], b.w[i])) return false;
+        if (!bad_difference[i] && difference[i] != fp::sub(a.w[i], b.w[i])) return false;
+        if (!bad_product[i] && product[i] != fp::mul(a.w[i], b.w[i])) return false;
+        if (!bad_both[i] && both[i] != fp::add(b.w[i], fp::mul(a.w[i], b.w[i]))) return false;
+    }
+    return true;
+}
+
+// What a program can leave behind in the registers: the struct up to tpc (it ends in padding).
+constexpr std::size_t kVu0RegBytes = offsetof(Vu0Regs, tpc) + sizeof(std::uint32_t);
+
+// The first register in which the two loops' outcomes differ, with both values.
+void first_difference(const Vu0Regs &fast, const Vu0Regs &exact, char *text, std::size_t size) {
+    const auto vector = [&](const char *name, const Reg128 &a, const Reg128 &b) {
+        std::snprintf(text, size, "%s fast %08X %08X %08X %08X exact %08X %08X %08X %08X", name, a.w[0], a.w[1], a.w[2], a.w[3], b.w[0], b.w[1], b.w[2], b.w[3]);
+    };
+    for (int i = 0; i < 32; ++i)
+        if (std::memcmp(&fast.vf[i], &exact.vf[i], 16) != 0) {
+            char name[8];
+            std::snprintf(name, sizeof name, "vf%d", i);
+            return vector(name, fast.vf[i], exact.vf[i]);
+        }
+    if (std::memcmp(&fast.acc, &exact.acc, 16) != 0) return vector("acc", fast.acc, exact.acc);
+    for (int i = 0; i < 16; ++i)
+        if (fast.vi[i] != exact.vi[i]) {
+            std::snprintf(text, size, "vi%d fast %04X exact %04X", i, fast.vi[i], exact.vi[i]);
+            return;
+        }
+    const struct {
+        const char *name;
+        std::uint32_t fast, exact;
+    } words[] = {{"q", fast.q, exact.q}, {"p", fast.p, exact.p}, {"i", fast.i, exact.i}, {"r", fast.r, exact.r}, {"mac", fast.mac, exact.mac},
+                 {"status", fast.status, exact.status}, {"clip", fast.clip, exact.clip}, {"cmsar0", fast.cmsar0, exact.cmsar0}, {"tpc", fast.tpc, exact.tpc}};
+    for (const auto &w : words)
+        if (w.fast != w.exact) {
+            std::snprintf(text, size, "%s fast %08X exact %08X", w.name, w.fast, w.exact);
+            return;
+        }
+    std::snprintf(text, size, "registers equal");
+}
+
+// Both loops on one call, from the same state, and everything a program can leave behind compared: the
+// registers, the data memory, the number of instructions, and the EE's cycle budget, which neither loop may
+// touch. The fast loop goes first and sends no XGKICK; the exact loop then runs the call for real, and its
+// outcome stays unless the mode keeps the fast loop's.
+void check_vu0(std::uint32_t address) {
+    static std::uint8_t mem_before[4096], mem_fast[4096];
+    const Vu0Regs before = g_cpu.vu0;
+    std::memcpy(mem_before, g_vu0_mem, sizeof mem_before);
+    const std::int32_t budget = g_cpu.budget;
+    const std::uint32_t fast_steps = run_vu0(address, true);
+    const bool stale = image_stale();
+    const std::int32_t fast_budget = g_cpu.budget;
+    Vu0Regs fast = g_cpu.vu0;
+    std::memcpy(mem_fast, g_vu0_mem, sizeof mem_fast);
+    if (g_vu0_tamper) g_vu0_tamper(fast, mem_fast);
+    g_cpu.vu0 = before;
+    std::memcpy(g_vu0_mem, mem_before, sizeof mem_before);
+    const std::uint32_t steps = run_exact(0, address);
+    g_vu0.steps += steps;
+    ++g_vu0.compared;
+    const bool regs_differ = std::memcmp(&fast, &g_cpu.vu0, kVu0RegBytes) != 0;
+    const bool mem_differs = std::memcmp(mem_fast, g_vu0_mem, sizeof mem_fast) != 0;
+    const bool charged = fast_budget != budget || g_cpu.budget != budget;
+    if (stale) ++g_vu0.stale;
+    if (regs_differ || mem_differs || fast_steps != steps || charged || stale) {
+        if (++g_vu0.differ <= 8) {
+            char regs[160];
+            first_difference(fast, g_cpu.vu0, regs, sizeof regs);
+            std::size_t at = 0;
+            while (at < sizeof mem_fast && mem_fast[at] == g_vu0_mem[at]) ++at;
+            char memory[32] = "memory equal";
+            if (mem_differs) std::snprintf(memory, sizeof memory, "memory differs at 0x%03zX", at);
+            std::fprintf(stderr, "[vu0-check] call %llu entry 0x%04X, %u instructions (fast loop %u): %s; %s%s%s\n", static_cast<unsigned long long>(g_vu0.compared),
+                         address & 4095u, steps, fast_steps, regs, memory, charged ? "; the cycle budget moved" : "", stale ? "; the decoded image is not the code in memory" : "");
+        }
+    }
+    if (g_vu0.compared % 1'000'000 == 0)
+        std::fprintf(stderr, "[vu0-check] %llu calls compared, %llu differ\n", static_cast<unsigned long long>(g_vu0.compared), static_cast<unsigned long long>(g_vu0.differ));
+    if (g_vu0_mode == Vu0Mode::CheckLive) {
+        g_cpu.vu0 = fast;
+        std::memcpy(g_vu0_mem, mem_fast, sizeof mem_fast);
+    }
+}
+
+Vu0Mode vu0_mode_from_environment() {
+    if (const char *check = std::getenv("PS2_VU0_CHECK")) return std::strcmp(check, "live") == 0 ? Vu0Mode::CheckLive : Vu0Mode::Check;
+    if (std::getenv("PS2_VU_EXACT") || std::getenv("PS2_VU0_EXACT")) return Vu0Mode::Exact;
+    return Vu0Mode::Fast;
+}
+
+}
+
+void set_vu0_mode(Vu0Mode mode) {
+    if (mode != Vu0Mode::Exact && !host_floats_fit()) {
+        std::fprintf(stderr, "[vu0] this thread's floats do not round to nearest with denormals kept: VU0 runs its exact loop\n");
+        mode = Vu0Mode::Exact;
+    }
+    g_vu0_mode = mode;
+    g_vu0_mode_set = true;
+}
+
+Vu0Mode vu0_mode() {
+    if (!g_vu0_mode_set) set_vu0_mode(vu0_mode_from_environment());
+    return g_vu0_mode;
+}
+
+const Vu0Counters &vu0_counters() { return g_vu0; }
+
+void set_vu0_tamper(void (*tamper)(Vu0Regs &regs, std::uint8_t *mem)) { g_vu0_tamper = tamper; }
+
+void stats() {
+    if (!g_vu0.calls) return;
+    static const char *const kNames[] = {"fast", "exact", "check", "check, fast outcome kept"};
+    std::fprintf(stderr, "[vu0] mode %s: %llu calls, %llu instructions; fast loop: %llu through the model, %llu calls left to the exact loop, %llu code images, %llu image lookups\n",
+                 kNames[static_cast<int>(g_vu0_mode)], static_cast<unsigned long long>(g_vu0.calls), static_cast<unsigned long long>(g_vu0.steps),
+                 static_cast<unsigned long long>(g_vu0.slow), static_cast<unsigned long long>(g_vu0.guarded), static_cast<unsigned long long>(g_vu0.images),
+                 static_cast<unsigned long long>(g_vu0.lookups));
+    if (g_vu0_mode == Vu0Mode::Check || g_vu0_mode == Vu0Mode::CheckLive)
+        std::fprintf(stderr, "[vu0-check] %llu calls compared, %llu differ (%llu with a stale image), %llu XGKICK skipped in the fast loop\n", static_cast<unsigned long long>(g_vu0.compared),
+                     static_cast<unsigned long long>(g_vu0.differ), static_cast<unsigned long long>(g_vu0.stale), static_cast<unsigned long long>(g_vu0.kicks_skipped));
+}
+
+void run(int n, std::uint32_t address) {
+    if (n == 1) {
+        static const bool exact = std::getenv("PS2_VU_EXACT") != nullptr;
+        if (exact) run_exact(1, address);
+        else interpret(1, address);
+        return;
+    }
+    ++g_vu0.calls;
+    switch (vu0_mode()) {
+    case Vu0Mode::Fast: g_vu0.steps += run_vu0(address, false); break;
+    case Vu0Mode::Exact: g_vu0.steps += run_exact(0, address); break;
+    default: check_vu0(address); break;
+    }
 }
 
 }

@@ -116,7 +116,10 @@ void slow_st64(std::uint32_t a, std::uint64_t v) { write_slow(a, v); }
 
 void slow_st128(std::uint32_t a, const Reg128 &v) {
     const Target t = resolve(a);
-    if (t.host) std::memcpy(t.host, &v, 16);
+    if (t.host) {
+        std::memcpy(t.host, &v, 16);
+        if (t.region == Region::Vu && (t.address & 0x4000u) == 0) vu::code_changed((t.address >> 15) & 1u);
+    }
     else if (t.region == Region::Io) {
         if (harness::g_active) harness::io_write(t.address, v.d[0], 16);
         hw::write128(t.address, v);
