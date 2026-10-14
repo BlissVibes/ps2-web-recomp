@@ -92,6 +92,25 @@ if(PS2_GENERATED)
     target_link_libraries(ps2game PUBLIC ps2runtime)
     target_compile_options(ps2game PRIVATE -Wno-unused-label -Wno-unused-variable)
 
+    # How each generated unit is compiled, by its file name without .cpp (unit_005A). The lists belong to a
+    # game and come from its profiles. A hot unit gets its guest loads and stores inlined (PS2_INLINE_MEMORY
+    # in ps2/memory.hpp). With PS2_COLD_UNIT_OPTIONS (-Oz, say) every unit in neither list is compiled with
+    # those options added: the code a game seldom runs, built for size. Empty lists change nothing.
+    set(PS2_HOT_UNITS "" CACHE STRING "Generated units whose guest loads and stores are compiled inline")
+    set(PS2_WARM_UNITS "" CACHE STRING "Further generated units kept out of PS2_COLD_UNIT_OPTIONS")
+    set(PS2_COLD_UNIT_OPTIONS "" CACHE STRING "Compile options added for the generated units in neither list, e.g. -Oz")
+    foreach(unit_source IN LISTS PS2_UNITS)
+        get_filename_component(unit_name "${unit_source}" NAME_WE)
+        if(NOT unit_name MATCHES "unit_")
+            continue()
+        endif()
+        if(unit_name IN_LIST PS2_HOT_UNITS)
+            set_source_files_properties("${unit_source}" PROPERTIES COMPILE_DEFINITIONS PS2_INLINE_MEMORY)
+        elseif(PS2_COLD_UNIT_OPTIONS AND NOT unit_name IN_LIST PS2_WARM_UNITS)
+            set_source_files_properties("${unit_source}" PROPERTIES COMPILE_OPTIONS "${PS2_COLD_UNIT_OPTIONS}")
+        endif()
+    endforeach()
+
     set(PS2_HOOKS "" CACHE PATH "Folder with decompiled functions that replace recompiled ones (hooks_table.cpp defines register_hooks())")
     if(PS2_HOOKS)
         file(GLOB_RECURSE PS2_HOOK_SOURCES CONFIGURE_DEPENDS "${PS2_HOOKS}/*.cpp")
