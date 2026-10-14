@@ -1,6 +1,7 @@
 #include "queue.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -40,6 +41,19 @@ void wait(std::atomic<std::uint32_t> &value, std::uint32_t seen) {
 #endif
 }
 
+// As wait(), for at most `ms` milliseconds. False when the time ran out.
+bool wait_for(std::atomic<std::uint32_t> &value, std::uint32_t seen, int ms) {
+#ifdef __EMSCRIPTEN__
+    return emscripten_futex_wait(&value, seen, ms) != -ETIMEDOUT;
+#else
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (value.load() == seen)
+        if (std::chrono::steady_clock::now() >= until) return false;
+        else std::this_thread::yield();
+    return true;
+#endif
+}
+
 void notify(std::atomic<std::uint32_t> &value) {
 #ifdef __EMSCRIPTEN__
     emscripten_futex_wake(&value, INT_MAX);
@@ -65,9 +79,9 @@ void post(Type type, std::uint32_t arg0, std::uint32_t arg1, const void *data, s
 void stats() {
     const auto line = [](const char *name, const Ring &r) {
         if (!r.active()) return;
-        std::fprintf(stderr, "[queue] %s ring of %llu bytes: at most %llu waiting, largest message %llu, poster waited for room %llu times\n", name,
+        std::fprintf(stderr, "[queue] %s ring of %llu bytes: at most %llu waiting, largest message %llu, poster waited for room %llu times, lost wakes %llu\n", name,
                      static_cast<unsigned long long>(r.capacity()), static_cast<unsigned long long>(r.high_water()),
-                     static_cast<unsigned long long>(r.largest()), static_cast<unsigned long long>(r.waits()));
+                     static_cast<unsigned long long>(r.largest()), static_cast<unsigned long long>(r.waits()), static_cast<unsigned long long>(r.lost_wakes()));
     };
     line("vu", g_vu);
     line("render", g_render);
@@ -76,6 +90,19 @@ void stats() {
 #ifdef __EMSCRIPTEN__
 extern "C" EMSCRIPTEN_KEEPALIVE void ps2_ring_stats() { stats(); }
 #endif
+
+void Ring::describe(const char *name) const {
+    if (!active()) return;
+    const std::uint64_t head = head_.load(), tail = tail_.load();
+    std::fprintf(stderr, "[stuck] %s ring: head %llu, tail %llu, %llu bytes waiting; posted %u, freed %u; reader waiting %u, poster waiting %u\n", name,
+                 static_cast<unsigned long long>(head), static_cast<unsigned long long>(tail), static_cast<unsigned long long>(head - tail),
+                 posted_.load(), freed_.load(), consumer_waiting_.load(), producer_waiting_.load());
+}
+
+void describe() {
+    g_vu.describe("vu");
+    g_render.describe("render");
+}
 
 void Ring::start(std::size_t capacity) {
     buffer_ = std::make_unique<std::uint8_t[]>(capacity);
@@ -115,7 +142,9 @@ void Ring::post(Type type, std::uint32_t arg0, std::uint32_t arg1, const void *d
         if (!waited) waits_.store(waits_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
         waited = true;
         producer_waiting_.store(1);
-        if (head + claim - tail_.load() > capacity_) wait(freed_, seen);
+        // The reader wakes a poster that waits, but in the page a wake has been seen to go missing (the poster
+        // slept on with the ring empty, 2026-10-13): the wait also ends after 2 ms and looks again.
+        if (head + claim - tail_.load() > capacity_ && !wait_for(freed_, seen, 2) && freed_.load() != seen) lost_wakes_.fetch_add(1);
     }
     if (need > largest_.load(std::memory_order_relaxed)) largest_.store(need, std::memory_order_relaxed);
     std::uint8_t *at = buffer_.get() + head % capacity_;

@@ -80,7 +80,8 @@ bool load_state(const std::uint8_t *data, std::size_t size);
 bool halted();
 std::uint64_t frame_count();
 std::uint32_t state_version();
-std::uint64_t preempt_count();   // how often generated code has stopped to run due events
+std::uint64_t preempt_count();
+void describe_threads();   // what each thread may be waiting for, to stderr   // how often generated code has stopped to run due events
 
 // An idle call: a game that waits in a loop, calling `function` through a pointer on every turn from the
 // call that returns to `return_address`, with register `waiting_register` non-zero while it still waits.

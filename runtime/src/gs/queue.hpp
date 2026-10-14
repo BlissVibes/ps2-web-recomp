@@ -42,9 +42,11 @@ public:
     void wait_for_work(int timeout_ms);
     void wake();
     std::uint64_t capacity() const { return capacity_; }
+    void describe(const char *name) const;   // one line to stderr: positions and who is waiting
     std::uint64_t high_water() const { return high_water_.load(std::memory_order_relaxed); }   // most bytes waiting at once
     std::uint64_t largest() const { return largest_.load(std::memory_order_relaxed); }         // largest message, with its header
     std::uint64_t waits() const { return waits_.load(std::memory_order_relaxed); }             // times the poster found no room
+    std::uint64_t lost_wakes() const { return lost_wakes_.load(); }
 
 private:
     std::unique_ptr<std::uint8_t[]> buffer_;
@@ -55,6 +57,7 @@ private:
     alignas(64) std::atomic<std::uint32_t> posted_{0};
     alignas(64) std::atomic<std::uint32_t> freed_{0};
     std::atomic<std::uint32_t> consumer_waiting_{0}, producer_waiting_{0};
+    std::atomic<std::uint64_t> lost_wakes_{0};   // waits for room that ran out their time although room had been freed
 };
 
 Ring &render();
@@ -65,6 +68,7 @@ Ring &outbox();
 bool active();
 bool vu_active();
 void post(Type type, std::uint32_t arg0, std::uint32_t arg1, const void *data, std::uint32_t bytes);
+void describe();   // both rings, see Ring::describe
 void stats();   // how full each ring has been, to stderr (in the page: Module._ps2_ring_stats() from the console)
 
 void wait(std::atomic<std::uint32_t> &value, std::uint32_t seen);

@@ -327,6 +327,12 @@ void transfer(int unit, const std::uint8_t *data, std::uint32_t qwc) {
 
 bool stalled(int unit) { return state(unit).stalled; }
 
+void describe() {
+    std::fprintf(stderr, "[stuck] vif0 stalled %d, %zu words pending; vif1 stalled %d, %zu words pending; vif1 on the VU thread stalled %d, %zu words pending\n",
+                 g_units[0].stalled ? 1 : 0, g_units[0].pending.size(), g_units[1].stalled ? 1 : 0, g_units[1].pending.size(),
+                 g_vu_side.stalled ? 1 : 0, g_vu_side.pending.size());
+}
+
 std::uint32_t read(int unit, std::uint32_t reg) {
     const Unit &u = state(unit);
     switch (reg) {

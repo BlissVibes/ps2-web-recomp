@@ -853,6 +853,7 @@ bool copy_frame(const DisplayRegs &r, std::vector<std::uint32_t> &rgba, std::uin
 
 std::atomic<std::uint32_t> g_presented{0};
 std::uint32_t g_posted_presents = 0;
+std::atomic<std::uint32_t> g_present_waits{0};
 
 void flush_and_wait() {
 #ifdef PS2_GPU
@@ -862,11 +863,18 @@ void flush_and_wait() {
 
 void start_thread() { queue::render().start(queue::kRenderRingBytes); }
 
+void describe_waits() {
+    std::fprintf(stderr, "[stuck] presents posted %u, presented %u, waits for a present %u; downloads answered %u\n", g_posted_presents, g_presented.load(), g_present_waits.load(), g_downloads.load());
+}
+
 void post_present() {
     const DisplayRegs regs = display_regs();
     queue::post(queue::kPresent, 0, 0, &regs, sizeof regs);
     ++g_posted_presents;
-    for (std::uint32_t done = g_presented.load(); g_posted_presents - done > 2; done = g_presented.load()) queue::wait(g_presented, done);
+    for (std::uint32_t done = g_presented.load(); g_posted_presents - done > 2; done = g_presented.load()) {
+        g_present_waits.fetch_add(1);
+        queue::wait(g_presented, done);
+    }
 }
 
 Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_present, double budget_ms) {

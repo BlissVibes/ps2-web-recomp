@@ -450,6 +450,16 @@ void resize_window(std::uint32_t width, std::uint32_t height) { gs::resize_windo
 bool present_frame() { return gs::present(); }
 void init_graphics() { gs::init(); }
 void start_render_thread() { gs::start_thread(); }
+// What each thread of the page may be waiting for, to stderr. For a page that has stopped: the main thread
+// still answers, so this can be called from the browser's console.
+void describe_threads() {
+    std::fprintf(stderr, "[stuck] frame %llu, cycle %llu, VU fences passed %u, time slices %llu, EE pc 0x%08X\n", static_cast<unsigned long long>(g_frames),
+                 static_cast<unsigned long long>(now()), g_vu_fence.load(), static_cast<unsigned long long>(preempt_count()), g_cpu.pc);
+    gs::queue::describe();
+    gs::describe_waits();
+    vif::describe();
+}
+
 void start_vu_thread() { gs::queue::vu().start(gs::queue::kVuRingBytes); }
 
 std::atomic<double> g_vu_idle_ms{0.0};
