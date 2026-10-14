@@ -311,9 +311,15 @@ struct Stack {
     std::atomic<std::uintptr_t> base{0}, end{0};
 };
 Stack g_stacks[3];
-// Stack sizes of the two threads made here (the main thread's is -sSTACK_SIZE in CMakeLists.txt). Nobody
-// has measured what they use: read ps2web_stack_used after a race before making one smaller.
-constexpr std::size_t kEmulationStack = 16u << 20, kVuStack = 16u << 20;
+// Stack sizes of the two threads made here (the main thread's is -sSTACK_SIZE in CMakeLists.txt, 1 MB).
+// Measured with ps2web_stack_used after boot, menus, video and a race (docs/re/web-log-005.md in the
+// Burnout 3 repo): emulation 53,736 bytes, main 2,208, VU 18,208. The VU thread runs one flat loop (the
+// largest frame on it is XGKICK's, 16 KB), so 1 MB is more than fifty times what it uses. The emulation
+// thread runs the game's own calls: generated code nests up to kMaxDepth (192) calls before it unwinds to
+// the dispatch loop, an interrupt handler or a game syscall handler starts another such loop on top
+// (run_guest, at most three deep), and the largest frame of a generated function is about 11.6 KB, so a
+// game that recursed that deep would need about 6.7 MB. 8 MB covers that; the race uses 1/150 of it.
+constexpr std::size_t kEmulationStack = 8u << 20, kVuStack = 1u << 20;
 
 void note_stack(int which) {
     g_stacks[which].base.store(emscripten_stack_get_base());

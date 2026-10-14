@@ -13,7 +13,14 @@
 namespace ps2web {
 
 constexpr std::size_t kChunk = 256u << 10;
-constexpr std::uint32_t kSlots = 256;
+// The page's number of slots, 24 MB of chunks. Chosen by replaying Burnout 3's reads from boot to a race
+// (598 distinct chunks, 150 MB) with scripts/disc_replay.cpp, which builds the cache with other numbers
+// (PS2WEB_DISC_SLOTS): 96 to 144 slots miss the same 82 times, 256 slots 76 times (the six more are in the
+// menus and at the start of a video); race loading and the race miss as often from 256 down to 64 slots.
+#ifndef PS2WEB_DISC_SLOTS
+#define PS2WEB_DISC_SLOTS 96
+#endif
+constexpr std::uint32_t kSlots = PS2WEB_DISC_SLOTS;
 constexpr std::uint64_t kReadAhead = 16;
 
 // A slot goes kEmpty -> kWanted (asked for here) -> kLoading (the host has started the fetch) -> kReady or

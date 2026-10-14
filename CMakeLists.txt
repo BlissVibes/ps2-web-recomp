@@ -116,7 +116,11 @@ if(PS2_GENERATED)
             target_link_options(ps2web PRIVATE "SHELL:--preload-file ${PS2_WEB_BOOT_FILE}@/game/boot.txt")
         endif()
         target_link_libraries(ps2web PRIVATE $<$<BOOL:${PS2_HOOKS}>:ps2hooks> ps2game ps2runtime)
-        target_link_options(ps2web PRIVATE --profiling-funcs -sJSPI -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=268435456 -sPTHREAD_POOL_SIZE=2 -sALLOW_TABLE_GROWTH=1 -lidbfs.js -sSTACK_SIZE=16777216 -sENVIRONMENT=web
+        # Memory: a Burnout 3 race ended with the heap top at 248.8 MB with 16 MB stacks and a 64 MB disc cache;
+        # without the 78 MB those cuts give back it is near 171 MB, so 192 MB holds it with room. Growth stays
+        # on in case another route needs more.
+        # STACK_SIZE is the main thread's stack (2 KB used); the other threads' are set in host/web.cpp.
+        target_link_options(ps2web PRIVATE --profiling-funcs -sJSPI -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=201326592 -sPTHREAD_POOL_SIZE=2 -sALLOW_TABLE_GROWTH=1 -lidbfs.js -sSTACK_SIZE=1048576 -sENVIRONMENT=web
             -sEXPORTED_FUNCTIONS=_main,_ps2web_pad,_ps2web_resize,_ps2web_gpu_ms,_ps2web_frames,_ps2web_primitives,_ps2web_audio_ring,_ps2web_audio_queued_ms,_ps2web_idle_ms,_ps2web_vu_interpreted,_ps2web_stack_used,_ps2web_heap_top
             -sEXPORTED_RUNTIME_METHODS=callMain,addRunDependency,removeRunDependency,HEAPU8,ENV
             --shell-file ${PS2_WEB_SHELL})
