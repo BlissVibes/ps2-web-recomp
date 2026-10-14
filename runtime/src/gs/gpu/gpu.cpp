@@ -65,6 +65,14 @@ bool feedback_copy_off() {
     static const bool off = std::getenv("PS2_NO_FEEDBACK_COPY") != nullptr;
     return off;
 }
+
+// PS2_NO_FEEDBACK_RUNS: every such primitive gets a copy and a raster dispatch of its own, as before runs of
+// them shared one (for an A/B).
+bool feedback_runs_off() {
+    static const bool off = std::getenv("PS2_NO_FEEDBACK_RUNS") != nullptr;
+    return off;
+}
+std::uint64_t g_feedback_runs = 0;   // copies taken for them: one per run of such primitives drawn together
 std::uint32_t g_scale = 1, g_copy_words = 1u << 20, g_field_words = 1u << 19;
 
 std::uint32_t field_base(std::uint32_t field) { return g_copy_words + (field & 1u) * g_field_words; }
@@ -142,9 +150,11 @@ struct Batch {
     bool zte = false, zwrite = false;
     int rx0 = 0, ry0 = 0, rx1 = -2, ry1 = -2;
     Range fb_range, z_range;
-    // A batch of one primitive that samples memory it draws into: the texels it reads were copied to scratch
-    // just before it (snap_w x snap_h from snap_x, snap_y, in texture coordinates; snap_w 0 for none).
-    std::uint32_t snap_x = 0, snap_y = 0, snap_w = 0, snap_h = 0;
+    // A batch of primitives that sample memory they draw into: the texels they read are copied to scratch just
+    // before it (snap_w x snap_h from snap_x, snap_y, in texture coordinates of the texture snap_psm, snap_bp,
+    // snap_bw; snap_w 0 for none). snap_join: later such primitives may join it (see draw()).
+    std::uint32_t snap_x = 0, snap_y = 0, snap_w = 0, snap_h = 0, snap_psm = 0, snap_bp = 0, snap_bw = 0;
+    bool snap_join = false;
 } g_batch;
 
 struct SetupCache {
@@ -348,6 +358,7 @@ void flush_batch() {
     if (b.prims.empty()) {
         b.key = ~0ull;
         b.snap_w = b.snap_h = 0;
+        b.snap_join = false;
         return;
     }
     const std::uint32_t prims = static_cast<std::uint32_t>(b.prims.size() / kPrimWords);
@@ -395,9 +406,14 @@ void flush_batch() {
         }
     }
     for (std::uint32_t t : g_touched) g_tile_count[t] = 0;
+    if (b.snap_w) {
+        dispatch_linear(kSnapshot, b.snap_w * b.snap_h * g_scale * g_scale, push_params({b.snap_psm, b.snap_bp, b.snap_bw, b.snap_x, b.snap_y, b.snap_w, b.snap_h}));
+        ++g_feedback_runs;
+    }
     const std::uint32_t param = push_params({tile_offset, prim_offset, setup_offset, tiles, list_offset, b.snap_w ? 1u : 0u, b.snap_x, b.snap_y, b.snap_w, b.snap_h});
     g_commands.push_back({kRaster, std::min(tiles, 1024u), (tiles + 1023) / 1024, param});
     b.snap_w = b.snap_h = 0;
+    b.snap_join = false;
     b.prims.clear();
     b.setups.clear();
     b.boxes.clear();
@@ -1081,6 +1097,7 @@ void draw(const State &st, const Vertex *v, int count) {
     // before it, as PCSX2's hardware renderer gives it.
     int ua = 0, va = 0, ub = 0, vb = 0;
     bool feedback = false;
+    bool joinable = false;   // see "Strips of one effect" below
     if (flags & 2u) {
         // Which bits of a word each side touches, where both are formats of whole 32-bit words: a texture in
         // the top byte of the words of a 24-bit Z buffer (PSMT8H, the race's road) shares no bit with it.
@@ -1099,18 +1116,22 @@ void draw(const State &st, const Vertex *v, int count) {
         const bool color = (fbits & tbits) != 0, depth = (flags & 512u) && !(flags & 32u) && (zbits & tbits) != 0;
         const Range f = region(setup[1], setup[2], setup[3], minx, miny, maxx, maxy), z = region(setup[5], setup[2], setup[6], minx, miny, maxx, maxy);
         if ((color && cache.tex.overlaps(f.lo, f.hi)) || (depth && cache.tex.overlaps(z.lo, z.hi))) {
-            if (!texel_rect(setup, v, count, prim, fst, ua, va, ub, vb)) {
+            const bool exact = texel_rect(setup, v, count, prim, fst, ua, va, ub, vb);
+            if (!exact) {
                 ua = va = 0;
                 ub = (1 << (setup[15] & 0xFFu)) - 1;
                 vb = (1 << (setup[15] >> 8)) - 1;
             }
             const auto layout = [](std::uint32_t psm) { return psm == PSMCT24 ? PSMCT32 : psm; };
             const Range t = region(setup[12], setup[13], setup[14], ua, va, ub, vb);
-            if (setup[12] == setup[1] && setup[13] == setup[2] && layout(setup[14]) == layout(setup[3]))
+            const bool frame_texture = setup[12] == setup[1] && setup[13] == setup[2] && layout(setup[14]) == layout(setup[3]);
+            if (frame_texture)
                 feedback = color && ua <= maxx && minx <= ub && va <= maxy && miny <= vb;   // the frame as a texture: the rectangles tell
             else
                 feedback = color && t.overlaps(f.lo, f.hi);
-            feedback = feedback || (depth && t.overlaps(z.lo, z.hi));
+            const bool through_z = depth && t.overlaps(z.lo, z.hi);
+            joinable = feedback && frame_texture && exact && !through_z;
+            feedback = feedback || through_z;
         }
         if (feedback) {
             ++g_feedback;
@@ -1129,22 +1150,55 @@ void draw(const State &st, const Vertex *v, int count) {
             feedback = !feedback_copy_off();
         }
     }
+    // Strips of one effect (the speed blur draws the frame onto itself in about 100 strips a frame) share one
+    // copy and one raster dispatch while every strip reads only texels that no earlier strip of the run draws:
+    // each strip then sees in the copy, taken before the run, what it would have seen in memory just before
+    // itself, and where strips overlap on the frame the raster draws them in order as in any batch. Only for
+    // the frame read as a texture through an exact texel rectangle, and while the copy fits the scratch area
+    // copies use. In Burnout 3's race about a quarter of the strips join: most read a row or column that the
+    // strip before them drew, and those must see it drawn. PS2_NO_FEEDBACK_RUNS=1 turns this off.
+    bool joins = false;
     if (feedback) {
-        emit_all();
-        const std::uint32_t w = static_cast<std::uint32_t>(ub - ua + 1), h = static_cast<std::uint32_t>(vb - va + 1);
-        dispatch_linear(kSnapshot, w * h * g_scale * g_scale, push_params({setup[14], setup[12], setup[13], static_cast<std::uint32_t>(ua), static_cast<std::uint32_t>(va), w, h}));
-        g_batch.snap_x = static_cast<std::uint32_t>(ua);
-        g_batch.snap_y = static_cast<std::uint32_t>(va);
-        g_batch.snap_w = w;
-        g_batch.snap_h = h;
+        Batch &run = g_batch;
+        if (joinable && run.snap_join && run.key == cache.key && run.snap_psm == setup[14] && run.snap_bp == setup[12] && run.snap_bw == setup[13]) {
+            joins = true;
+            for (std::size_t i = 0; joins && i < run.boxes.size(); i += 2) {
+                const int x0 = static_cast<int>(run.boxes[i] & 0xFFFFu), y0 = static_cast<int>(run.boxes[i] >> 16);
+                const int x1 = static_cast<int>(run.boxes[i + 1] & 0xFFFFu), y1 = static_cast<int>(run.boxes[i + 1] >> 16);
+                joins = ub < x0 || x1 < ua || vb < y0 || y1 < va;
+            }
+            const std::uint32_t x0 = std::min(run.snap_x, static_cast<std::uint32_t>(ua)), y0 = std::min(run.snap_y, static_cast<std::uint32_t>(va));
+            const std::uint32_t x1 = std::max(run.snap_x + run.snap_w, static_cast<std::uint32_t>(ub) + 1u);
+            const std::uint32_t y1 = std::max(run.snap_y + run.snap_h, static_cast<std::uint32_t>(vb) + 1u);
+            if (joins && static_cast<std::uint64_t>(x1 - x0) * (y1 - y0) * g_scale * g_scale <= g_copy_words) {
+                run.snap_x = x0;
+                run.snap_y = y0;
+                run.snap_w = x1 - x0;
+                run.snap_h = y1 - y0;
+            } else {
+                joins = false;
+            }
+        }
+        if (!joins) {
+            emit_all();
+            run.snap_x = static_cast<std::uint32_t>(ua);
+            run.snap_y = static_cast<std::uint32_t>(va);
+            run.snap_w = static_cast<std::uint32_t>(ub - ua + 1);
+            run.snap_h = static_cast<std::uint32_t>(vb - va + 1);
+            run.snap_psm = setup[14];
+            run.snap_bp = setup[12];
+            run.snap_bw = setup[13];
+            run.snap_join = joinable && !feedback_runs_off();
+        }
+    } else if (g_batch.snap_w) {
+        emit_all();   // the copy is for the run's strips alone
     }
-
     Batch &b = g_batch;
     const bool zte = flags & 512u;
     const std::uint64_t key = cache.key;
     if (b.key != ~0ull && b.key != key) emit_all();
     const Range &tex = cache.tex;
-    if (flags & 2u) {
+    if ((flags & 2u) && !joins) {
         if (!b.prims.empty()) {
             batch_ranges();
             const auto written = [&](const Range &t) { return t.overlaps(b.fb_range.lo, b.fb_range.hi) || (b.zwrite && t.overlaps(b.z_range.lo, b.z_range.hi)); };
@@ -1190,7 +1244,7 @@ void draw(const State &st, const Vertex *v, int count) {
     b.miny = std::min(b.miny, miny);
     b.maxx = std::max(b.maxx, maxx);
     b.maxy = std::max(b.maxy, maxy);
-    if (feedback || b.prims.size() >= kPrimWords * 65536) emit_all();
+    if ((feedback && !b.snap_join) || b.prims.size() >= kPrimWords * 65536) emit_all();
 }
 
 void image_begin(const State &s) {
@@ -1323,8 +1377,8 @@ void stats() {
     for (int i = 0; i < kPipelines; ++i) std::fprintf(stderr, " %s %llu", kEntryPoints[i], static_cast<unsigned long long>(g_dispatches[i]));
     std::fprintf(stderr, "\n");
     if (g_feedback)
-        std::fprintf(stderr, "[gpu] %llu primitives sampled memory they draw into%s\n", static_cast<unsigned long long>(g_feedback),
-                     feedback_copy_off() ? "" : ", each drawn alone from a copy of its texels");
+        std::fprintf(stderr, "[gpu] %llu primitives sampled memory they draw into, drawn in %llu runs from a copy of their texels each\n",
+                     static_cast<unsigned long long>(g_feedback), static_cast<unsigned long long>(g_feedback_runs));
     if (!g_feedback_frames.empty()) {
         std::uint32_t most = 0;
         std::uint64_t at = 0;
