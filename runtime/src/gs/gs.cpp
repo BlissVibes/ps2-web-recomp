@@ -881,9 +881,12 @@ Rendered render_pending(const std::function<void(const DisplayRegs &)> &on_prese
     queue::role() = queue::Role::Render;
     queue::Header h;
     const std::uint8_t *payload = nullptr;
-    const auto start = std::chrono::steady_clock::now();
+    // The budget is timed from the first message: a call that finds the queue empty, the usual case when
+    // this thread keeps up, reads no clock (a call out to JavaScript in the page).
+    std::chrono::steady_clock::time_point start;
     for (std::uint32_t n = 1; queue::render().peek(h, payload); ++n) {
-        if (!(n & 7u) && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > budget_ms) return Rendered::busy;
+        if (n == 1) start = std::chrono::steady_clock::now();
+        else if (!(n & 7u) && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() > budget_ms) return Rendered::busy;
         bool presented = false;
         switch (h.type) {
         case queue::kGif: gif::render(static_cast<int>(h.arg0), payload, h.arg1); break;

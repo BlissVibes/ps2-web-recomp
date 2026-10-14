@@ -120,7 +120,7 @@ void post_present();
 enum class Rendered { idle, presented, busy };
 Rendered render_pending(bool surface, const std::function<void(const std::uint32_t *rgba, std::uint32_t width, std::uint32_t height)> &copy,
                         const std::function<void()> &before_present, double budget_ms);
-void wait_render_work(int timeout_ms);
+double wait_render_work(int timeout_ms);   // the milliseconds it waited; 0 when there was work at once
 void wake_render_thread();
 bool copy_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height);
 bool parse_press(const std::string &spec, Press &press);

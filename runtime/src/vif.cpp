@@ -33,6 +33,32 @@ bool on_vu_thread() { return gs::queue::role() == gs::queue::Role::Vu; }
 bool shadow(int unit) { return unit == 1 && gs::queue::vu_active() && !on_vu_thread(); }
 Unit &state(int unit) { return unit == 1 && on_vu_thread() ? g_vu_side : g_units[unit]; }
 
+// In the page the VU thread runs VIF1 from the words the emulation thread posts to the VU ring, while the
+// emulation thread runs the same words in shadow (above) for what only it may do: MSKPATH3 and the rest of
+// the PATH3 release, which posts the released data to the same ring. The ring's order is the order in which
+// the GS gets data, so the shadow pass posts its words as it goes: before a code lets PATH3 data go, the
+// words before that point; the rest when it stops. Words after an interrupt-bit stall are held back until
+// FBRST lets the shadow pass go on, so that a release among them falls into place as well. Natively the
+// release is drawn at the code itself, and so it is here.
+const std::uint32_t *g_cut = nullptr;   // during a shadow run: the first word of the array run that is not posted
+std::size_t g_withheld = 0;             // words at the end of the shadow's pending words that are not posted
+
+void post_words(const std::uint32_t *from, const std::uint32_t *to) {
+    constexpr std::size_t kMost = gs::queue::kMaxPayload / 4;
+    while (from < to) {
+        const std::size_t n = std::min<std::size_t>(static_cast<std::size_t>(to - from), kMost);
+        gs::queue::vu().post(gs::queue::kVif1, static_cast<std::uint32_t>(n), 0, from, static_cast<std::uint32_t>(n * 4));
+        from += n;
+    }
+}
+
+// A code at `at` in the array being run in shadow is about to let PATH3 data go: what comes before it goes first.
+void post_before(const std::uint32_t *at) {
+    if (!g_cut || at <= g_cut) return;
+    post_words(g_cut, at);
+    g_cut = at;
+}
+
 std::uint8_t *vu_data(int unit) { return unit ? g_vu1_mem : g_vu0_mem; }
 std::uint32_t vu_qwords(int unit) { return unit ? 1024u : 256u; }
 
@@ -232,7 +258,10 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
     // MSKPATH3 off directly followed by MSKPATH3 on lets one PATH3 packet through (gif.cpp). Any
     // VIF1 code that does work in between means PATH3 stayed open, so the rest of its queue goes
     // too. No-ops and the flushes, which only wait, do not count.
-    if (unit == 1 && !on_vu_thread() && op != 0x00 && op != 0x06 && op != 0x10 && op != 0x11 && op != 0x13) gif::path3_advance();
+    if (unit == 1 && !on_vu_thread() && op != 0x00 && op != 0x06 && op != 0x10 && op != 0x11 && op != 0x13) {
+        if (gif::path3_advance_releases()) post_before(data - 1);
+        gif::path3_advance();
+    }
     switch (op) {
     case 0x00: break;
     case 0x01: u.cycle = imm; break;
@@ -240,7 +269,12 @@ void execute(int unit, std::uint32_t cmd, const std::uint32_t *data) {
     case 0x03: u.base = imm & 0x3FFu; break;
     case 0x04: u.itops = imm & 0x3FFu; break;
     case 0x05: u.mode = imm & 3u; break;
-    case 0x06: if (unit == 1 && !on_vu_thread()) gif::set_path3_mask(imm & 0x8000u); break;
+    case 0x06:
+        if (unit == 1 && !on_vu_thread()) {
+            if (!(imm & 0x8000u) && gif::path3_unmask_releases()) post_before(data);
+            gif::set_path3_mask(imm & 0x8000u);
+        }
+        break;
     case 0x07: u.mark = imm; break;
     case 0x10: case 0x11: case 0x13: break;
     case 0x14: case 0x15: run_vu(unit, imm * 8u); break;
@@ -303,9 +337,22 @@ std::size_t run(int unit, const std::uint32_t *words, std::size_t count) {
     return pos;
 }
 
+// The shadow run of `count` words from `words`, of which the first `posted` are in the VU ring already: posts
+// the rest up to where it stopped, all of them unless it stalled. Returns the words run, as run() does.
+std::size_t run_shadow(const std::uint32_t *words, std::size_t count, std::size_t posted) {
+    Unit &u = g_units[1];
+    g_cut = words + posted;
+    const std::size_t pos = run(1, words, count);
+    post_before(u.stalled ? words + pos : words + count);
+    g_withheld = static_cast<std::size_t>(words + count - g_cut);
+    g_cut = nullptr;
+    return pos;
+}
+
 void process(int unit) {
     Unit &u = state(unit);
-    const std::size_t pos = run(unit, u.pending.data(), u.pending.size());
+    const std::size_t pos = shadow(unit) ? run_shadow(u.pending.data(), u.pending.size(), u.pending.size() - g_withheld)
+                                         : run(unit, u.pending.data(), u.pending.size());
     u.pending.erase(u.pending.begin(), u.pending.begin() + static_cast<std::ptrdiff_t>(pos));
 }
 
@@ -313,6 +360,7 @@ void process(int unit) {
 
 void reset() {
     for (Unit &u : g_units) u = Unit{};
+    g_withheld = 0;
 }
 
 void reset_vu_side() { g_vu_side = Unit{}; }
@@ -327,18 +375,18 @@ void stats() {
 }
 
 void transfer(int unit, const std::uint8_t *data, std::uint32_t qwc) {
-    if (shadow(unit)) gs::queue::vu().post(gs::queue::kVif1, qwc, 0, data, qwc * 16);
+    transfer_words(unit, reinterpret_cast<const std::uint32_t *>(data), static_cast<std::size_t>(qwc) * 4);
+}
+
+void transfer_words(int unit, const std::uint32_t *words, std::size_t count) {
     Unit &u = state(unit);
     if (u.pending.empty() && !u.stalled) {
-        const auto *words = reinterpret_cast<const std::uint32_t *>(data);
-        const std::size_t count = static_cast<std::size_t>(qwc) * 4;
-        const std::size_t pos = run(unit, words, count);
+        const std::size_t pos = shadow(unit) ? run_shadow(words, count, 0) : run(unit, words, count);
         if (pos < count) u.pending.assign(words + pos, words + count);
         return;
     }
-    const std::size_t old = u.pending.size();
-    u.pending.resize(old + static_cast<std::size_t>(qwc) * 4);
-    std::memcpy(u.pending.data() + old, data, static_cast<std::size_t>(qwc) * 16);
+    if (shadow(unit)) g_withheld += count;   // posted as the run gets past them (process)
+    u.pending.insert(u.pending.end(), words, words + count);
     process(unit);
 }
 
@@ -381,6 +429,7 @@ void write(int unit, std::uint32_t reg, std::uint32_t value) {
     case 0x10:
         if (value & 1u) {
             u = Unit{};
+            if (unit == 1 && !on_vu_thread()) g_withheld = 0;
         }
         if (value & 8u) {
             u.stat &= ~0x3F00u;
@@ -427,6 +476,10 @@ void state(ps2::state::Stream &s) {
         s.pod(u->stalled);
         s.vec(u->pending);
     }
+    // What the shadow pass holds back is what it has beyond the VU thread's side: after a stall, the words
+    // behind it. A state saved where nothing ran on a VU thread gives its pending words to the VU thread
+    // this way too.
+    if (s.loading()) g_withheld = g_units[1].pending.size() > g_vu_side.pending.size() ? g_units[1].pending.size() - g_vu_side.pending.size() : 0;
 }
 
 }

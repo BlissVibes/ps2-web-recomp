@@ -565,9 +565,7 @@ int main(int argc, char **argv) {
             ps2::browser_yield();
         } else {
             gate.queue_empty();
-            const double start = emscripten_get_now();
-            ps2::wait_render_work(50);
-            g_render_idle.store(g_render_idle.load() + emscripten_get_now() - start);
+            if (const double waited = ps2::wait_render_work(50)) g_render_idle.store(g_render_idle.load() + waited);
         }
     }
 }

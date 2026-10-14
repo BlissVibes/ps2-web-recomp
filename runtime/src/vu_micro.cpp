@@ -416,26 +416,32 @@ float u2f(std::uint32_t v) {
     return f;
 }
 
+// The packet goes to the GIF straight from VU memory: its tags give its length, at most the whole memory.
+// On the VU thread of the page the one copy is then into the render ring (queue::Ring::add_gif). A packet
+// that runs past the end of the memory continues at its start and is gathered first, as every packet was.
 void xgkick(Unit &u, std::uint32_t address) {
-    std::uint8_t buffer[16 * 1024 + 16];
-    std::uint32_t q = address & (u.data_qwords - 1), count = 0;
+    const std::uint32_t start = address & (u.data_qwords - 1);
+    std::uint32_t count = 0;
     bool done = false;
     while (!done && count < u.data_qwords) {
-        Reg128 tag;
-        std::memcpy(&tag, qword(u, q), 16);
-        std::memcpy(buffer + count * 16, &tag, 16);
-        ++q;
-        ++count;
-        const std::uint32_t nloop = static_cast<std::uint32_t>(tag.d[0]) & 0x7FFFu;
-        const bool eop = (tag.d[0] >> 15) & 1u;
-        const std::uint32_t flg = static_cast<std::uint32_t>(tag.d[0] >> 58) & 3u;
-        std::uint32_t nreg = static_cast<std::uint32_t>(tag.d[0] >> 60) & 0xFu;
+        std::uint64_t tag;
+        std::memcpy(&tag, qword(u, start + count), 8);
+        const std::uint32_t nloop = static_cast<std::uint32_t>(tag) & 0x7FFFu;
+        const std::uint32_t flg = static_cast<std::uint32_t>(tag >> 58) & 3u;
+        std::uint32_t nreg = static_cast<std::uint32_t>(tag >> 60) & 0xFu;
         if (!nreg) nreg = 16;
-        std::uint32_t body = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
-        for (std::uint32_t i = 0; i < body && count < u.data_qwords; ++i, ++q, ++count)
-            std::memcpy(buffer + count * 16, qword(u, q), 16);
-        done = eop;
+        const std::uint32_t body = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
+        count = std::min(count + 1 + body, u.data_qwords);
+        done = (tag >> 15) & 1u;
     }
+    const std::uint32_t first = std::min(count, u.data_qwords - start);
+    if (count == first) {
+        gif::transfer(1, qword(u, start), count);
+        return;
+    }
+    std::uint8_t buffer[16 * 1024];
+    std::memcpy(buffer, qword(u, start), static_cast<std::size_t>(first) * 16);
+    std::memcpy(buffer + static_cast<std::size_t>(first) * 16, qword(u, 0), static_cast<std::size_t>(count - first) * 16);
     gif::transfer(1, buffer, count);
 }
 

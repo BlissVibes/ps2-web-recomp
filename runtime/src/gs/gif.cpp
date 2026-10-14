@@ -337,6 +337,9 @@ void path3_advance() {
     if (held_bytes() && !path3_masked()) release_path3();
 }
 
+bool path3_advance_releases() { return held_bytes() && !path3_masked(); }
+bool path3_unmask_releases() { return held_bytes() && g_mask_vif1 && !(g_mode & 1u); }
+
 void scan_signals(int path, const std::uint8_t *data, std::uint32_t qwc) { scan(g_scan[path], data, qwc); }
 
 bool busy(int path) { return g_paths[path].active; }

@@ -467,15 +467,21 @@ std::atomic<double> g_vu_idle_ms{0.0};
 double vu_thread_idle_ms() { return g_vu_idle_ms.load(); }
 std::uint64_t vu1_interpreted_calls() { return vu::interpreted_calls(); }
 
+// The VU thread: runs VIF1 and VU1, and passes on in order everything else the emulation thread sends for
+// the GS. It is the only poster of the render ring. GIF data (its own XGKICKs and DIRECTs, and the PATH3
+// data it passes on) is added to the render ring unsent and goes in pieces of queue::kSendBytes, or with
+// the next other message, or when the VU ring runs dry: the render thread is then woken a few times a frame
+// rather than once a kick.
 void run_vu_thread() {
     gs::queue::role() = gs::queue::Role::Vu;
     gs::queue::Ring &in = gs::queue::vu();
+    gs::queue::Ring &out = gs::queue::render();
     for (;;) {
         gs::queue::Header h;
         const std::uint8_t *payload = nullptr;
         while (in.peek(h, payload)) {
             switch (h.type) {
-            case gs::queue::kVif1: vif::transfer(1, payload, h.arg0); break;
+            case gs::queue::kVif1: vif::transfer_words(1, reinterpret_cast<const std::uint32_t *>(payload), h.arg0); break;
             case gs::queue::kVif1Write: vif::write(1, h.arg0, h.arg1); break;
             case gs::queue::kVuReset:
                 vif::reset_vu_side();
@@ -485,13 +491,13 @@ void run_vu_thread() {
                 g_vu_fence.fetch_add(1);
                 gs::queue::notify(g_vu_fence);
                 break;
-            default: gs::queue::render().post(static_cast<gs::queue::Type>(h.type), h.arg0, h.arg1, payload, h.bytes); break;
+            case gs::queue::kGif: out.add_gif(h.arg0, payload, h.bytes); break;
+            default: out.post(static_cast<gs::queue::Type>(h.type), h.arg0, h.arg1, payload, h.bytes); break;
             }
             in.pop(h);
         }
-        const auto start = std::chrono::steady_clock::now();
-        in.wait_for_work(50);
-        g_vu_idle_ms.store(g_vu_idle_ms.load() + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        out.send();
+        if (const double waited = in.wait_for_work(50)) g_vu_idle_ms.store(g_vu_idle_ms.load() + waited);
     }
 }
 void post_present() { gs::post_present(); }
@@ -510,7 +516,7 @@ Rendered render_pending(bool surface, const std::function<void(const std::uint32
     }, budget_ms);
 }
 
-void wait_render_work(int timeout_ms) { gs::queue::render().wait_for_work(timeout_ms); }
+double wait_render_work(int timeout_ms) { return gs::queue::render().wait_for_work(timeout_ms); }
 void wake_render_thread() { gs::queue::render().wake(); }
 bool copy_frame(std::vector<std::uint32_t> &rgba, std::uint32_t &width, std::uint32_t &height) { return gs::copy_frame(rgba, width, height); }
 
