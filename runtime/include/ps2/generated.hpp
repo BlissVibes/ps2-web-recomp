@@ -5,6 +5,7 @@
 #include "memory.hpp"
 #include "mmi.hpp"
 #include "vu.hpp"
+#include "vu_macro.hpp"
 
 #include <cstdint>
 
@@ -29,6 +30,20 @@ struct ModuleInfo {
     const UnitInfo *units;
     std::uint32_t count;
 };
+
+// A unit's entry table as the recompiler writes it: the table is left zero and the word offsets of the
+// unit's entries are listed in id order (the entry at offsets[k] has id k + 1). register_generated_code()
+// fills every table with fill_entries() before it registers the units.
+struct EntryList {
+    std::uint16_t *table;
+    const std::uint16_t *offsets;
+    std::uint32_t count;
+};
+
+inline void fill_entries(const EntryList *lists, std::uint32_t count) {
+    for (std::uint32_t l = 0; l < count; ++l)
+        for (std::uint32_t k = 0; k < lists[l].count; ++k) lists[l].table[lists[l].offsets[k]] = static_cast<std::uint16_t>(k + 1);
+}
 
 void register_units(const UnitInfo *units, std::uint32_t count);
 void register_modules(const ModuleInfo *modules, std::uint32_t count);

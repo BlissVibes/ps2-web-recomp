@@ -68,6 +68,8 @@ struct UnitRow {
     std::uint32_t size;
     std::string function;
     std::string table;
+    std::string offsets;
+    std::size_t entries;
 };
 
 class Generator {
@@ -83,7 +85,7 @@ public:
         for (std::uint32_t u = 0; u < layout_.count(); ++u)
             if (has_code_[u]) {
                 write_unit(u);
-                rows.push_back({layout_.base_of(u), layout_.size(), unit_name(u), table_name(u)});
+                rows.push_back({layout_.base_of(u), layout_.size(), unit_name(u), table_name(u), offsets_name(u), ids_[u].size()});
             }
         return rows;
     }
@@ -91,6 +93,7 @@ public:
 private:
     std::string unit_name(std::uint32_t u) const { return std::format("{}unit_{:04X}", prefix_, u); }
     std::string table_name(std::uint32_t u) const { return std::format("{}entries_{:04X}", prefix_, u); }
+    std::string offsets_name(std::uint32_t u) const { return std::format("{}entry_offsets_{:04X}", prefix_, u); }
     std::string pc(std::uint32_t a) const { return relocatable_ ? std::format("(B + {})", hex(a)) : hex(a); }
     std::string rebase() const { return relocatable_ ? "c.base = B; " : ""; }
 
@@ -183,11 +186,20 @@ private:
 
         out_.str({});
         out_ << "#include \"units.hpp\"\n\nnamespace gen {\n\nusing namespace ps2;\n\n";
-        out_ << "const std::uint16_t " << table_name(u) << "[" << (layout_.size() / 4) << "] = {";
-        std::vector<std::uint16_t> dense(layout_.size() / 4, 0);
-        for (const auto &[a, id] : ids_[u]) dense[(a - base_) >> 2] = id;
-        for (std::size_t k = 0; k < dense.size(); ++k) out_ << (k % 32 ? " " : "\n    ") << dense[k] << ",";
-        out_ << "\n};\n\n";
+        // The entry table has an id for every word of the unit, nearly all of them zero. It is not written
+        // out: the unit lists the word offsets of its entries in id order, and register_generated_code()
+        // fills the table from the list before anything runs. A table written out in full costs the page a
+        // data segment for every run of ids between the zeros, and a start-up function as large as a unit.
+        out_ << "std::uint16_t " << table_name(u) << "[" << (layout_.size() / 4) << "];\n";
+        if (layout_.size() / 4 > 0x10000u) throw std::runtime_error("units larger than 256 KiB have word offsets past 16 bits");
+        std::vector<std::uint32_t> offsets(ids_[u].size());
+        for (const auto &[a, id] : ids_[u]) offsets[id - 1] = (a - base_) >> 2;
+        if (!offsets.empty()) {
+            out_ << "const std::uint16_t " << offsets_name(u) << "[] = {";
+            for (std::size_t k = 0; k < offsets.size(); ++k) out_ << (k % 16 ? " " : "\n    ") << offsets[k] << ",";
+            out_ << "\n};\n";
+        }
+        out_ << "\n";
         out_ << "void " << unit_name(u) << "(Cpu &c, std::uint32_t entry, std::uint32_t depth) {\n";
         if (relocatable_) out_ << "    [[maybe_unused]] const std::uint32_t B = c.base;\n";
         out_ << "dispatch_entry:\n    switch (entry) {\n";
@@ -793,10 +805,10 @@ private:
 
 void generate(const std::vector<Translation> &translations, const CodegenOptions &options) {
     fs::create_directories(options.output);
-    std::ostringstream header, table, modules;
+    std::ostringstream header, table, modules, lists;
     header << "#pragma once\n\n#include \"ps2/generated.hpp\"\n\nnamespace gen {\n";
     table << "#include \"units.hpp\"\n\nnamespace gen {\n\n";
-    std::size_t written = 0, main_units = 0, module_count = 0;
+    std::size_t written = 0, main_units = 0, module_count = 0, list_count = 0;
     std::set<std::string> current;
     for (const Translation &t : translations) {
         const std::vector<UnitRow> rows = Generator(t, options).run();
@@ -804,7 +816,12 @@ void generate(const std::vector<Translation> &translations, const CodegenOptions
         for (const UnitRow &r : rows) {
             current.insert(r.function + ".cpp");
             header << "void " << r.function << "(ps2::Cpu &c, std::uint32_t entry, std::uint32_t depth);\n";
-            header << "extern const std::uint16_t " << r.table << "[];\n";
+            header << "extern std::uint16_t " << r.table << "[];\n";
+            if (r.entries) {
+                header << "extern const std::uint16_t " << r.offsets << "[];\n";
+                lists << std::format("    {{{}, {}, {}u}},\n", r.table, r.offsets, r.entries);
+                ++list_count;
+            }
         }
         table << "const ps2::UnitInfo " << (t.relocatable ? t.prefix + "units" : "kUnits") << "[] = {\n";
         for (const UnitRow &r : rows) table << std::format("    {{{}, {}u, &{}, {}}},\n", hex(r.base), r.size, r.function, r.table);
@@ -821,7 +838,10 @@ void generate(const std::vector<Translation> &translations, const CodegenOptions
     }
     header << "}\n";
     if (module_count) table << "const ps2::ModuleInfo kModules[] = {\n" << modules.str() << "};\n\n";
-    table << "}\n\nvoid register_generated_code() { ps2::register_units(gen::kUnits, " << main_units << "u);";
+    if (list_count) table << "const ps2::EntryList kEntryLists[] = {\n" << lists.str() << "};\n\n";
+    table << "}\n\nvoid register_generated_code() {";
+    if (list_count) table << " ps2::fill_entries(gen::kEntryLists, " << list_count << "u);";
+    table << " ps2::register_units(gen::kUnits, " << main_units << "u);";
     if (module_count) table << " ps2::register_modules(gen::kModules, " << module_count << "u);";
     table << " }\n";
     // Unit files from an earlier pass that this one no longer emits would still be compiled
